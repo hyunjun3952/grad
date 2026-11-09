@@ -92,7 +92,7 @@ fn sumSlice(comptime T: type, xs: []const T) Accum(T) {
     return total;
 }
 
-fn BroadcastResult(comptime A: type, comptime B: type) type {
+pub fn BroadcastResult(comptime A: type, comptime B: type) type {
     if (A.Elem != B.Elem) {
         @compileError("element types differ");
     }

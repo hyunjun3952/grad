@@ -56,14 +56,13 @@ pub fn Tensor(comptime T: type, comptime dims: []const usize) type {
     };
 }
 
-const small_matmul_limit = 192 * 192 * 192;
-
 pub const MatmulOpts = struct {
     trans_a: bool = false,
     trans_b: bool = false,
+    accumulate: bool = false,
 };
 
-fn MatmulResult(comptime A: type, comptime B: type, comptime opts: MatmulOpts) type {
+pub fn MatmulResult(comptime A: type, comptime B: type, comptime opts: MatmulOpts) type {
     if (A.rank != 2 or B.rank != 2) {
         @compileError("matmul requires rank-2 tensors");
     }
@@ -83,29 +82,41 @@ fn MatmulResult(comptime A: type, comptime B: type, comptime opts: MatmulOpts) t
     return Tensor(A.Elem, &.{ m, n });
 }
 
+pub fn matmulInto(
+    gpa: Allocator,
+    a: anytype,
+    b: anytype,
+    out: anytype,
+    comptime opts: MatmulOpts,
+) Allocator.Error!void {
+    const A = @TypeOf(a);
+    comptime {
+        if (@TypeOf(out) != MatmulResult(A, @TypeOf(b), opts)) {
+            @compileError("matmulInto: out does not have the product's shape");
+        }
+    }
+    const M = @TypeOf(out).shape[0];
+    const N = @TypeOf(out).shape[1];
+    const K = if (opts.trans_a) A.shape[0] else A.shape[1];
+
+    const cfg: kernels.TileConfig = .{ .trans_a = opts.trans_a, .trans_b = opts.trans_b, .accumulate = opts.accumulate };
+    const work = try gpa.alloc(A.Elem, kernels.tiledWorkLenFor(A.Elem, cfg, M, K, N));
+    defer gpa.free(work);
+    kernels.tiledWith(A.Elem, cfg, M, K, N, a.data, b.data, out.data, work);
+}
+
 pub fn matmul(
     gpa: Allocator,
     a: anytype,
     b: anytype,
     comptime opts: MatmulOpts,
 ) Allocator.Error!MatmulResult(@TypeOf(a), @TypeOf(b), opts) {
-    const A = @TypeOf(a);
-    const R = MatmulResult(A, @TypeOf(b), opts);
-    const M = R.shape[0];
-    const N = R.shape[1];
-    const K = if (opts.trans_a) A.shape[0] else A.shape[1];
-
-    const out = try R.empty(gpa);
-    errdefer out.deinit(gpa);
-
-    if (comptime (!opts.trans_a and !opts.trans_b and M * K * N <= small_matmul_limit)) {
-        kernels.blockedWith(A.Elem, 4, 2, M, K, N, a.data, b.data, out.data);
-    } else {
-        const cfg: kernels.TileConfig = .{ .trans_a = opts.trans_a, .trans_b = opts.trans_b };
-        const work = try gpa.alloc(A.Elem, kernels.tiledWorkLenFor(A.Elem, cfg, M, K, N));
-        defer gpa.free(work);
-        kernels.tiledWith(A.Elem, cfg, M, K, N, a.data, b.data, out.data, work);
+    comptime {
+        if (opts.accumulate) @compileError("matmul returns a fresh tensor; use matmulInto to accumulate");
     }
+    const out = try MatmulResult(@TypeOf(a), @TypeOf(b), opts).empty(gpa);
+    errdefer out.deinit(gpa);
+    try matmulInto(gpa, a, b, out, opts);
     return out;
 }
 
@@ -189,6 +200,21 @@ test "matmul matches the naive kernel on both sides of the tiling threshold" {
     try expectMatmulMatchesNaive(190, 192, 191, .{});
     try expectMatmulMatchesNaive(200, 193, 197, .{});
     try expectMatmulMatchesNaive(257, 130, 100, .{});
+}
+
+test "matmulInto accumulates on top of what is already in out" {
+    const gpa = testing.allocator;
+    const a = try Tensor(f32, &.{ 2, 3 }).fromSlice(gpa, &.{ 1, 2, 3, 4, 5, 6 });
+    defer a.deinit(gpa);
+    const b = try Tensor(f32, &.{ 3, 2 }).fromSlice(gpa, &.{ 7, 8, 9, 10, 11, 12 });
+    defer b.deinit(gpa);
+    const out = try Tensor(f32, &.{ 2, 2 }).fromSlice(gpa, &.{ 1, 1, 1, 1 });
+    defer out.deinit(gpa);
+
+    try matmulInto(gpa, a, b, out, .{ .accumulate = true });
+    try testing.expectEqualSlices(f32, &.{ 59, 65, 140, 155 }, out.data);
+    try matmulInto(gpa, a, b, out, .{});
+    try testing.expectEqualSlices(f32, &.{ 58, 64, 139, 154 }, out.data);
 }
 
 test "matmul with transposed operands reads them in place" {

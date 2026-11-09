@@ -3,6 +3,7 @@ const Io = std.Io;
 
 const grad = @import("grad");
 const kernels = grad.kernels;
+const Tensor = grad.Tensor;
 
 const T = f32;
 const Kernel = *const fn (usize, usize, usize, []const T, []const T, []T, []T) void;
@@ -14,10 +15,6 @@ fn wrap(comptime f: anytype) Kernel {
             f(T, m, k, n, a, b, out);
         }
     }.call;
-}
-
-fn blocked(comptime E: type, m: usize, k: usize, n: usize, a: []const E, b: []const E, out: []E) void {
-    kernels.blockedWith(E, 4, 2, m, k, n, a, b, out);
 }
 
 fn tiled(m: usize, k: usize, n: usize, a: []const T, b: []const T, out: []T, work: []T) void {
@@ -37,37 +34,12 @@ const Entry = struct { name: []const u8, run: Kernel, work_len: *const fn (usize
 const entries = [_]Entry{
     .{ .name = "naive (ijk)", .run = wrap(kernels.naive) },
     .{ .name = "@Vector", .run = wrap(kernels.vec) },
-    .{ .name = "register block 4x2", .run = wrap(blocked) },
     .{ .name = "tiled + packed 6x2", .run = tiled, .work_len = tiledWork },
 };
 
-fn matmulMs(io: Io, alloc: std.mem.Allocator, arena: ?*std.heap.ArenaAllocator, ta: anytype, tb: anytype) !f64 {
-    var best: i96 = std.math.maxInt(i96);
-    for (0..200) |_| {
-        if (arena) |ar| _ = ar.reset(.retain_capacity);
-        const t0 = Io.Clock.awake.now(io);
-        const c = try grad.matmul(alloc, ta, tb, .{});
-        const t1 = Io.Clock.awake.now(io);
-        std.mem.doNotOptimizeAway(c.data.ptr);
-        if (arena == null) c.deinit(alloc);
-        best = @min(best, t1.nanoseconds - t0.nanoseconds);
-    }
-    return @as(f64, @floatFromInt(best)) / 1e6;
-}
-
-pub fn main(init: std.process.Init) !void {
-    const io = init.io;
-    const gpa = init.gpa;
-
-    var stdout_buffer: [4096]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const out = &stdout_file_writer.interface;
-
+fn kernelTable(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, rng: std.Random) !void {
     try out.print("f32 matmul, vector lanes = {d}\n\n", .{std.simd.suggestVectorLength(T) orelse 1});
     try out.print("{s:>5}  {s:<20} {s:>10} {s:>9} {s:>8}\n", .{ "size", "kernel", "best ms", "GFLOPS", "speedup" });
-
-    var prng = std.Random.DefaultPrng.init(42);
-    const rng = prng.random();
 
     for ([_]usize{ 64, 256, 512, 1024 }) |n| {
         const a = try gpa.alloc(T, n * n);
@@ -117,8 +89,24 @@ pub fn main(init: std.process.Init) !void {
         try out.writeAll("\n");
         try out.flush();
     }
+}
 
-    const Mat = grad.Tensor(T, &.{ 256, 256 });
+fn matmulMs(io: Io, alloc: std.mem.Allocator, arena: ?*std.heap.ArenaAllocator, ta: anytype, tb: anytype) !f64 {
+    var best: i96 = std.math.maxInt(i96);
+    for (0..200) |_| {
+        if (arena) |ar| _ = ar.reset(.retain_capacity);
+        const t0 = Io.Clock.awake.now(io);
+        const c = try grad.matmul(alloc, ta, tb, .{});
+        const t1 = Io.Clock.awake.now(io);
+        std.mem.doNotOptimizeAway(c.data.ptr);
+        if (arena == null) c.deinit(alloc);
+        best = @min(best, t1.nanoseconds - t0.nanoseconds);
+    }
+    return @as(f64, @floatFromInt(best)) / 1e6;
+}
+
+fn matmulOverhead(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, rng: std.Random) !void {
+    const Mat = Tensor(T, &.{ 256, 256 });
     const ta = try Mat.empty(gpa);
     defer ta.deinit(gpa);
     const tb = try Mat.empty(gpa);
@@ -132,6 +120,174 @@ pub fn main(init: std.process.Init) !void {
     defer arena.deinit();
     const arena_ms = try matmulMs(io, arena.allocator(), &arena, ta, tb);
     try out.print("Tensor.matmul 256x256, gpa:          {d:.3} ms, {d:.2} GFLOPS\n", .{ gpa_ms, flops_256 / (gpa_ms * 1e6) });
-    try out.print("Tensor.matmul 256x256, reused arena: {d:.3} ms, {d:.2} GFLOPS\n", .{ arena_ms, flops_256 / (arena_ms * 1e6) });
+    try out.print("Tensor.matmul 256x256, reused arena: {d:.3} ms, {d:.2} GFLOPS\n\n", .{ arena_ms, flops_256 / (arena_ms * 1e6) });
+}
+
+fn scaling(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, rng: std.Random) !void {
+    const shapes = [_][3]usize{ .{ 64, 784, 128 }, .{ 784, 64, 128 }, .{ 64, 128, 10 }, .{ 256, 256, 256 } };
+    try out.print("thread scaling of tiled matmul (best of 200, us)\n{s:<16}", .{"m x k x n"});
+    for ([_]usize{ 1, 2, 3, 4, 6 }) |t| try out.print("{d:>9}", .{t});
+    try out.writeAll("   threads\n");
+    for (shapes) |s| {
+        const a = try gpa.alloc(T, s[0] * s[1]);
+        defer gpa.free(a);
+        const b = try gpa.alloc(T, s[1] * s[2]);
+        defer gpa.free(b);
+        const c = try gpa.alloc(T, s[0] * s[2]);
+        defer gpa.free(c);
+        for (a) |*v| v.* = rng.float(T);
+        for (b) |*v| v.* = rng.float(T);
+        try out.print("{d:>4}x{d:>4}x{d:>4} ", .{ s[0], s[1], s[2] });
+        for ([_]usize{ 1, 2, 3, 4, 6 }) |t| {
+            kernels.parallel = if (t > 1) .{ .io = io, .threads = t } else .{};
+            const work = try gpa.alloc(T, kernels.tiledWorkLenFor(T, .{}, s[0], s[1], s[2]));
+            defer gpa.free(work);
+            var best: i96 = std.math.maxInt(i96);
+            for (0..200) |_| {
+                const t0 = Io.Clock.awake.now(io);
+                kernels.tiledWith(T, .{}, s[0], s[1], s[2], a, b, c, work);
+                best = @min(best, Io.Clock.awake.now(io).nanoseconds - t0.nanoseconds);
+            }
+            try out.print("{d:>9.1}", .{@as(f64, @floatFromInt(best)) / 1000.0});
+        }
+        try out.writeAll("\n");
+    }
+    kernels.parallel = .{};
+    try out.writeAll("\n");
+}
+
+const Lap = struct {
+    io: Io,
+    last: i96,
+
+    fn lap(self: *Lap) i96 {
+        const now = Io.Clock.awake.now(self.io).nanoseconds;
+        defer self.last = now;
+        return now - self.last;
+    }
+};
+
+const batch = 64;
+const n_in = 784;
+const n_hidden = 128;
+const n_out = 10;
+
+fn stepProfile(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, rng: std.Random, threads: usize) !void {
+    kernels.parallel = if (threads > 1) .{ .io = io, .threads = threads } else .{};
+    const Tape = grad.autograd.Tape;
+    const names = [_][]const u8{ "matmul x*w1", "add b1", "relu", "matmul h*w2", "add b2", "cross-entropy" };
+
+    const w1 = try Tensor(T, &.{ n_in, n_hidden }).empty(gpa);
+    defer w1.deinit(gpa);
+    const b1 = try Tensor(T, &.{n_hidden}).zeros(gpa);
+    defer b1.deinit(gpa);
+    const w2 = try Tensor(T, &.{ n_hidden, n_out }).empty(gpa);
+    defer w2.deinit(gpa);
+    const b2 = try Tensor(T, &.{n_out}).zeros(gpa);
+    defer b2.deinit(gpa);
+    const x = try Tensor(T, &.{ batch, n_in }).empty(gpa);
+    defer x.deinit(gpa);
+    for (w1.data) |*v| v.* = (rng.float(T) - 0.5) * 0.1;
+    for (w2.data) |*v| v.* = (rng.float(T) - 0.5) * 0.1;
+    for (x.data) |*v| v.* = rng.float(T);
+    var labels: [batch]u8 = undefined;
+    for (&labels) |*l| l.* = rng.uintLessThan(u8, n_out);
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var fwd: [6]i96 = @splat(0);
+    var bwd: [6]i96 = @splat(0);
+    var update: i96 = 0;
+    var total: i96 = 0;
+    var loss_value: T = 0;
+    const warmup = 20;
+    const reps = 300;
+
+    for (0..warmup + reps) |it| {
+        _ = arena.reset(.retain_capacity);
+        var tape: Tape = .{ .gpa = arena.allocator() };
+        var lap: Lap = .{ .io = io, .last = Io.Clock.awake.now(io).nanoseconds };
+        const start = lap.last;
+        var f: [6]i96 = undefined;
+        var b: [6]i96 = undefined;
+
+        const vx = try tape.constant(x);
+        const vw1 = try tape.leaf(w1);
+        const vb1 = try tape.leaf(b1);
+        const vw2 = try tape.leaf(w2);
+        const vb2 = try tape.leaf(b2);
+        _ = lap.lap();
+
+        const m1 = try tape.matmul(vx, vw1);
+        f[0] = lap.lap();
+        const a1 = try tape.add(m1, vb1);
+        f[1] = lap.lap();
+        const h = try tape.relu(a1);
+        f[2] = lap.lap();
+        const m2 = try tape.matmul(h, vw2);
+        f[3] = lap.lap();
+        const logits = try tape.add(m2, vb2);
+        f[4] = lap.lap();
+        const loss = try tape.crossEntropy(logits, &labels);
+        f[5] = lap.lap();
+
+        loss.grad.data[0] = 1;
+        var i = tape.nodes.items.len;
+        while (i > 0) {
+            i -= 1;
+            const node = tape.nodes.items[i];
+            try node.run(&tape, node.ctx);
+            b[i] = lap.lap();
+        }
+
+        grad.optim.sgd(0.01, .{ vw1, vb1, vw2, vb2 });
+        const upd = lap.lap();
+        const elapsed = lap.last - start;
+
+        if (it >= warmup) {
+            for (0..6) |k| {
+                fwd[k] += f[k];
+                bwd[k] += b[k];
+            }
+            update += upd;
+            total += elapsed;
+        }
+        loss_value = loss.value.data[0];
+    }
+
+    const to_us = 1.0 / (1000.0 * reps);
+    try out.print("training step, MLP {d}-{d}-{d}, batch {d}, {d} thread(s) (mean of {d} steps, last loss {d:.3})\n", .{ n_in, n_hidden, n_out, batch, threads, reps, loss_value });
+    try out.print("{s:<16} {s:>10} {s:>10}\n", .{ "op", "fwd us", "bwd us" });
+    for (names, 0..) |name, k| {
+        try out.print("{s:<16} {d:>10.1} {d:>10.1}\n", .{ name, @as(f64, @floatFromInt(fwd[k])) * to_us, @as(f64, @floatFromInt(bwd[k])) * to_us });
+    }
+    try out.print("{s:<16} {d:>10.1}\n", .{ "sgd update", @as(f64, @floatFromInt(update)) * to_us });
+    try out.print("{s:<16} {d:>10.1}  ({d:.0} steps/s)\n", .{ "total step", @as(f64, @floatFromInt(total)) * to_us, 1e6 / (@as(f64, @floatFromInt(total)) * to_us) });
+    const matmul_flops = 2.0 * batch * n_hidden * (n_in + n_out) * 3;
+    try out.print("matmul work per step: {d:.1} MFLOP = {d:.0} us at 100 GFLOPS\n", .{ matmul_flops / 1e6, matmul_flops / 1e5 });
+}
+
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const gpa = init.gpa;
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
+    const out = &stdout_file_writer.interface;
+
+    var prng = std.Random.DefaultPrng.init(42);
+    const rng = prng.random();
+
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    const only_step = args.len > 1 and std.mem.eql(u8, args[1], "step");
+    if (!only_step) {
+        try kernelTable(io, gpa, out, rng);
+        try matmulOverhead(io, gpa, out, rng);
+    }
+    if (only_step) try scaling(io, gpa, out, rng);
+    try stepProfile(io, gpa, out, rng, 1);
+    try out.writeAll("\n");
+    try stepProfile(io, gpa, out, rng, std.Thread.getCpuCount() catch 1);
     try out.flush();
 }

@@ -53,6 +53,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const bench_run = b.addRunArtifact(bench_exe);
+    bench_run.addPassthruArgs();
     const bench_step = b.step("bench", "Run the matmul benchmark (ReleaseFast)");
     bench_step.dependOn(&bench_run.step);
 }

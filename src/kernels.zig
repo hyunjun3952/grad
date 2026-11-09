@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 
 pub fn naive(comptime T: type, m: usize, k: usize, n: usize, a: []const T, b: []const T, out: []T) void {
     std.debug.assert(a.len >= m * k and b.len >= k * n and out.len >= m * n);
@@ -39,56 +40,6 @@ pub fn vec(comptime T: type, m: usize, k: usize, n: usize, a: []const T, b: []co
     }
 }
 
-pub fn blockedWith(
-    comptime T: type,
-    comptime MR: usize,
-    comptime NV: usize,
-    m: usize,
-    k: usize,
-    n: usize,
-    a: []const T,
-    b: []const T,
-    out: []T,
-) void {
-    std.debug.assert(a.len >= m * k and b.len >= k * n and out.len >= m * n);
-    const lanes = comptime std.simd.suggestVectorLength(T) orelse 1;
-    const Vec = @Vector(lanes, T);
-    const NR = NV * lanes;
-
-    var i: usize = 0;
-    while (i + MR <= m) : (i += MR) {
-        var j: usize = 0;
-        while (j + NR <= n) : (j += NR) {
-            var acc: [MR][NV]Vec = @splat(@splat(@splat(0)));
-            for (0..k) |p| {
-                var bv: [NV]Vec = undefined;
-                inline for (0..NV) |v| {
-                    bv[v] = b[p * n + j + v * lanes ..][0..lanes].*;
-                }
-                inline for (0..MR) |r| {
-                    const av: Vec = @splat(a[(i + r) * k + p]);
-                    inline for (0..NV) |v| {
-                        acc[r][v] = @mulAdd(Vec, av, bv[v], acc[r][v]);
-                    }
-                }
-            }
-            inline for (0..MR) |r| {
-                inline for (0..NV) |v| {
-                    out[(i + r) * n + j + v * lanes ..][0..lanes].* = acc[r][v];
-                }
-            }
-        }
-        for (i..i + MR) |row| {
-            for (j..n) |col| {
-                var s: T = 0;
-                for (0..k) |p| s += a[row * k + p] * b[p * n + col];
-                out[row * n + col] = s;
-            }
-        }
-    }
-    if (i < m) vec(T, m - i, k, n, a[i * k ..], b, out[i * n ..]);
-}
-
 pub const TileConfig = struct {
     mr: usize = 6,
     nv: usize = 2,
@@ -97,7 +48,74 @@ pub const TileConfig = struct {
     nc: usize = 1024,
     trans_a: bool = false,
     trans_b: bool = false,
+    accumulate: bool = false,
 };
+
+pub const Parallel = struct { io: ?Io = null, threads: usize = 1 };
+
+pub var parallel: Parallel = .{};
+
+const min_flops_per_part = 2_000_000;
+const max_workers = 15;
+const spin_limit = 4000;
+
+const Mailbox = struct {
+    seq: std.atomic.Value(u32) = .init(0),
+    done: std.atomic.Value(u32) = .init(0),
+    parked: std.atomic.Value(u32) = .init(0),
+    run: *const fn (*const anyopaque, usize) void = undefined,
+    ctx: *const anyopaque = undefined,
+    part: usize = 0,
+    io: Io = undefined,
+};
+
+var mailboxes: [max_workers]Mailbox = @splat(.{});
+var spawned: usize = 0;
+
+fn workerMain(box: *Mailbox) void {
+    var seen: u32 = 0;
+    while (true) {
+        var spins: u32 = 0;
+        while (box.seq.load(.acquire) == seen) {
+            if (spins < spin_limit) {
+                spins += 1;
+                std.atomic.spinLoopHint();
+                continue;
+            }
+            box.parked.store(1, .seq_cst);
+            if (box.seq.load(.seq_cst) == seen) box.io.futexWait(u32, &box.seq.raw, seen) catch {};
+            box.parked.store(0, .monotonic);
+            spins = 0;
+        }
+        seen = box.seq.load(.acquire);
+        box.run(box.ctx, box.part);
+        box.done.store(seen, .release);
+    }
+}
+
+fn parallelRun(parts: usize, ctx: *const anyopaque, run: *const fn (*const anyopaque, usize) void) void {
+    const workers = parts - 1;
+    while (spawned < workers) : (spawned += 1) {
+        mailboxes[spawned].io = parallel.io.?;
+        const thread = std.Thread.spawn(.{}, workerMain, .{&mailboxes[spawned]}) catch {
+            for (0..parts) |p| run(ctx, p);
+            return;
+        };
+        thread.detach();
+    }
+    for (mailboxes[0..workers], 1..) |*box, part| {
+        box.run = run;
+        box.ctx = ctx;
+        box.part = part;
+        box.seq.store(box.seq.load(.monotonic) +% 1, .seq_cst);
+        if (box.parked.load(.seq_cst) == 1) box.io.futexWake(u32, &box.seq.raw, 1);
+    }
+    run(ctx, 0);
+    for (mailboxes[0..workers]) |*box| {
+        const want = box.seq.load(.monotonic);
+        while (box.done.load(.acquire) != want) std.atomic.spinLoopHint();
+    }
+}
 
 fn laneCount(comptime T: type) comptime_int {
     return std.simd.suggestVectorLength(T) orelse 1;
@@ -107,55 +125,52 @@ fn roundUp(x: usize, to: usize) usize {
     return (x + to - 1) / to * to;
 }
 
-const TileDims = struct { mc: usize, kc: usize, nc: usize };
+const TileDims = struct { kc: usize, nc: usize };
 
-fn tiledDims(comptime T: type, comptime cfg: TileConfig, m: usize, k: usize, n: usize) TileDims {
-    const NR = cfg.nv * laneCount(T);
+fn tiledDims(comptime T: type, comptime cfg: TileConfig, k: usize, n: usize) TileDims {
     return .{
-        .mc = @min(cfg.mc, roundUp(m, cfg.mr)),
         .kc = @min(cfg.kc, k),
-        .nc = @min(cfg.nc, roundUp(n, NR)),
+        .nc = @min(cfg.nc, roundUp(n, cfg.nv * laneCount(T))),
     };
 }
 
-pub fn tiledWorkLenFor(comptime T: type, comptime cfg: TileConfig, m: usize, k: usize, n: usize) usize {
-    const d = tiledDims(T, cfg, m, k, n);
-    return d.mc * d.kc + d.kc * d.nc;
+const Split = struct { by_rows: bool, parts: usize, chunk: usize };
+
+pub fn parallelFor(len: usize, min_chunk: usize, ctx: anytype, comptime body: fn (@TypeOf(ctx), usize, usize) void) void {
+    const parts = if (parallel.io == null) 1 else @max(1, @min(parallel.threads, max_workers + 1, len / min_chunk));
+    if (parts == 1) return body(ctx, 0, len);
+
+    const Job = struct { ctx: @TypeOf(ctx), len: usize, chunk: usize };
+    const Task = struct {
+        fn run(raw: *const anyopaque, p: usize) void {
+            const j: *const Job = @ptrCast(@alignCast(raw));
+            const lo = @min(p * j.chunk, j.len);
+            body(j.ctx, lo, @min(lo + j.chunk, j.len));
+        }
+    };
+    const job: Job = .{ .ctx = ctx, .len = len, .chunk = (len + parts - 1) / parts };
+    parallelRun(parts, &job, Task.run);
 }
 
-fn packA(
-    comptime T: type,
-    comptime MR: usize,
-    comptime trans: bool,
-    a: []const T,
-    m: usize,
-    k: usize,
-    ic: usize,
-    pc: usize,
-    mc: usize,
-    kc: usize,
-    dst: []T,
-) void {
-    var ir: usize = 0;
-    while (ir < mc) : (ir += MR) {
-        const strip = dst[(ir / MR) * kc * MR ..];
-        const rows = @min(MR, mc - ir);
-        if (trans) {
-            for (0..kc) |p| {
-                const src = a[(pc + p) * m + ic + ir ..];
-                for (0..MR) |r| strip[p * MR + r] = if (r < rows) src[r] else 0;
-            }
-        } else {
-            for (0..MR) |r| {
-                if (r < rows) {
-                    const src = a[(ic + ir + r) * k + pc ..][0..kc];
-                    for (src, 0..) |x, p| strip[p * MR + r] = x;
-                } else {
-                    for (0..kc) |p| strip[p * MR + r] = 0;
-                }
-            }
-        }
-    }
+fn splitFor(comptime T: type, comptime cfg: TileConfig, m: usize, k: usize, n: usize) Split {
+    const by_rows = m >= n;
+    const unit = if (by_rows) cfg.mr else cfg.nv * laneCount(T);
+    const tiles = ((if (by_rows) m else n) + unit - 1) / unit;
+    const by_work = 2 * m * k * n / min_flops_per_part;
+    const want = if (parallel.io == null) 1 else @max(1, @min(parallel.threads, max_workers + 1, by_work));
+    const per = (tiles + want - 1) / want;
+    return .{ .by_rows = by_rows, .chunk = per * unit, .parts = (tiles + per - 1) / per };
+}
+
+fn partWorkLen(comptime T: type, comptime cfg: TileConfig, s: Split, m: usize, k: usize, n: usize) usize {
+    _ = m;
+    const d = tiledDims(T, cfg, k, if (s.by_rows) n else @min(n, s.chunk));
+    return d.kc * d.nc;
+}
+
+pub fn tiledWorkLenFor(comptime T: type, comptime cfg: TileConfig, m: usize, k: usize, n: usize) usize {
+    const s = splitFor(T, cfg, m, k, n);
+    return s.parts * partWorkLen(T, cfg, s, m, k, n);
 }
 
 fn packB(
@@ -204,7 +219,9 @@ inline fn microTile(
     comptime MR: usize,
     comptime NV: usize,
     kc: usize,
-    ap: []const T,
+    a: []const T,
+    a_off: [MR]usize,
+    a_step: usize,
     bp: []const T,
 ) [MR][NV]@Vector(laneCount(T), T) {
     const lanes = comptime laneCount(T);
@@ -218,7 +235,7 @@ inline fn microTile(
             bv[v] = bp[p * NR + v * lanes ..][0..lanes].*;
         }
         inline for (0..MR) |r| {
-            const av: Vec = @splat(ap[p * MR + r]);
+            const av: Vec = @splat(a[a_off[r] + p * a_step]);
             inline for (0..NV) |v| {
                 acc[r][v] = @mulAdd(Vec, av, bv[v], acc[r][v]);
             }
@@ -238,6 +255,43 @@ pub fn tiledWith(
     out: []T,
     work: []T,
 ) void {
+    const s = splitFor(T, cfg, m, k, n);
+    const part_len = partWorkLen(T, cfg, s, m, k, n);
+    std.debug.assert(work.len >= s.parts * part_len);
+    if (s.parts == 1) return tiledRange(T, cfg, m, k, n, a, b, out, 0, m, 0, n, work);
+
+    const Ctx = struct { s: Split, part_len: usize, m: usize, k: usize, n: usize, a: []const T, b: []const T, out: []T, work: []T };
+    const Task = struct {
+        fn run(raw: *const anyopaque, p: usize) void {
+            const c: *const Ctx = @ptrCast(@alignCast(raw));
+            const lo = p * c.s.chunk;
+            const w = c.work[p * c.part_len ..][0..c.part_len];
+            if (c.s.by_rows) {
+                tiledRange(T, cfg, c.m, c.k, c.n, c.a, c.b, c.out, lo, @min(lo + c.s.chunk, c.m), 0, c.n, w);
+            } else {
+                tiledRange(T, cfg, c.m, c.k, c.n, c.a, c.b, c.out, 0, c.m, lo, @min(lo + c.s.chunk, c.n), w);
+            }
+        }
+    };
+    const ctx: Ctx = .{ .s = s, .part_len = part_len, .m = m, .k = k, .n = n, .a = a, .b = b, .out = out, .work = work };
+    parallelRun(s.parts, &ctx, Task.run);
+}
+
+fn tiledRange(
+    comptime T: type,
+    comptime cfg: TileConfig,
+    m: usize,
+    k: usize,
+    n: usize,
+    a: []const T,
+    b: []const T,
+    out: []T,
+    r0: usize,
+    r1: usize,
+    c0: usize,
+    c1: usize,
+    work: []T,
+) void {
     const MR = cfg.mr;
     const NV = cfg.nv;
     const MC = cfg.mc;
@@ -251,26 +305,25 @@ pub fn tiledWith(
         if (NC % NR != 0) @compileError("tiled: nc must be a multiple of nv * lanes");
     }
     std.debug.assert(a.len >= m * k and b.len >= k * n and out.len >= m * n);
-    const d = tiledDims(T, cfg, m, k, n);
-    std.debug.assert(work.len >= d.mc * d.kc + d.kc * d.nc);
+    const d = tiledDims(T, cfg, k, c1 - c0);
+    std.debug.assert(work.len >= d.kc * d.nc);
+    const b_pack = work[0 .. d.kc * d.nc];
 
-    const a_pack = work[0 .. d.mc * d.kc];
-    const b_pack = work[d.mc * d.kc ..][0 .. d.kc * d.nc];
+    if (!cfg.accumulate) {
+        for (r0..r1) |r| @memset(out[r * n + c0 .. r * n + c1], 0);
+    }
 
-    @memset(out[0 .. m * n], 0);
-
-    var jc: usize = 0;
-    while (jc < n) : (jc += NC) {
-        const nc = @min(NC, n - jc);
+    var jc: usize = c0;
+    while (jc < c1) : (jc += NC) {
+        const nc = @min(NC, c1 - jc);
         var pc: usize = 0;
         while (pc < k) : (pc += KC) {
             const kc = @min(KC, k - pc);
             packB(T, NR, cfg.trans_b, b, k, n, pc, jc, kc, nc, b_pack);
 
-            var ic: usize = 0;
-            while (ic < m) : (ic += MC) {
-                const mc = @min(MC, m - ic);
-                packA(T, MR, cfg.trans_a, a, m, k, ic, pc, mc, kc, a_pack);
+            var ic: usize = r0;
+            while (ic < r1) : (ic += MC) {
+                const mc = @min(MC, r1 - ic);
 
                 var jr: usize = 0;
                 while (jr < nc) : (jr += NR) {
@@ -280,8 +333,12 @@ pub fn tiledWith(
                     var ir: usize = 0;
                     while (ir < mc) : (ir += MR) {
                         const mr_eff = @min(MR, mc - ir);
-                        const ap = a_pack[(ir / MR) * kc * MR ..];
-                        const acc = microTile(T, MR, NV, kc, ap, bp);
+                        var a_off: [MR]usize = undefined;
+                        inline for (0..MR) |r| {
+                            const row = ic + ir + @min(r, mr_eff - 1);
+                            a_off[r] = if (cfg.trans_a) pc * m + row else row * k + pc;
+                        }
+                        const acc = microTile(T, MR, NV, kc, a, a_off, if (cfg.trans_a) m else 1, bp);
                         const c = out[(ic + ir) * n + jc + jr ..];
 
                         if (mr_eff == MR and nr_eff == NR) {
@@ -357,10 +414,6 @@ fn expectSameResult(comptime T: type, m: usize, k: usize, n: usize) !void {
     vec(T, m, k, n, a, b, got);
     try std.testing.expectEqualSlices(T, want, got);
 
-    @memset(got, 99);
-    blockedWith(T, 4, 2, m, k, n, a, b, got);
-    try std.testing.expectEqualSlices(T, want, got);
-
     const at = try gpa.alloc(T, m * k);
     defer gpa.free(at);
     const bt = try gpa.alloc(T, k * n);
@@ -381,6 +434,26 @@ fn expectSameResult(comptime T: type, m: usize, k: usize, n: usize) !void {
     const work_dflt = try gpa.alloc(T, tiledWorkLenFor(T, dflt, m, k, n));
     defer gpa.free(work_dflt);
     try expectTiledCombos(T, dflt, m, k, n, a, b, at, bt, want, got, work_dflt);
+}
+
+test "parallel tiled matmul matches in both split directions" {
+    parallel = .{ .io = std.testing.io, .threads = 4 };
+    defer parallel = .{};
+
+    const by_rows = splitFor(f32, .{}, 200, 193, 197);
+    const by_cols = splitFor(f32, .{}, 150, 200, 260);
+    try std.testing.expect(by_rows.by_rows and by_rows.parts > 1);
+    try std.testing.expect(!by_cols.by_rows and by_cols.parts > 1);
+
+    try expectSameResult(f32, 200, 193, 197);
+    try expectSameResult(f32, 150, 200, 260);
+    try expectSameResult(f64, 120, 150, 140);
+}
+
+test "worker pool survives many park and wake cycles" {
+    parallel = .{ .io = std.testing.io, .threads = 6 };
+    defer parallel = .{};
+    for (0..60) |i| try expectSameResult(f32, 110 + i % 7, 130, 120 + i % 5);
 }
 
 test "kernels agree, sizes not a multiple of the vector width" {
