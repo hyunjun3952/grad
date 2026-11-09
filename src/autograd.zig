@@ -18,6 +18,7 @@ const Node = struct {
 
 pub const Tape = struct {
     gpa: Allocator,
+    par: kernels.Parallel = .{},
     nodes: std.ArrayList(Node) = .empty,
 
     fn track(self: *Tape, value: anytype, needs_grad: bool) Error!Var(@TypeOf(value)) {
@@ -83,12 +84,12 @@ pub const Tape = struct {
     }
 
     pub fn matmul(self: *Tape, a: anytype, b: anytype) Error!Var(tensor.MatmulResult(@TypeOf(a.value), @TypeOf(b.value), .{})) {
-        const out = try self.track(try tensor.matmul(self.gpa, a.value, b.value, .{}), a.needs_grad or b.needs_grad);
+        const out = try self.track(try tensor.matmul(self.gpa, self.par, a.value, b.value, .{}), a.needs_grad or b.needs_grad);
         const Ctx = struct { a: @TypeOf(a), b: @TypeOf(b), out: @TypeOf(out) };
         if (out.needs_grad) try self.push(Ctx{ .a = a, .b = b, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
-                if (c.a.needs_grad) try tensor.matmulInto(t.gpa, c.out.grad, c.b.value, c.a.grad, .{ .trans_b = true, .accumulate = true });
-                if (c.b.needs_grad) try tensor.matmulInto(t.gpa, c.a.value, c.out.grad, c.b.grad, .{ .trans_a = true, .accumulate = true });
+                if (c.a.needs_grad) try tensor.matmulInto(t.gpa, t.par, c.out.grad, c.b.value, c.a.grad, .{ .trans_b = true, .accumulate = true });
+                if (c.b.needs_grad) try tensor.matmulInto(t.gpa, t.par, c.a.value, c.out.grad, c.b.grad, .{ .trans_a = true, .accumulate = true });
             }
         }.run);
         return out;
@@ -223,8 +224,7 @@ fn minHiddenMagnitude(p: Params) f32 {
 }
 
 fn bigGradients(gpa: Allocator, threads: usize, x: Tensor(f32, &.{ 64, 784 }), w1: Tensor(f32, &.{ 784, 128 }), w2: Tensor(f32, &.{ 128, 10 }), labels: []const u8) !struct { loss: f32, g1: []f32, g2: []f32 } {
-    kernels.parallel = if (threads > 1) .{ .io = testing.io, .threads = threads } else .{};
-    var t: Tape = .{ .gpa = gpa };
+    var t: Tape = .{ .gpa = gpa, .par = if (threads > 1) .{ .io = testing.io, .threads = threads } else .{} };
     const vx = try t.constant(x);
     const vw1 = try t.leaf(w1);
     const vw2 = try t.leaf(w2);
@@ -237,7 +237,6 @@ test "gradients are bit-identical with one thread and with worker threads" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const gpa = arena.allocator();
-    defer kernels.parallel = .{};
 
     var prng = std.Random.DefaultPrng.init(11);
     const rng = prng.random();

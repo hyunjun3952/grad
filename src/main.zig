@@ -18,7 +18,7 @@ pub fn main(init: std.process.Init) !void {
     const bias = try grad.Tensor(f32, &.{2}).fromSlice(gpa, &.{ 0.5, -0.5 });
     defer bias.deinit(gpa);
 
-    const c = try grad.matmul(gpa, a, b, .{});
+    const c = try grad.matmul(gpa, .{}, a, b, .{});
     defer c.deinit(gpa);
     const d = try grad.ops.add(gpa, c, bias);
     defer d.deinit(gpa);

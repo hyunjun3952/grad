@@ -53,8 +53,6 @@ pub const TileConfig = struct {
 
 pub const Parallel = struct { io: ?Io = null, threads: usize = 1 };
 
-pub var parallel: Parallel = .{};
-
 const min_flops_per_part = 2_000_000;
 const max_workers = 15;
 const spin_limit = 4000;
@@ -93,10 +91,10 @@ fn workerMain(box: *Mailbox) void {
     }
 }
 
-fn parallelRun(parts: usize, ctx: *const anyopaque, run: *const fn (*const anyopaque, usize) void) void {
+fn parallelRun(par: Parallel, parts: usize, ctx: *const anyopaque, run: *const fn (*const anyopaque, usize) void) void {
     const workers = parts - 1;
     while (spawned < workers) : (spawned += 1) {
-        mailboxes[spawned].io = parallel.io.?;
+        mailboxes[spawned].io = par.io.?;
         const thread = std.Thread.spawn(.{}, workerMain, .{&mailboxes[spawned]}) catch {
             for (0..parts) |p| run(ctx, p);
             return;
@@ -136,8 +134,8 @@ fn tiledDims(comptime T: type, comptime cfg: TileConfig, k: usize, n: usize) Til
 
 const Split = struct { by_rows: bool, parts: usize, chunk: usize };
 
-pub fn parallelFor(len: usize, min_chunk: usize, ctx: anytype, comptime body: fn (@TypeOf(ctx), usize, usize) void) void {
-    const parts = if (parallel.io == null) 1 else @max(1, @min(parallel.threads, max_workers + 1, len / min_chunk));
+pub fn parallelFor(par: Parallel, len: usize, min_chunk: usize, ctx: anytype, comptime body: fn (@TypeOf(ctx), usize, usize) void) void {
+    const parts = if (par.io == null) 1 else @max(1, @min(par.threads, max_workers + 1, len / min_chunk));
     if (parts == 1) return body(ctx, 0, len);
 
     const Job = struct { ctx: @TypeOf(ctx), len: usize, chunk: usize };
@@ -149,15 +147,15 @@ pub fn parallelFor(len: usize, min_chunk: usize, ctx: anytype, comptime body: fn
         }
     };
     const job: Job = .{ .ctx = ctx, .len = len, .chunk = (len + parts - 1) / parts };
-    parallelRun(parts, &job, Task.run);
+    parallelRun(par, parts, &job, Task.run);
 }
 
-fn splitFor(comptime T: type, comptime cfg: TileConfig, m: usize, k: usize, n: usize) Split {
+fn splitFor(comptime T: type, comptime cfg: TileConfig, par: Parallel, m: usize, k: usize, n: usize) Split {
     const by_rows = m >= n;
     const unit = if (by_rows) cfg.mr else cfg.nv * laneCount(T);
     const tiles = ((if (by_rows) m else n) + unit - 1) / unit;
     const by_work = 2 * m * k * n / min_flops_per_part;
-    const want = if (parallel.io == null) 1 else @max(1, @min(parallel.threads, max_workers + 1, by_work));
+    const want = if (par.io == null) 1 else @max(1, @min(par.threads, max_workers + 1, by_work));
     const per = (tiles + want - 1) / want;
     return .{ .by_rows = by_rows, .chunk = per * unit, .parts = (tiles + per - 1) / per };
 }
@@ -168,8 +166,8 @@ fn partWorkLen(comptime T: type, comptime cfg: TileConfig, s: Split, m: usize, k
     return d.kc * d.nc;
 }
 
-pub fn tiledWorkLenFor(comptime T: type, comptime cfg: TileConfig, m: usize, k: usize, n: usize) usize {
-    const s = splitFor(T, cfg, m, k, n);
+pub fn tiledWorkLenFor(comptime T: type, comptime cfg: TileConfig, par: Parallel, m: usize, k: usize, n: usize) usize {
+    const s = splitFor(T, cfg, par, m, k, n);
     return s.parts * partWorkLen(T, cfg, s, m, k, n);
 }
 
@@ -247,6 +245,7 @@ inline fn microTile(
 pub fn tiledWith(
     comptime T: type,
     comptime cfg: TileConfig,
+    par: Parallel,
     m: usize,
     k: usize,
     n: usize,
@@ -255,7 +254,7 @@ pub fn tiledWith(
     out: []T,
     work: []T,
 ) void {
-    const s = splitFor(T, cfg, m, k, n);
+    const s = splitFor(T, cfg, par, m, k, n);
     const part_len = partWorkLen(T, cfg, s, m, k, n);
     std.debug.assert(work.len >= s.parts * part_len);
     if (s.parts == 1) return tiledRange(T, cfg, m, k, n, a, b, out, 0, m, 0, n, work);
@@ -274,7 +273,7 @@ pub fn tiledWith(
         }
     };
     const ctx: Ctx = .{ .s = s, .part_len = part_len, .m = m, .k = k, .n = n, .a = a, .b = b, .out = out, .work = work };
-    parallelRun(s.parts, &ctx, Task.run);
+    parallelRun(par, s.parts, &ctx, Task.run);
 }
 
 fn tiledRange(
@@ -370,6 +369,7 @@ fn tiledRange(
 fn expectTiledCombos(
     comptime T: type,
     comptime base: TileConfig,
+    par: Parallel,
     m: usize,
     k: usize,
     n: usize,
@@ -389,12 +389,12 @@ fn expectTiledCombos(
             break :blk c;
         };
         @memset(got, 99);
-        tiledWith(T, cfg, m, k, n, if (flags[0]) at else a, if (flags[1]) bt else b, got, work);
+        tiledWith(T, cfg, par, m, k, n, if (flags[0]) at else a, if (flags[1]) bt else b, got, work);
         try std.testing.expectEqualSlices(T, want, got);
     }
 }
 
-fn expectSameResult(comptime T: type, m: usize, k: usize, n: usize) !void {
+fn expectSameResult(comptime T: type, par: Parallel, m: usize, k: usize, n: usize) !void {
     const gpa = std.testing.allocator;
     const a = try gpa.alloc(T, m * k);
     defer gpa.free(a);
@@ -426,48 +426,39 @@ fn expectSameResult(comptime T: type, m: usize, k: usize, n: usize) !void {
     }
 
     const small: TileConfig = .{ .mr = 4, .nv = 2, .mc = 8, .kc = 5, .nc = 16 };
-    const work_small = try gpa.alloc(T, tiledWorkLenFor(T, small, m, k, n));
+    const work_small = try gpa.alloc(T, tiledWorkLenFor(T, small, par, m, k, n));
     defer gpa.free(work_small);
-    try expectTiledCombos(T, small, m, k, n, a, b, at, bt, want, got, work_small);
+    try expectTiledCombos(T, small, par, m, k, n, a, b, at, bt, want, got, work_small);
 
     const dflt: TileConfig = .{};
-    const work_dflt = try gpa.alloc(T, tiledWorkLenFor(T, dflt, m, k, n));
+    const work_dflt = try gpa.alloc(T, tiledWorkLenFor(T, dflt, par, m, k, n));
     defer gpa.free(work_dflt);
-    try expectTiledCombos(T, dflt, m, k, n, a, b, at, bt, want, got, work_dflt);
+    try expectTiledCombos(T, dflt, par, m, k, n, a, b, at, bt, want, got, work_dflt);
 }
 
 test "parallel tiled matmul matches in both split directions" {
-    parallel = .{ .io = std.testing.io, .threads = 4 };
-    defer parallel = .{};
-
-    const by_rows = splitFor(f32, .{}, 200, 193, 197);
-    const by_cols = splitFor(f32, .{}, 150, 200, 260);
+    const par: Parallel = .{ .io = std.testing.io, .threads = 4 };
+    const by_rows = splitFor(f32, .{}, par, 200, 193, 197);
+    const by_cols = splitFor(f32, .{}, par, 150, 200, 260);
     try std.testing.expect(by_rows.by_rows and by_rows.parts > 1);
     try std.testing.expect(!by_cols.by_rows and by_cols.parts > 1);
 
-    try expectSameResult(f32, 200, 193, 197);
-    try expectSameResult(f32, 150, 200, 260);
-    try expectSameResult(f64, 120, 150, 140);
+    try expectSameResult(f32, par, 200, 193, 197);
+    try expectSameResult(f32, par, 150, 200, 260);
+    try expectSameResult(f64, par, 120, 150, 140);
 }
 
 test "worker pool survives many park and wake cycles" {
-    parallel = .{ .io = std.testing.io, .threads = 6 };
-    defer parallel = .{};
-    for (0..60) |i| try expectSameResult(f32, 110 + i % 7, 130, 120 + i % 5);
+    const par: Parallel = .{ .io = std.testing.io, .threads = 6 };
+    for (0..60) |i| try expectSameResult(f32, par, 110 + i % 7, 130, 120 + i % 5);
 }
 
 test "kernels agree, sizes not a multiple of the vector width" {
-    try expectSameResult(f32, 5, 7, 11);
-    try expectSameResult(f32, 3, 1, 9);
-    try expectSameResult(f32, 1, 4, 1);
-    try expectSameResult(f32, 16, 16, 16);
-    try expectSameResult(f32, 17, 33, 65);
-    try expectSameResult(f64, 9, 5, 13);
-    try expectSameResult(f32, 6, 5, 16);
-    try expectSameResult(f32, 12, 12, 32);
-    try expectSameResult(f32, 13, 9, 40);
-    try expectSameResult(f32, 7, 3, 17);
-    try expectSameResult(f32, 24, 10, 48);
-    try expectSameResult(f32, 50, 70, 90);
-    try expectSameResult(f64, 33, 21, 29);
+    const shapes = [_][3]usize{
+        .{ 5, 7, 11 },   .{ 3, 1, 9 },   .{ 1, 4, 1 },  .{ 16, 16, 16 }, .{ 17, 33, 65 }, .{ 6, 5, 16 },
+        .{ 12, 12, 32 }, .{ 13, 9, 40 }, .{ 7, 3, 17 }, .{ 24, 10, 48 }, .{ 50, 70, 90 },
+    };
+    for (shapes) |s| try expectSameResult(f32, .{}, s[0], s[1], s[2]);
+    try expectSameResult(f64, .{}, 9, 5, 13);
+    try expectSameResult(f64, .{}, 33, 21, 29);
 }

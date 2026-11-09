@@ -18,11 +18,11 @@ fn wrap(comptime f: anytype) Kernel {
 }
 
 fn tiled(m: usize, k: usize, n: usize, a: []const T, b: []const T, out: []T, work: []T) void {
-    kernels.tiledWith(T, .{}, m, k, n, a, b, out, work);
+    kernels.tiledWith(T, .{}, .{}, m, k, n, a, b, out, work);
 }
 
 fn tiledWork(n: usize) usize {
-    return kernels.tiledWorkLenFor(T, .{}, n, n, n);
+    return kernels.tiledWorkLenFor(T, .{}, .{}, n, n, n);
 }
 
 fn noWork(n: usize) usize {
@@ -96,7 +96,7 @@ fn matmulMs(io: Io, alloc: std.mem.Allocator, arena: ?*std.heap.ArenaAllocator, 
     for (0..200) |_| {
         if (arena) |ar| _ = ar.reset(.retain_capacity);
         const t0 = Io.Clock.awake.now(io);
-        const c = try grad.matmul(alloc, ta, tb, .{});
+        const c = try grad.matmul(alloc, .{}, ta, tb, .{});
         const t1 = Io.Clock.awake.now(io);
         std.mem.doNotOptimizeAway(c.data.ptr);
         if (arena == null) c.deinit(alloc);
@@ -139,20 +139,19 @@ fn scaling(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, rng: std.Random) !vo
         for (b) |*v| v.* = rng.float(T);
         try out.print("{d:>4}x{d:>4}x{d:>4} ", .{ s[0], s[1], s[2] });
         for ([_]usize{ 1, 2, 3, 4, 6 }) |t| {
-            kernels.parallel = if (t > 1) .{ .io = io, .threads = t } else .{};
-            const work = try gpa.alloc(T, kernels.tiledWorkLenFor(T, .{}, s[0], s[1], s[2]));
+            const par: kernels.Parallel = if (t > 1) .{ .io = io, .threads = t } else .{};
+            const work = try gpa.alloc(T, kernels.tiledWorkLenFor(T, .{}, par, s[0], s[1], s[2]));
             defer gpa.free(work);
             var best: i96 = std.math.maxInt(i96);
             for (0..200) |_| {
                 const t0 = Io.Clock.awake.now(io);
-                kernels.tiledWith(T, .{}, s[0], s[1], s[2], a, b, c, work);
+                kernels.tiledWith(T, .{}, par, s[0], s[1], s[2], a, b, c, work);
                 best = @min(best, Io.Clock.awake.now(io).nanoseconds - t0.nanoseconds);
             }
             try out.print("{d:>9.1}", .{@as(f64, @floatFromInt(best)) / 1000.0});
         }
         try out.writeAll("\n");
     }
-    kernels.parallel = .{};
     try out.writeAll("\n");
 }
 
@@ -173,22 +172,17 @@ const n_hidden = 128;
 const n_out = 10;
 
 fn stepProfile(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, rng: std.Random, threads: usize) !void {
-    kernels.parallel = if (threads > 1) .{ .io = io, .threads = threads } else .{};
+    const par: kernels.Parallel = if (threads > 1) .{ .io = io, .threads = threads } else .{};
     const Tape = grad.autograd.Tape;
-    const names = [_][]const u8{ "matmul x*w1", "add b1", "relu", "matmul h*w2", "add b2", "cross-entropy" };
+    const names = [_][]const u8{ "linear1 (matmul+bias)", "relu", "linear2 (matmul+bias)", "cross-entropy" };
 
-    const w1 = try Tensor(T, &.{ n_in, n_hidden }).empty(gpa);
-    defer w1.deinit(gpa);
-    const b1 = try Tensor(T, &.{n_hidden}).zeros(gpa);
-    defer b1.deinit(gpa);
-    const w2 = try Tensor(T, &.{ n_hidden, n_out }).empty(gpa);
-    defer w2.deinit(gpa);
-    const b2 = try Tensor(T, &.{n_out}).zeros(gpa);
-    defer b2.deinit(gpa);
+    const l1 = try grad.nn.Linear(n_in, n_hidden).init(gpa, rng);
+    defer l1.deinit(gpa);
+    const l2 = try grad.nn.Linear(n_hidden, n_out).init(gpa, rng);
+    defer l2.deinit(gpa);
+    const params = l1.params() ++ l2.params();
     const x = try Tensor(T, &.{ batch, n_in }).empty(gpa);
     defer x.deinit(gpa);
-    for (w1.data) |*v| v.* = (rng.float(T) - 0.5) * 0.1;
-    for (w2.data) |*v| v.* = (rng.float(T) - 0.5) * 0.1;
     for (x.data) |*v| v.* = rng.float(T);
     var labels: [batch]u8 = undefined;
     for (&labels) |*l| l.* = rng.uintLessThan(u8, n_out);
@@ -196,8 +190,9 @@ fn stepProfile(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, rng: std.Random,
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
 
-    var fwd: [6]i96 = @splat(0);
+    var fwd: [4]i96 = @splat(0);
     var bwd: [6]i96 = @splat(0);
+    var zero: i96 = 0;
     var update: i96 = 0;
     var total: i96 = 0;
     var loss_value: T = 0;
@@ -206,31 +201,25 @@ fn stepProfile(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, rng: std.Random,
 
     for (0..warmup + reps) |it| {
         _ = arena.reset(.retain_capacity);
-        var tape: Tape = .{ .gpa = arena.allocator() };
+        var tape: Tape = .{ .gpa = arena.allocator(), .par = par };
         var lap: Lap = .{ .io = io, .last = Io.Clock.awake.now(io).nanoseconds };
         const start = lap.last;
-        var f: [6]i96 = undefined;
+        var f: [4]i96 = undefined;
         var b: [6]i96 = undefined;
 
+        grad.optim.zeroGrad(par, params);
+        const zeroed = lap.lap();
         const vx = try tape.constant(x);
-        const vw1 = try tape.leaf(w1);
-        const vb1 = try tape.leaf(b1);
-        const vw2 = try tape.leaf(w2);
-        const vb2 = try tape.leaf(b2);
         _ = lap.lap();
 
-        const m1 = try tape.matmul(vx, vw1);
+        const h0 = try l1.forward(&tape, vx);
         f[0] = lap.lap();
-        const a1 = try tape.add(m1, vb1);
+        const h1 = try tape.relu(h0);
         f[1] = lap.lap();
-        const h = try tape.relu(a1);
+        const logits = try l2.forward(&tape, h1);
         f[2] = lap.lap();
-        const m2 = try tape.matmul(h, vw2);
-        f[3] = lap.lap();
-        const logits = try tape.add(m2, vb2);
-        f[4] = lap.lap();
         const loss = try tape.crossEntropy(logits, &labels);
-        f[5] = lap.lap();
+        f[3] = lap.lap();
 
         loss.grad.data[0] = 1;
         var i = tape.nodes.items.len;
@@ -241,15 +230,14 @@ fn stepProfile(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, rng: std.Random,
             b[i] = lap.lap();
         }
 
-        grad.optim.sgd(0.01, .{ vw1, vb1, vw2, vb2 });
+        grad.optim.sgd(par, 0.01, params);
         const upd = lap.lap();
         const elapsed = lap.last - start;
 
         if (it >= warmup) {
-            for (0..6) |k| {
-                fwd[k] += f[k];
-                bwd[k] += b[k];
-            }
+            for (0..4) |k| fwd[k] += f[k];
+            for (0..6) |k| bwd[k] += b[k];
+            zero += zeroed;
             update += upd;
             total += elapsed;
         }
@@ -258,12 +246,20 @@ fn stepProfile(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, rng: std.Random,
 
     const to_us = 1.0 / (1000.0 * reps);
     try out.print("training step, MLP {d}-{d}-{d}, batch {d}, {d} thread(s) (mean of {d} steps, last loss {d:.3})\n", .{ n_in, n_hidden, n_out, batch, threads, reps, loss_value });
-    try out.print("{s:<16} {s:>10} {s:>10}\n", .{ "op", "fwd us", "bwd us" });
+    try out.print("{s:<22} {s:>10} {s:>10}\n", .{ "op", "fwd us", "bwd us" });
+    const bwd_rows = [4]i96{ bwd[0] + bwd[1], bwd[2], bwd[3] + bwd[4], bwd[5] };
     for (names, 0..) |name, k| {
-        try out.print("{s:<16} {d:>10.1} {d:>10.1}\n", .{ name, @as(f64, @floatFromInt(fwd[k])) * to_us, @as(f64, @floatFromInt(bwd[k])) * to_us });
+        try out.print("{s:<22} {d:>10.1} {d:>10.1}\n", .{ name, @as(f64, @floatFromInt(fwd[k])) * to_us, @as(f64, @floatFromInt(bwd_rows[k])) * to_us });
     }
-    try out.print("{s:<16} {d:>10.1}\n", .{ "sgd update", @as(f64, @floatFromInt(update)) * to_us });
-    try out.print("{s:<16} {d:>10.1}  ({d:.0} steps/s)\n", .{ "total step", @as(f64, @floatFromInt(total)) * to_us, 1e6 / (@as(f64, @floatFromInt(total)) * to_us) });
+    try out.print("{s:<22} {d:>10.1}\n", .{ "zero grad", @as(f64, @floatFromInt(zero)) * to_us });
+    try out.print("{s:<22} {d:>10.1}\n", .{ "sgd update", @as(f64, @floatFromInt(update)) * to_us });
+    try out.print("{s:<22} {d:>10.1}  ({d:.0} steps/s)\n", .{ "total step", @as(f64, @floatFromInt(total)) * to_us, 1e6 / (@as(f64, @floatFromInt(total)) * to_us) });
+    var adam = try grad.optim.Adam.init(gpa, 0.001, params);
+    defer adam.deinit(gpa);
+    const adam_start = Io.Clock.awake.now(io).nanoseconds;
+    for (0..reps) |_| adam.step(par, params);
+    const adam_ns = Io.Clock.awake.now(io).nanoseconds - adam_start;
+    try out.print("{s:<22} {d:>10.1}  (in place of sgd)\n", .{ "adam update", @as(f64, @floatFromInt(adam_ns)) * to_us });
     const matmul_flops = 2.0 * batch * n_hidden * (n_in + n_out) * 3;
     try out.print("matmul work per step: {d:.1} MFLOP = {d:.0} us at 100 GFLOPS\n", .{ matmul_flops / 1e6, matmul_flops / 1e5 });
 }

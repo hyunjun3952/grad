@@ -84,6 +84,7 @@ pub fn MatmulResult(comptime A: type, comptime B: type, comptime opts: MatmulOpt
 
 pub fn matmulInto(
     gpa: Allocator,
+    par: kernels.Parallel,
     a: anytype,
     b: anytype,
     out: anytype,
@@ -100,13 +101,14 @@ pub fn matmulInto(
     const K = if (opts.trans_a) A.shape[0] else A.shape[1];
 
     const cfg: kernels.TileConfig = .{ .trans_a = opts.trans_a, .trans_b = opts.trans_b, .accumulate = opts.accumulate };
-    const work = try gpa.alloc(A.Elem, kernels.tiledWorkLenFor(A.Elem, cfg, M, K, N));
+    const work = try gpa.alloc(A.Elem, kernels.tiledWorkLenFor(A.Elem, cfg, par, M, K, N));
     defer gpa.free(work);
-    kernels.tiledWith(A.Elem, cfg, M, K, N, a.data, b.data, out.data, work);
+    kernels.tiledWith(A.Elem, cfg, par, M, K, N, a.data, b.data, out.data, work);
 }
 
 pub fn matmul(
     gpa: Allocator,
+    par: kernels.Parallel,
     a: anytype,
     b: anytype,
     comptime opts: MatmulOpts,
@@ -116,7 +118,7 @@ pub fn matmul(
     }
     const out = try MatmulResult(@TypeOf(a), @TypeOf(b), opts).empty(gpa);
     errdefer out.deinit(gpa);
-    try matmulInto(gpa, a, b, out, opts);
+    try matmulInto(gpa, par, a, b, out, opts);
     return out;
 }
 
@@ -149,7 +151,7 @@ test "matmul small shape uses the untiled kernel" {
     defer a.deinit(gpa);
     const b = try Tensor(f32, &.{ 3, 2 }).fromSlice(gpa, &.{ 7, 8, 9, 10, 11, 12 });
     defer b.deinit(gpa);
-    const c = try matmul(gpa, a, b, .{});
+    const c = try matmul(gpa, .{}, a, b, .{});
     defer c.deinit(gpa);
     try testing.expectEqual(@as(usize, 2), @TypeOf(c).shape[0]);
     try testing.expectEqual(@as(usize, 2), @TypeOf(c).shape[1]);
@@ -187,7 +189,7 @@ fn expectMatmulMatchesNaive(
     defer gpa.free(want);
     kernels.naive(f32, M, K, N, la, lb, want);
 
-    const got = try matmul(gpa, a, b, opts);
+    const got = try matmul(gpa, .{}, a, b, opts);
     defer got.deinit(gpa);
     try testing.expectEqual(M, @TypeOf(got).shape[0]);
     try testing.expectEqual(N, @TypeOf(got).shape[1]);
@@ -211,9 +213,9 @@ test "matmulInto accumulates on top of what is already in out" {
     const out = try Tensor(f32, &.{ 2, 2 }).fromSlice(gpa, &.{ 1, 1, 1, 1 });
     defer out.deinit(gpa);
 
-    try matmulInto(gpa, a, b, out, .{ .accumulate = true });
+    try matmulInto(gpa, .{}, a, b, out, .{ .accumulate = true });
     try testing.expectEqualSlices(f32, &.{ 59, 65, 140, 155 }, out.data);
-    try matmulInto(gpa, a, b, out, .{});
+    try matmulInto(gpa, .{}, a, b, out, .{});
     try testing.expectEqualSlices(f32, &.{ 58, 64, 139, 154 }, out.data);
 }
 
