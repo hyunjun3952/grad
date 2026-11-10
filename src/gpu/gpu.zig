@@ -122,7 +122,10 @@ pub const Gpu = struct {
         if (grid[0] == 0 or grid[1] == 0) return;
         var copy = args;
         var pointers: [copy.len]?*anyopaque = undefined;
-        inline for (0..copy.len) |i| pointers[i] = &copy[i];
+        inline for (0..copy.len) |i| {
+            if (@sizeOf(@TypeOf(copy[i])) < 4) @compileError("kernel arguments must be at least 32 bits wide; widen flags with @as(u32, ...)");
+            pointers[i] = &copy[i];
+        }
         try self.cu.launch(self.fns[@backingInt(kernel)], grid, .{ 256, 1, 1 }, &pointers);
     }
 
