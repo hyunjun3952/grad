@@ -4,6 +4,7 @@ const ops = @import("../tensor/ops.zig");
 const tensor = @import("../tensor/tensor.zig");
 const kernels = @import("../cpu/kernels.zig");
 const gpu_mod = @import("../gpu/gpu.zig");
+const ga = @import("../gpu/args.zig");
 const conv = @import("../gpu/math/conv.zig");
 const drop = @import("../gpu/math/dropout.zig");
 const norm = @import("../gpu/math/norm.zig");
@@ -349,10 +350,19 @@ pub const Tape = struct {
         const kc = k * k * In.shape[3];
         const dev = self.par.gpu;
         const packed_path = if (dev) |g| g.tensorWorthwhile(rows, channels_out, kc) else false;
+        const implicit_shape = opts.stride == 1 and In.shape[3] % 64 == 0 and channels_out % 32 == 0;
+        const implicit_path = implicit_shape and packed_path;
+        const geometry: ga.ConvGeometry = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = In.shape[3], .k = k, .stride = opts.stride, .pad = opts.pad, .out_h = Out.shape[1], .out_w = Out.shape[2], .positions = rows };
         const value = try self.newTensor(Out);
         var col: Col = undefined;
         var col_half: ?gpu_mod.Gpu.Packed = null;
-        if (packed_path) {
+        var x_half: []const u16 = &.{};
+        if (implicit_path) {
+            const g = dev.?;
+            x_half = (try g.packMatrix(x.value.data, In.len / In.shape[3], In.shape[3], In.len / In.shape[3], In.shape[3], false)).data;
+            const w_half = try g.packMatrix(w.value.data, kc, channels_out, kc, std.mem.alignForward(usize, channels_out, 64), false);
+            try g.convImplicitForward(x_half, w_half, value.data, geometry, channels_out, false);
+        } else if (packed_path) {
             const g = dev.?;
             const half = try g.im2colPacked(x.value.data, d);
             const w_half = try g.packMatrix(w.value.data, kc, channels_out, half.cols_padded, std.mem.alignForward(usize, channels_out, 64), false);
@@ -365,11 +375,19 @@ pub const Tape = struct {
         }
         const out = try self.makeVar(value, x.needs_grad or w.needs_grad);
 
-        const Ctx = struct { x: @TypeOf(x), w: @TypeOf(w), col: Col, col_half: ?gpu_mod.Gpu.Packed, out: @TypeOf(out) };
-        if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .w = w, .col = col, .col_half = col_half, .out = out }, struct {
+        const Ctx = struct { x: @TypeOf(x), w: @TypeOf(w), col: Col, col_half: ?gpu_mod.Gpu.Packed, x_half: []const u16, out: @TypeOf(out) };
+        if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .w = w, .col = col, .col_half = col_half, .x_half = x_half, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
                 const grad: Flat = .{ .data = c.out.grad.data };
-                if (c.x.needs_grad and c.col_half != null) {
+                if (c.x.needs_grad and c.x_half.len != 0) {
+                    const g = t.par.gpu.?;
+                    const mark = g.step_used;
+                    defer g.step_used = mark;
+                    const grad_half = try g.packMatrix(grad.data, rows, channels_out, rows, channels_out, false);
+                    const rotated = try g.packRotatedWeights(c.w.value.data, k, In.shape[3], channels_out);
+                    const reverse: ga.ConvGeometry = .{ .n = In.shape[0], .h = Out.shape[1], .w = Out.shape[2], .c = channels_out, .k = k, .stride = 1, .pad = k - 1 - opts.pad, .out_h = In.shape[1], .out_w = In.shape[2], .positions = In.len / In.shape[3] };
+                    try g.convImplicitForward(grad_half.data, rotated, c.x.grad.data, reverse, In.shape[3], true);
+                } else if (c.x.needs_grad and c.col_half != null) {
                     const g = t.par.gpu.?;
                     const mark = g.step_used;
                     defer g.step_used = mark;
@@ -384,7 +402,13 @@ pub const Tape = struct {
                     try t.convKernel(.col2im, .{ dcol.data, c.x.grad.data }, d);
                 }
                 if (!c.w.needs_grad) return;
-                if (c.col_half) |half| {
+                if (c.x_half.len != 0) {
+                    const g = t.par.gpu.?;
+                    const mark = g.step_used;
+                    defer g.step_used = mark;
+                    const grad_t = try g.packMatrix(grad.data, channels_out, rows, std.mem.alignForward(usize, channels_out, 128), std.mem.alignForward(usize, rows, 32), true);
+                    try g.convImplicitWeightGrad(grad_t, c.x_half, c.w.grad.data, geometry, channels_out, kc);
+                } else if (c.col_half) |half| {
                     const g = t.par.gpu.?;
                     const mark = g.step_used;
                     defer g.step_used = mark;
@@ -738,10 +762,10 @@ const ConvPoolNet = struct {
     }
 };
 
-fn ConvCase(comptime opts: ConvOpts, comptime c_in: usize, comptime c_out: usize) type {
+fn ConvCase(comptime opts: ConvOpts, comptime k: usize, comptime c_in: usize, comptime c_out: usize) type {
     return struct {
         const In = Tensor(f32, &.{ 2, 5, 5, c_in });
-        const Wt = Tensor(f32, &.{ 9 * c_in, c_out });
+        const Wt = Tensor(f32, &.{ k * k * c_in, c_out });
         const Out = ConvOut(In, Wt, opts);
 
         pub const Inputs = struct { x: In, w: Wt };
@@ -771,17 +795,17 @@ fn ConvCase(comptime opts: ConvOpts, comptime c_in: usize, comptime c_out: usize
                     for (0..ow) |ox| {
                         for (0..c_out) |oc| {
                             var want: f32 = 0;
-                            for (0..3) |ky| {
-                                for (0..3) |kx| {
+                            for (0..k) |ky| {
+                                for (0..k) |kx| {
                                     const py = oy * opts.stride + ky;
                                     const px = ox * opts.stride + kx;
                                     if (py < opts.pad or px < opts.pad or py - opts.pad >= 5 or px - opts.pad >= 5) continue;
                                     for (0..c_in) |c| {
-                                        want += p.x.data[((n * 5 + py - opts.pad) * 5 + px - opts.pad) * c_in + c] * p.w.data[((ky * 3 + kx) * c_in + c) * c_out + oc];
+                                        want += p.x.data[((n * 5 + py - opts.pad) * 5 + px - opts.pad) * c_in + c] * p.w.data[((ky * k + kx) * c_in + c) * c_out + oc];
                                     }
                                 }
                             }
-                            try testing.expectApproxEqAbs(want, run.y.value.data[((n * oh + oy) * ow + ox) * c_out + oc], 1e-5);
+                            try testing.expectApproxEqAbs(want, run.y.value.data[((n * oh + oy) * ow + ox) * c_out + oc], 1e-6 * @as(f32, k * k * c_in));
                         }
                     }
                 }
@@ -1002,12 +1026,21 @@ test "gradients of a convolution, pooling and linear network match finite differ
 test "conv2d with padding and stride matches a direct convolution, finite differences and the gpu" {
     inline for (.{ ConvOpts{}, ConvOpts{ .stride = 1, .pad = 1 }, ConvOpts{ .stride = 2, .pad = 1 }, ConvOpts{ .stride = 2, .pad = 0 } }) |opts| {
         inline for (.{ .{ 2, 3 }, .{ 4, 8 }, .{ 8, 4 } }) |channels| {
-            const Case = ConvCase(opts, channels[0], channels[1]);
+            const Case = ConvCase(opts, 3, channels[0], channels[1]);
             try Case.expectDirectConvolution();
             try gradcheck.expectFiniteDifferences(Case, 31, 1e-3, 3e-3);
             try gradcheck.expectGpuMatchesCpu(Case, 32, 1e-5);
             try gradcheck.expectTensorCoresClose(Case, 32, 3e-2);
         }
+    }
+}
+
+test "implicit-GEMM convolutions on tensor cores match a direct convolution and the cpu" {
+    inline for (.{ .{ ConvOpts{ .pad = 1 }, 3, 64, 32 }, .{ ConvOpts{}, 3, 64, 64 }, .{ ConvOpts{ .pad = 1 }, 3, 128, 64 }, .{ ConvOpts{}, 1, 64, 128 } }) |config| {
+        const Case = ConvCase(config[0], config[1], config[2], config[3]);
+        try Case.expectDirectConvolution();
+        try gradcheck.expectGpuMatchesCpu(Case, 33, 1e-4);
+        try gradcheck.expectTensorCoresClose(Case, 33, 0.15);
     }
 }
 test "batch norm gradients match finite differences, and the gpu matches the cpu including running statistics" {

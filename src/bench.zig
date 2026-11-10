@@ -294,6 +294,55 @@ fn gpuMatmul(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
     try out.writeAll("\n");
 }
 
+fn implicitGemm(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
+    const dev = grad.gpu.Gpu.init(gpa, 2 << 30) catch |err| switch (err) {
+        error.DriverNotFound => return,
+        else => return err,
+    };
+    defer dev.deinit();
+    const cases = [_]struct { name: []const u8, n: u32, side: u32, c_in: u32, c_out: u32 }{
+        .{ .name = "stage 1: 64x32x32, 64->64", .n = 64, .side = 32, .c_in = 64, .c_out = 64 },
+        .{ .name = "stage 2: 64x16x16, 128->128", .n = 64, .side = 16, .c_in = 128, .c_out = 128 },
+        .{ .name = "stage 3: 64x8x8, 256->256", .n = 64, .side = 8, .c_in = 256, .c_out = 256 },
+    };
+    try out.print("implicit-GEMM 3x3 convolution kernels (bf16 in, f32 out), kernel only, best of 20\n{s:<30}{s:>14}{s:>14}\n", .{ "case", "forward TFLOPS", "dW TFLOPS" });
+    for (cases) |case| {
+        const rows: usize = case.n * case.side * case.side;
+        const kc: usize = 9 * case.c_in;
+        const x = try dev.alloc(T, rows * case.c_in);
+        const w = try dev.alloc(T, kc * case.c_out);
+        const y = try dev.alloc(T, rows * case.c_out);
+        const dw = try dev.alloc(T, kc * case.c_out);
+        const host = try gpa.alloc(T, @max(x.len, y.len));
+        defer gpa.free(host);
+        var prng = std.Random.DefaultPrng.init(case.side);
+        for (host) |*v| v.* = prng.random().float(T) - 0.5;
+        try dev.upload(x, host[0..x.len]);
+        try dev.upload(y, host[0..y.len]);
+        try dev.upload(w, host[0..w.len]);
+
+        const geo: grad.gpu.ConvGeometry = .{ .n = case.n, .h = case.side, .w = case.side, .c = case.c_in, .k = 3, .stride = 1, .pad = 1, .out_h = case.side, .out_w = case.side, .positions = @intCast(rows) };
+        const x_half = (try dev.packMatrix(x, rows, case.c_in, rows, case.c_in, false)).data;
+        const w_half = try dev.packMatrix(w, kc, case.c_out, kc, case.c_out, false);
+        const dy_t = try dev.packMatrix(y, case.c_out, rows, std.mem.alignForward(usize, case.c_out, 128), std.mem.alignForward(usize, rows, 32), true);
+        const flops = 2.0 * @as(f64, @floatFromInt(rows)) * @as(f64, @floatFromInt(kc)) * @as(f64, @floatFromInt(case.c_out));
+        var tflops: [2]f64 = undefined;
+        for (0..2) |variant| {
+            if (variant == 0) try dev.convImplicitForward(x_half, w_half, y, geo, case.c_out, false) else try dev.convImplicitWeightGrad(dy_t, x_half, dw, geo, case.c_out, kc);
+            try dev.cu.sync();
+            const t0 = Io.Clock.awake.now(io);
+            for (0..20) |_| {
+                if (variant == 0) try dev.convImplicitForward(x_half, w_half, y, geo, case.c_out, false) else try dev.convImplicitWeightGrad(dy_t, x_half, dw, geo, case.c_out, kc);
+            }
+            try dev.cu.sync();
+            const ns: f64 = @floatFromInt(Io.Clock.awake.now(io).nanoseconds - t0.nanoseconds);
+            tflops[variant] = flops * 20 / ns / 1000;
+        }
+        try out.print("{s:<30}{d:>14.2}{d:>14.2}\n", .{ case.name, tflops[0], tflops[1] });
+    }
+    try out.writeAll("\n");
+}
+
 fn gpuTensorCore(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
     const dev = grad.gpu.Gpu.init(gpa, 1 << 30) catch |err| switch (err) {
         error.DriverNotFound => return out.writeAll("no NVIDIA driver\n"),
@@ -380,6 +429,7 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len > 1 and std.mem.eql(u8, args[1], "tc")) {
         try gpuTensorCore(io, gpa, out);
+        try implicitGemm(io, gpa, out);
         try out.flush();
         return;
     }

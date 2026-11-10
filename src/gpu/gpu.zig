@@ -15,6 +15,8 @@ pub const Augment = @import("math/augment.zig").Config;
 
 pub const MatmulOpts = struct { trans_a: bool = false, trans_b: bool = false, accumulate: bool = false };
 
+pub const ConvGeometry = ga.ConvGeometry;
+
 pub const MatmulShape = struct { m: usize, n: usize, k: usize };
 
 pub const BroadcastPlan = struct { dims: [4]u32, a_strides: [4]u32, b_strides: [4]u32 };
@@ -35,6 +37,9 @@ const Kernel = enum {
     packHalfTransposed,
     im2colHalf,
     sgemmTensor,
+    convGemmForward,
+    convGemmWeightGrad,
+    packWeightsRotated,
     elementwise,
     relu,
     reluBackward,
@@ -323,6 +328,29 @@ pub const Gpu = struct {
         const dst = try self.scratch(u16, rows_padded * cols_padded);
         try self.launch(.im2colHalf, .{ toU32(rows_padded), 1, 1 }, .{ x, dst, d, cols_padded });
         return .{ .data = dst, .rows_padded = rows_padded, .cols_padded = cols_padded };
+    }
+
+    pub fn packRotatedWeights(self: *Gpu, w: []const f32, k: usize, c_in: usize, c_out: usize) Error!Packed {
+        const rows = k * k * c_out;
+        const cols_padded = std.mem.alignForward(usize, c_in, 64);
+        const dst = try self.scratch(u16, rows * cols_padded);
+        try self.launchFlat(.packWeightsRotated, dst.len, .{ w, dst, pack(ga.RotateArgs, .{ .k = k, .c_in = c_in, .c_out = c_out, .rows_padded = rows, .cols_padded = cols_padded }) });
+        return .{ .data = dst, .rows_padded = rows, .cols_padded = cols_padded };
+    }
+
+    pub fn convImplicitForward(self: *Gpu, x_half: []const u16, w: Packed, out: []f32, geo: ga.ConvGeometry, c_out: usize, accumulate: bool) Error!void {
+        const m = @as(usize, geo.n) * geo.out_h * geo.out_w;
+        const kernel_shape = pack(ga.TensorShape, .{ .m = m, .n = c_out, .k_padded = w.rows_padded, .n_padded = w.cols_padded, .accumulate = accumulate, .chunk = w.rows_padded, .transpose_out = false, .output_half = false });
+        try self.launch(.convGemmForward, .{ toU32(w.cols_padded / 64), ceilDiv(m, 128), 1 }, .{ x_half, w.data, out, kernel_shape, geo });
+    }
+
+    pub fn convImplicitWeightGrad(self: *Gpu, dy_t: Packed, x_half: []const u16, out: []f32, geo: ga.ConvGeometry, c_out: usize, taps: usize) Error!void {
+        const n_padded = std.mem.alignForward(usize, taps, 64);
+        const blocks = (dy_t.rows_padded / 128) * (n_padded / 64);
+        const splits = @max(1, @min(dy_t.cols_padded / 256, (128 + blocks - 1) / blocks));
+        const chunk = std.mem.alignForward(usize, (dy_t.cols_padded + splits - 1) / splits, 32);
+        const kernel_shape = pack(ga.TensorShape, .{ .m = c_out, .n = taps, .k_padded = dy_t.cols_padded, .n_padded = n_padded, .accumulate = true, .chunk = chunk, .transpose_out = true, .output_half = false });
+        try self.launch(.convGemmWeightGrad, .{ toU32(n_padded / 64), toU32(dy_t.rows_padded / 128), ceilDiv(dy_t.cols_padded, chunk) }, .{ dy_t.data, x_half, out, kernel_shape, geo });
     }
 
     pub fn matmulPacked(self: *Gpu, a: Packed, b: Packed, out: anytype, shape: MatmulShape, accumulate: bool, transpose_out: bool) Error!void {
