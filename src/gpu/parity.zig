@@ -61,7 +61,7 @@ fn checkMatmul(gpu: *Gpu, m: usize, n: usize, k: usize, ta: bool, tb: bool, accu
     try gpu.upload(da, a);
     try gpu.upload(db, b);
     try gpu.upload(dc, got);
-    try gpu.matmul(da, db, dc, ta, tb, accumulate, m, n, k);
+    try gpu.matmul(da, db, dc, .{ .m = m, .n = n, .k = k }, .{ .trans_a = ta, .trans_b = tb, .accumulate = accumulate });
     try gpu.download(got, dc);
     try expectClose(want, got, 2e-4);
 }

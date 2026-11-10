@@ -18,3 +18,9 @@ pub const TensorTable = extern struct {
 };
 
 pub const AdamArgs = extern struct { beta1: f32, beta2: f32, step: f32, inv_sqrt_c2: f32, eps: f32, decay: f32 };
+
+pub const ElementwiseArgs = extern struct { len: u32, multiply: u32, dims: [4]u32, a_strides: [4]u32, b_strides: [4]u32 };
+
+pub const SumArgs = extern struct { out_len: u32, reduce_count: u32, mask: u32, accumulate: u32, dims: [4]u32, strides: [4]u32 };
+
+pub const GatherArgs = extern struct { start: u32, rows: u32, pixels: u32, max_shift: u32, seed: u64 };

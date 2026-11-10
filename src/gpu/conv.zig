@@ -4,7 +4,7 @@ pub const Op = enum { im2col, col2im, maxPool, maxPoolBackward, avgPool, avgPool
 
 const Index = u32;
 
-pub const Dims = struct { n: Index, h: Index, w: Index, c: Index, k: Index, stride: Index = 1, pad: Index = 0 };
+pub const Dims = extern struct { n: Index, h: Index, w: Index, c: Index, k: Index, stride: Index = 1, pad: Index = 0 };
 
 pub fn outHeight(d: Dims) Index {
     return (d.h + 2 * d.pad - d.k) / d.stride + 1;

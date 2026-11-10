@@ -11,6 +11,16 @@ pub const Error = Allocator.Error || error{ DriverNotFound, MissingSymbol, CudaF
 
 pub const BinaryOp = enum { add, mul };
 
+pub const Augment = struct { max_shift: u32 = 0, seed: u64 = 0 };
+
+pub const MatmulOpts = struct { trans_a: bool = false, trans_b: bool = false, accumulate: bool = false };
+
+pub const MatmulShape = struct { m: usize, n: usize, k: usize };
+
+pub const BroadcastPlan = struct { dims: [4]u32, a_strides: [4]u32, b_strides: [4]u32 };
+
+pub const ReducePlan = struct { dims: [4]u32, strides: [4]u32, mask: u32 };
+
 const Kernel = enum {
     sgemmNN,
     sgemmNT,
@@ -232,18 +242,13 @@ pub const Gpu = struct {
         try self.launch(kernel, .{ ceilDiv(items, 256), 1, 1 }, args);
     }
 
-    pub fn matmul(
-        self: *Gpu,
-        a: []const f32,
-        b: []const f32,
-        out: []f32,
-        trans_a: bool,
-        trans_b: bool,
-        accumulate: bool,
-        m: usize,
-        n: usize,
-        k: usize,
-    ) Error!void {
+    pub fn matmul(self: *Gpu, a: []const f32, b: []const f32, out: []f32, shape: MatmulShape, opts: MatmulOpts) Error!void {
+        const m = shape.m;
+        const n = shape.n;
+        const k = shape.k;
+        const trans_a = opts.trans_a;
+        const trans_b = opts.trans_b;
+        const accumulate = opts.accumulate;
         std.debug.assert(!(trans_a and trans_b));
         const tile: usize = if (n <= 32 and m <= 64) 2 else if (n <= 32) 1 else 0;
         const transpose: usize = if (trans_a) 2 else if (trans_b) 1 else 0;
@@ -254,22 +259,19 @@ pub const Gpu = struct {
         const splits = @max(1, @min(k / 256, (128 + blocks - 1) / blocks));
         const chunk = std.mem.alignForward(usize, (k + splits - 1) / splits, 8);
         if (splits > 1 and !accumulate) try self.fill(out, 0);
-        const shape: ga.GemmShape = .{
+        const kernel_shape: ga.GemmShape = .{
             .m = toU32(m),
             .n = toU32(n),
             .k = toU32(k),
             .accumulate = @intFromBool(accumulate),
             .chunk = toU32(chunk),
         };
-        try self.launch(kernel, .{ ceilDiv(n, tile_n), ceilDiv(m, tile_m), ceilDiv(k, chunk) }, .{ address(a), address(b), address(out), shape });
+        try self.launch(kernel, .{ ceilDiv(n, tile_n), ceilDiv(m, tile_m), ceilDiv(k, chunk) }, .{ address(a), address(b), address(out), kernel_shape });
     }
-    pub fn elementwise(self: *Gpu, op: BinaryOp, a: []const f32, b: []const f32, out: []f32, dims: [4]u32, sa: [4]u32, sb: [4]u32) Error!void {
-        try self.launchFlat(.elementwise, out.len, .{
-            address(a), address(b), address(out), toU32(out.len), @as(u32, @intFromBool(op == .mul)), dims[1], dims[2], dims[3],
-            sa[0],      sa[1],      sa[2],        sa[3],          sb[0],                              sb[1],   sb[2],   sb[3],
-        });
+    pub fn elementwise(self: *Gpu, op: BinaryOp, a: []const f32, b: []const f32, out: []f32, plan: BroadcastPlan) Error!void {
+        const args: ga.ElementwiseArgs = .{ .len = toU32(out.len), .multiply = @intFromBool(op == .mul), .dims = plan.dims, .a_strides = plan.a_strides, .b_strides = plan.b_strides };
+        try self.launchFlat(.elementwise, out.len, .{ address(a), address(b), address(out), args });
     }
-
     pub fn relu(self: *Gpu, x: []const f32, out: []f32) Error!void {
         try self.launchFlat(.relu, x.len, .{ address(x), address(out), toU32(x.len) });
     }
@@ -282,43 +284,39 @@ pub const Gpu = struct {
         try self.launchFlat(.addInPlace, dst.len, .{ address(dst), address(src), toU32(dst.len) });
     }
 
-    pub fn sumTo(self: *Gpu, in: []const f32, out: []f32, dims: [4]u32, strides: [4]u32, reduced: u32, accumulate: bool) Error!void {
-        if (reduced == 0b0111 and strides[3] == 1 and dims[3] == out.len) {
+    pub fn sumTo(self: *Gpu, in: []const f32, out: []f32, plan: ReducePlan, accumulate: bool) Error!void {
+        if (plan.mask == 0b0111 and plan.strides[3] == 1 and plan.dims[3] == out.len) {
             if (!accumulate) try self.fill(out, 0);
             return self.columnSums(in, out);
         }
-        const flag: u32 = @intFromBool(accumulate);
-        try self.launch(.sumTo, .{ toU32(out.len), 1, 1 }, .{
-            address(in), address(out), toU32(out.len), toU32(in.len / out.len), reduced,
-            flag,        dims[0],      dims[1],        dims[2],                 dims[3],
-            strides[0],  strides[1],   strides[2],     strides[3],
-        });
+        const args: ga.SumArgs = .{ .out_len = toU32(out.len), .reduce_count = toU32(in.len / out.len), .mask = plan.mask, .accumulate = @intFromBool(accumulate), .dims = plan.dims, .strides = plan.strides };
+        try self.launch(.sumTo, .{ toU32(out.len), 1, 1 }, .{ address(in), address(out), args });
     }
-
-    pub fn crossEntropy(self: *Gpu, logits: []const f32, logp: []f32, labels: []const u8, loss: []f32, rows: usize, cols: usize) Error!void {
+    pub fn crossEntropy(self: *Gpu, logits: []const f32, logp: []f32, labels: []const u8, loss: []f32, cols: usize) Error!void {
+        const rows = labels.len;
         const row_loss = try self.scratch(f32, rows);
         try self.launchFlat(.crossEntropyRows, rows, .{ address(logits), address(logp), address(labels), address(row_loss), toU32(rows), toU32(cols) });
         try self.launchFlat(.crossEntropyMean, 1, .{ address(row_loss), address(loss), toU32(rows) });
     }
 
-    pub fn crossEntropyBackward(self: *Gpu, logp: []const f32, labels: []const u8, grad: []f32, loss_grad: []const f32, rows: usize, cols: usize) Error!void {
+    pub fn crossEntropyBackward(self: *Gpu, logp: []const f32, labels: []const u8, grad: []f32, loss_grad: []const f32, cols: usize) Error!void {
+        const rows = labels.len;
         try self.launchFlat(.crossEntropyBackward, rows * cols, .{ address(logp), address(labels), address(grad), address(loss_grad), toU32(rows), toU32(cols) });
     }
 
     pub fn convKernel(self: *Gpu, comptime op: conv.Op, slices: anytype, d: conv.Dims) Error!void {
         const len = conv.workItems(op, d);
         const types = comptime blk: {
-            var t: [slices.len + 8]type = undefined;
-            for (&t, 0..) |*e, i| e.* = if (i < slices.len) u64 else u32;
+            var t: [slices.len + 2]type = undefined;
+            for (&t, 0..) |*e, i| e.* = if (i < slices.len) u64 else if (i == slices.len) u32 else conv.Dims;
             break :blk t;
         };
         var args: @Tuple(&types) = undefined;
         inline for (slices, 0..) |s, i| args[i] = address(s);
         args[slices.len] = toU32(len);
-        inline for (.{ d.n, d.h, d.w, d.c, d.k, d.stride, d.pad }, 0..) |v, i| args[slices.len + 1 + i] = toU32(v);
+        args[slices.len + 1] = d;
         try self.launchFlat(@field(Kernel, @tagName(op)), len, args);
     }
-
     const ColumnKind = enum(u32) { sum, squared_deviation, gradient_sums };
 
     fn columnReduce(self: *Gpu, a: []const f32, b: []const f32, mean: []const f32, inv_std: []const f32, out: []f32, kind: ColumnKind, scale: f32, channels: usize) Error!void {
@@ -376,11 +374,11 @@ pub const Gpu = struct {
     pub fn adam(self: *Gpu, table: ga.TensorTable, hp: ga.AdamArgs) Error!void {
         try self.launchTable(.adam, table, .{hp});
     }
-    pub fn gather(self: *Gpu, images: []const f32, labels_src: []const u8, order: []const u32, batch: []f32, labels_out: []u8, start: usize, rows: usize, pixels: usize) Error!void {
-        try self.launchFlat(.gather, rows * pixels, .{
-            address(images), address(labels_src), address(order), address(batch), address(labels_out),
-            toU32(start),    toU32(rows),         toU32(pixels),
-        });
+    pub fn gather(self: *Gpu, images: []const f32, labels_src: []const u8, order: []const u32, batch: []f32, labels_out: []u8, start: usize, augment: Augment) Error!void {
+        const rows = labels_out.len;
+        const pixels = batch.len / rows;
+        const args: ga.GatherArgs = .{ .start = toU32(start), .rows = toU32(rows), .pixels = toU32(pixels), .max_shift = augment.max_shift, .seed = augment.seed };
+        try self.launchFlat(.gather, rows * pixels, .{ address(images), address(labels_src), address(order), address(batch), address(labels_out), args });
     }
 };
 

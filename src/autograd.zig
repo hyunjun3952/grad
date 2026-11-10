@@ -114,7 +114,7 @@ pub const Tape = struct {
         if (self.par.gpu) |dev| {
             const out = try self.newTensor(ops.BroadcastResult(@TypeOf(a), @TypeOf(b)));
             const bc = comptime ops.broadcast(@TypeOf(a).shape, @TypeOf(b).shape);
-            try dev.elementwise(op, a.data, b.data, out.data, padTo4(&bc.dims, 1), padTo4(&bc.a, 0), padTo4(&bc.b, 0));
+            try dev.elementwise(op, a.data, b.data, out.data, .{ .dims = padTo4(&bc.dims, 1), .a_strides = padTo4(&bc.a, 0), .b_strides = padTo4(&bc.b, 0) });
             return out;
         }
         return switch (op) {
@@ -153,7 +153,7 @@ pub const Tape = struct {
             if (comptime std.mem.eql(usize, D.shape, G.shape)) {
                 try dev.addInPlace(v.grad.data, g.data);
             } else {
-                try dev.sumTo(g.data, v.grad.data, padTo4(G.shape, 1), rowMajorStrides4(G.shape), comptime reducedAxisMask(D.shape), true);
+                try dev.sumTo(g.data, v.grad.data, .{ .dims = padTo4(G.shape, 1), .strides = rowMajorStrides4(G.shape), .mask = comptime reducedAxisMask(D.shape) }, true);
             }
             return;
         }
@@ -384,7 +384,7 @@ pub const Tape = struct {
         if (self.par.gpu) |dev| {
             logp = try self.newTensor(L);
             value = try self.newTensor(Scalar);
-            try dev.crossEntropy(logits.value.data, logp.data, labels, value.data, rows, cols);
+            try dev.crossEntropy(logits.value.data, logp.data, labels, value.data, cols);
         } else {
             logp = try ops.logSoftmax(self.gpa, logits.value);
             var total: f64 = 0;
@@ -397,7 +397,7 @@ pub const Tape = struct {
         const Ctx = struct { logits: @TypeOf(logits), logp: L, labels: []const u8, out: @TypeOf(out) };
         if (out.needs_grad) try self.recordBackward(Ctx{ .logits = logits, .logp = logp, .labels = labels, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
-                if (t.par.gpu) |dev| return dev.crossEntropyBackward(c.logp.data, c.labels, c.logits.grad.data, c.out.grad.data, rows, cols);
+                if (t.par.gpu) |dev| return dev.crossEntropyBackward(c.logp.data, c.labels, c.logits.grad.data, c.out.grad.data, cols);
                 const scale = c.out.grad.data[0] / rows;
                 for (0..rows) |i| {
                     for (0..cols) |j| {

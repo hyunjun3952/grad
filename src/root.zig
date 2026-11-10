@@ -1,4 +1,6 @@
+pub const augment = @import("gpu/augment.zig");
 pub const autograd = @import("autograd.zig");
+pub const checkpoint = @import("checkpoint.zig");
 pub const gpu = @import("gpu/gpu.zig");
 pub const kernels = @import("kernels.zig");
 pub const mnist = @import("mnist.zig");
@@ -14,5 +16,6 @@ test {
     _ = @import("gpu/parity.zig");
     _ = @import("gpu/conv.zig");
     _ = @import("gpu/dropout.zig");
+    _ = @import("gpu/augment.zig");
     _ = @import("gpu/norm.zig");
 }

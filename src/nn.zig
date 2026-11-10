@@ -56,6 +56,10 @@ pub fn Linear(comptime n_in: usize, comptime n_out: usize) type {
         pub fn params(self: Self) struct { Var(W), Var(B) } {
             return .{ self.w, self.b };
         }
+
+        pub fn state(self: Self) struct { []f32, []f32 } {
+            return .{ self.w.value.data, self.b.value.data };
+        }
     };
 }
 
@@ -122,6 +126,10 @@ pub fn BatchNorm(comptime c: usize) type {
         pub fn params(self: Self) struct { Var(V), Var(V) } {
             return .{ self.gamma, self.beta };
         }
+
+        pub fn state(self: Self) struct { []f32, []f32, []f32, []f32 } {
+            return .{ self.gamma.value.data, self.beta.value.data, self.mean.data, self.variance.data };
+        }
     };
 }
 
@@ -151,6 +159,10 @@ pub fn Conv2d(comptime c_in: usize, comptime c_out: usize, comptime k: usize, co
 
         pub fn params(self: Self) @TypeOf(self.inner.params()) {
             return self.inner.params();
+        }
+
+        pub fn state(self: Self) @TypeOf(self.inner.state()) {
+            return self.inner.state();
         }
     };
 }

@@ -56,11 +56,7 @@ pub fn Tensor(comptime T: type, comptime dims: []const usize) type {
     };
 }
 
-pub const MatmulOpts = struct {
-    trans_a: bool = false,
-    trans_b: bool = false,
-    accumulate: bool = false,
-};
+pub const MatmulOpts = @import("gpu/gpu.zig").MatmulOpts;
 
 pub fn MatmulResult(comptime A: type, comptime B: type, comptime opts: MatmulOpts) type {
     if (A.rank != 2 or B.rank != 2) {
@@ -100,7 +96,7 @@ pub fn matmulInto(
     const N = @TypeOf(out).shape[1];
     const K = if (opts.trans_a) A.shape[0] else A.shape[1];
 
-    if (par.gpu) |g| return g.matmul(a.data, b.data, out.data, opts.trans_a, opts.trans_b, opts.accumulate, M, N, K);
+    if (par.gpu) |g| return g.matmul(a.data, b.data, out.data, .{ .m = M, .n = N, .k = K }, opts);
 
     const cfg: kernels.TileConfig = .{ .trans_a = opts.trans_a, .trans_b = opts.trans_b, .accumulate = opts.accumulate };
     const work = try gpa.alloc(A.Elem, kernels.matmulTiledWorkLen(A.Elem, cfg, par, M, K, N));

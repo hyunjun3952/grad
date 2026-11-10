@@ -1,3 +1,4 @@
+const aug = @import("augment.zig");
 const ga = @import("args.zig");
 const cv = @import("conv.zig");
 const drop = @import("dropout.zig");
@@ -142,36 +143,19 @@ comptime {
     exportGemm("sgemmSmallNT", 32, 32, false, true);
     exportGemm("sgemmSmallTN", 32, 32, true, false);
 }
-export fn elementwise(
-    a: [*]const f32,
-    b: [*]const f32,
-    out: [*]f32,
-    n: u32,
-    multiply: u32,
-    d1: u32,
-    d2: u32,
-    d3: u32,
-    sa0: u32,
-    sa1: u32,
-    sa2: u32,
-    sa3: u32,
-    sb0: u32,
-    sb1: u32,
-    sb2: u32,
-    sb3: u32,
-) callconv(.nvptx_kernel) void {
+export fn elementwise(a: [*]const f32, b: [*]const f32, out: [*]f32, args: ga.ElementwiseArgs) callconv(.nvptx_kernel) void {
     const t = globalIndex();
-    if (t >= n) return;
+    if (t >= args.len) return;
     var rest = t;
-    const p3 = rest % d3;
-    rest /= d3;
-    const p2 = rest % d2;
-    rest /= d2;
-    const p1 = rest % d1;
-    const p0 = rest / d1;
-    const x = a[p0 * sa0 + p1 * sa1 + p2 * sa2 + p3 * sa3];
-    const y = b[p0 * sb0 + p1 * sb1 + p2 * sb2 + p3 * sb3];
-    out[t] = if (multiply != 0) x * y else x + y;
+    const p3 = rest % args.dims[3];
+    rest /= args.dims[3];
+    const p2 = rest % args.dims[2];
+    rest /= args.dims[2];
+    const p1 = rest % args.dims[1];
+    const p0 = rest / args.dims[1];
+    const x = a[p0 * args.a_strides[0] + p1 * args.a_strides[1] + p2 * args.a_strides[2] + p3 * args.a_strides[3]];
+    const y = b[p0 * args.b_strides[0] + p1 * args.b_strides[1] + p2 * args.b_strides[2] + p3 * args.b_strides[3]];
+    out[t] = if (args.multiply != 0) x * y else x + y;
 }
 
 export fn relu(x: [*]const f32, out: [*]f32, n: u32) callconv(.nvptx_kernel) void {
@@ -189,27 +173,12 @@ export fn addInPlace(dst: [*]f32, src: [*]const f32, n: u32) callconv(.nvptx_ker
     if (t < n) dst[t] += src[t];
 }
 
-export fn sumTo(
-    in: [*]const f32,
-    out: [*]f32,
-    out_len: u32,
-    reduce_count: u32,
-    rmask: u32,
-    accumulate: u32,
-    d0: u32,
-    d1: u32,
-    d2: u32,
-    d3: u32,
-    s0: u32,
-    s1: u32,
-    s2: u32,
-    s3: u32,
-) callconv(.nvptx_kernel) void {
-    _ = out_len;
+export fn sumTo(in: [*]const f32, out: [*]f32, args: ga.SumArgs) callconv(.nvptx_kernel) void {
     const t: usize = @workGroupId(0);
     const tid: usize = @workItemId(0);
-    const d = [4]usize{ d0, d1, d2, d3 };
-    const s = [4]usize{ s0, s1, s2, s3 };
+    const d = [4]usize{ args.dims[0], args.dims[1], args.dims[2], args.dims[3] };
+    const s = [4]usize{ args.strides[0], args.strides[1], args.strides[2], args.strides[3] };
+    const rmask = args.mask;
 
     var base: usize = 0;
     var rest: usize = t;
@@ -223,7 +192,7 @@ export fn sumTo(
 
     var total: f32 = 0;
     var q: usize = tid;
-    while (q < reduce_count) : (q += threads) {
+    while (q < args.reduce_count) : (q += threads) {
         var left = q;
         var at = base;
         inline for (0..4) |step| {
@@ -236,7 +205,7 @@ export fn sumTo(
         total += in[at];
     }
     const sum = blockSum(total, tid);
-    if (tid == 0) out[t] = if (accumulate != 0) out[t] + sum else sum;
+    if (tid == 0) out[t] = if (args.accumulate != 0) out[t] + sum else sum;
 }
 
 const column = struct {
@@ -359,32 +328,28 @@ export fn crossEntropyBackward(logp: [*]const f32, labels: [*]const u8, grad: [*
     grad[t] += p * (loss_grad[0] / @as(f32, @floatFromInt(rows)));
 }
 
-fn convDims(n: u32, h: u32, w: u32, c: u32, k: u32, stride: u32, pad: u32) cv.Dims {
-    return .{ .n = n, .h = h, .w = w, .c = c, .k = k, .stride = stride, .pad = pad };
+export fn im2col(x: [*]const f32, col: [*]f32, len: u32, d: cv.Dims) callconv(.nvptx_kernel) void {
+    if (globalIndex() < len) cv.im2col(x, col, @intCast(globalIndex()), d);
 }
 
-export fn im2col(x: [*]const f32, col: [*]f32, len: u32, n: u32, h: u32, w: u32, c: u32, k: u32, stride: u32, pad: u32) callconv(.nvptx_kernel) void {
-    if (globalIndex() < len) cv.im2col(x, col, @intCast(globalIndex()), convDims(n, h, w, c, k, stride, pad));
+export fn col2im(dcol: [*]const f32, dx: [*]f32, len: u32, d: cv.Dims) callconv(.nvptx_kernel) void {
+    if (globalIndex() < len) cv.col2im(dcol, dx, @intCast(globalIndex()), d);
 }
 
-export fn col2im(dcol: [*]const f32, dx: [*]f32, len: u32, n: u32, h: u32, w: u32, c: u32, k: u32, stride: u32, pad: u32) callconv(.nvptx_kernel) void {
-    if (globalIndex() < len) cv.col2im(dcol, dx, @intCast(globalIndex()), convDims(n, h, w, c, k, stride, pad));
+export fn maxPool(x: [*]const f32, out: [*]f32, len: u32, d: cv.Dims) callconv(.nvptx_kernel) void {
+    if (globalIndex() < len) cv.maxPool(x, out, @intCast(globalIndex()), d);
 }
 
-export fn maxPool(x: [*]const f32, out: [*]f32, len: u32, n: u32, h: u32, w: u32, c: u32, k: u32, stride: u32, pad: u32) callconv(.nvptx_kernel) void {
-    if (globalIndex() < len) cv.maxPool(x, out, @intCast(globalIndex()), convDims(n, h, w, c, k, stride, pad));
+export fn avgPool(x: [*]const f32, out: [*]f32, len: u32, d: cv.Dims) callconv(.nvptx_kernel) void {
+    if (globalIndex() < len) cv.avgPool(x, out, @intCast(globalIndex()), d);
 }
 
-export fn avgPool(x: [*]const f32, out: [*]f32, len: u32, n: u32, h: u32, w: u32, c: u32, k: u32, stride: u32, pad: u32) callconv(.nvptx_kernel) void {
-    if (globalIndex() < len) cv.avgPool(x, out, @intCast(globalIndex()), convDims(n, h, w, c, k, stride, pad));
+export fn avgPoolBackward(gout: [*]const f32, gin: [*]f32, len: u32, d: cv.Dims) callconv(.nvptx_kernel) void {
+    if (globalIndex() < len) cv.avgPoolBackward(gout, gin, @intCast(globalIndex()), d);
 }
 
-export fn avgPoolBackward(gout: [*]const f32, gin: [*]f32, len: u32, n: u32, h: u32, w: u32, c: u32, k: u32, stride: u32, pad: u32) callconv(.nvptx_kernel) void {
-    if (globalIndex() < len) cv.avgPoolBackward(gout, gin, @intCast(globalIndex()), convDims(n, h, w, c, k, stride, pad));
-}
-
-export fn maxPoolBackward(x: [*]const f32, gout: [*]const f32, gin: [*]f32, len: u32, n: u32, h: u32, w: u32, c: u32, k: u32, stride: u32, pad: u32) callconv(.nvptx_kernel) void {
-    if (globalIndex() < len) cv.maxPoolBackward(x, gout, gin, @intCast(globalIndex()), convDims(n, h, w, c, k, stride, pad));
+export fn maxPoolBackward(x: [*]const f32, gout: [*]const f32, gin: [*]f32, len: u32, d: cv.Dims) callconv(.nvptx_kernel) void {
+    if (globalIndex() < len) cv.maxPoolBackward(x, gout, gin, @intCast(globalIndex()), d);
 }
 
 export fn dropout(src: [*]const f32, dst: [*]f32, len: u32, seed: u64, keep: f32, accumulate: u32) callconv(.nvptx_kernel) void {
@@ -438,21 +403,13 @@ export fn adam(table: ga.TensorTable, hp: ga.AdamArgs) callconv(.nvptx_kernel) v
     v[0] = v_new;
     w[0] -= hp.step * m_new / (@sqrt(v_new) * hp.inv_sqrt_c2 + hp.eps) + hp.decay * w[0];
 }
-export fn gather(
-    images: [*]const f32,
-    labels_src: [*]const u8,
-    order: [*]const u32,
-    batch: [*]f32,
-    labels_out: [*]u8,
-    start: u32,
-    rows: u32,
-    pixels: u32,
-) callconv(.nvptx_kernel) void {
+export fn gather(images: [*]const f32, labels_src: [*]const u8, order: [*]const u32, batch: [*]f32, labels_out: [*]u8, args: ga.GatherArgs) callconv(.nvptx_kernel) void {
     const t = globalIndex();
-    if (t >= @as(usize, rows) * pixels) return;
-    const r = t / pixels;
-    const p = t % pixels;
-    const idx: usize = order[start + r];
-    batch[t] = images[idx * pixels + p];
+    if (t >= @as(usize, args.rows) * args.pixels) return;
+    const r = t / args.pixels;
+    const p = t % args.pixels;
+    const idx: usize = order[args.start + r];
+    const shift = aug.shiftOf(args.seed, args.start + r, args.max_shift);
+    batch[t] = aug.pixel(images + idx * args.pixels, p, aug.side(args.pixels), shift);
     if (p == 0) labels_out[r] = labels_src[idx];
 }

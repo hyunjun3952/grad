@@ -281,10 +281,10 @@ fn gpuMatmul(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
         try dev.fill(b, 0.25);
         try out.print("{d:>5}x{d:>5}x{d:>5}", .{ m, n, k });
         for ([_][2]bool{ .{ false, false }, .{ false, true }, .{ true, false } }) |t| {
-            try dev.matmul(a, b, c, t[0], t[1], false, m, n, k);
+            try dev.matmul(a, b, c, .{ .m = m, .n = n, .k = k }, .{ .trans_a = t[0], .trans_b = t[1] });
             try dev.cu.sync();
             const t0 = Io.Clock.awake.now(io);
-            for (0..20) |_| try dev.matmul(a, b, c, t[0], t[1], false, m, n, k);
+            for (0..20) |_| try dev.matmul(a, b, c, .{ .m = m, .n = n, .k = k }, .{ .trans_a = t[0], .trans_b = t[1] });
             try dev.cu.sync();
             const ns: f64 = @floatFromInt(Io.Clock.awake.now(io).nanoseconds - t0.nanoseconds);
             try out.print("{d:>10.2}", .{2.0 * @as(f64, @floatFromInt(m * n * k)) * 20 / ns / 1000});

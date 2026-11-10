@@ -41,6 +41,10 @@ const Mlp = struct {
         return self.l1.params() ++ self.l2.params();
     }
 
+    fn state(self: Mlp) @TypeOf(self.l1.state() ++ self.l2.state()) {
+        return self.l1.state() ++ self.l2.state();
+    }
+
     fn forward(self: Mlp, tape: *Tape, x: anytype) grad.autograd.Error!Var(Tensor(f32, &.{ @TypeOf(x.value).shape[0], classes })) {
         return self.l2.forward(tape, try tape.dropout(try tape.relu(try self.l1.forward(tape, x)), 0.8));
     }
@@ -79,6 +83,10 @@ const Cnn = struct {
 
     fn params(self: Cnn) @TypeOf(self.c1.params() ++ self.n1.params() ++ self.c2.params() ++ self.n2.params() ++ self.fc.params()) {
         return self.c1.params() ++ self.n1.params() ++ self.c2.params() ++ self.n2.params() ++ self.fc.params();
+    }
+
+    fn state(self: Cnn) @TypeOf(self.c1.state() ++ self.n1.state() ++ self.c2.state() ++ self.n2.state() ++ self.fc.state()) {
+        return self.c1.state() ++ self.n1.state() ++ self.c2.state() ++ self.n2.state() ++ self.fc.state();
     }
 
     fn forward(self: Cnn, tape: *Tape, x: anytype) grad.autograd.Error!Var(Tensor(f32, &.{ @TypeOf(x.value).shape[0], classes })) {
@@ -136,6 +144,9 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     var use_gpu = false;
     var profile = false;
+    var max_shift: u32 = 0;
+    var save_path: ?[]const u8 = null;
+    var load_path: ?[]const u8 = null;
     var epochs: usize = 5;
     var data_dir: []const u8 = "data/mnist";
     var positional: usize = 0;
@@ -144,6 +155,12 @@ pub fn main(init: std.process.Init) !void {
             use_gpu = true;
         } else if (std.mem.eql(u8, arg, "--profile")) {
             profile = true;
+        } else if (std.mem.startsWith(u8, arg, "--shift=")) {
+            max_shift = try std.fmt.parseInt(u32, arg["--shift=".len..], 10);
+        } else if (std.mem.startsWith(u8, arg, "--save=")) {
+            save_path = arg["--save=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--load=")) {
+            load_path = arg["--load=".len..];
         } else {
             if (positional == 0) epochs = try std.fmt.parseInt(usize, arg, 10) else data_dir = arg;
             positional += 1;
@@ -170,12 +187,15 @@ pub fn main(init: std.process.Init) !void {
     defer host_model.deinit(gpa);
     const model = if (gpu) |dev| try host_model.toGpu(dev) else host_model;
     const params = model.params();
+    if (load_path) |path| try grad.checkpoint.load(gpa, io, path, gpu, model.state());
     var adam = try grad.optim.Adam.init(gpa, par, learning_rate, params);
     defer adam.deinit();
     adam.weight_decay = weight_decay;
 
     const train_data = if (gpu) |dev| try train.toGpu(dev) else train;
     const test_data = if (gpu) |dev| try test_set.toGpu(dev) else test_set;
+
+    if (load_path != null) try out.print("loaded checkpoint, test accuracy {d:.2}%\n", .{try accuracy(gpa, par, model, test_data, test_set.labels)});
 
     const order = try gpa.alloc(u32, train.count());
     defer gpa.free(order);
@@ -209,12 +229,14 @@ pub fn main(init: std.process.Init) !void {
 
         var loss_sum: f64 = 0;
         if (gpu) |dev| try dev.fill(loss_total, 0);
+        const augment: grad.gpu.Augment = .{ .max_shift = max_shift, .seed = epoch };
         for (0..steps) |step| {
             if (gpu) |dev| {
-                try dev.gather(train_data.images, train_data.labels, order_device, batch.data, labels, step * train_batch, train_batch, pixels);
+                try dev.gather(train_data.images, train_data.labels, order_device, batch.data, labels, step * train_batch, augment);
             } else {
                 for (order[step * train_batch ..][0..train_batch], 0..) |idx, row| {
-                    @memcpy(batch.data[row * pixels ..][0..pixels], train.images[idx * pixels ..][0..pixels]);
+                    const shift = grad.augment.shiftOf(augment.seed, step * train_batch + row, augment.max_shift);
+                    for (batch.data[row * pixels ..][0..pixels], 0..) |*v, p| v.* = grad.augment.pixel(train.images[idx * pixels ..].ptr, p, grad.augment.side(pixels), shift);
                     labels[row] = train.labels[idx];
                 }
             }
@@ -237,6 +259,10 @@ pub fn main(init: std.process.Init) !void {
         const acc = try accuracy(gpa, par, model, test_data, test_set.labels);
         try out.print("epoch {d}/{d}  train loss {d:.4}  test accuracy {d:.2}%  ({d:.2} s)\n", .{ epoch + 1, epochs, loss_sum / @as(f64, @floatFromInt(steps)), acc, seconds });
         try out.flush();
+    }
+    if (save_path) |path| {
+        try grad.checkpoint.save(gpa, io, path, gpu, model.state());
+        try out.print("saved {s}\n", .{path});
     }
     if (gpu) |dev| try dev.printProfile(out);
     try out.flush();
