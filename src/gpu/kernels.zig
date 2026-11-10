@@ -1,4 +1,5 @@
 const cv = @import("conv.zig");
+const drop = @import("dropout.zig");
 
 const BM = 128;
 const BN = 128;
@@ -284,6 +285,10 @@ export fn maxPoolBackward(x: [*]const f32, gout: [*]const f32, gin: [*]f32, len:
     if (globalIndex() < len) cv.maxPoolBackward(x, gout, gin, globalIndex(), convDims(n, h, w, c, k));
 }
 
+export fn dropout(src: [*]const f32, dst: [*]f32, len: u32, seed: u64, keep: f32, accumulate: u32) callconv(.nvptx_kernel) void {
+    if (globalIndex() < len) drop.apply(src, dst, globalIndex(), seed, keep, accumulate != 0);
+}
+
 export fn sgd(w: [*]f32, g: [*]const f32, lr: f32, n: u32) callconv(.nvptx_kernel) void {
     const t = globalIndex();
     if (t < n) w[t] -= lr * g[t];
@@ -300,6 +305,7 @@ export fn adam(
     step: f32,
     inv_sqrt_c2: f32,
     eps: f32,
+    decay: f32,
 ) callconv(.nvptx_kernel) void {
     const t = globalIndex();
     if (t >= n) return;
@@ -308,7 +314,7 @@ export fn adam(
     const v_new = b2 * v[t] + (1 - b2) * grad * grad;
     m[t] = m_new;
     v[t] = v_new;
-    w[t] -= step * m_new / (@sqrt(v_new) * inv_sqrt_c2 + eps);
+    w[t] -= step * m_new / (@sqrt(v_new) * inv_sqrt_c2 + eps) + decay * w[t];
 }
 
 export fn gather(

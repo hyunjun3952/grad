@@ -34,6 +34,11 @@ pub fn sgd(par: kernels.Parallel, lr: f32, params: anytype) !void {
     }
 }
 
+pub fn cosineLr(base: f32, step: usize, total: usize) f32 {
+    const progress = @as(f32, @floatFromInt(step)) / @as(f32, @floatFromInt(total));
+    return 0.5 * base * (1 + @cos(std.math.pi * progress));
+}
+
 pub const Adam = struct {
     gpa: std.mem.Allocator,
     on_gpu: bool,
@@ -44,6 +49,7 @@ pub const Adam = struct {
     beta1: f32 = 0.9,
     beta2: f32 = 0.999,
     eps: f32 = 1e-8,
+    weight_decay: f32 = 0,
 
     pub fn init(gpa: std.mem.Allocator, par: kernels.Parallel, lr: f32, params: anytype) !Adam {
         var total: usize = 0;
@@ -79,7 +85,7 @@ pub const Adam = struct {
             var at: usize = 0;
             inline for (params) |p| {
                 const len = p.value.data.len;
-                try dev.adam(p.value.data, p.grad.data, self.m[at..][0..len], self.v[at..][0..len], self.beta1, self.beta2, @floatCast(self.lr / c1), @floatCast(1 / @sqrt(c2)), self.eps);
+                try dev.adam(p.value.data, p.grad.data, self.m[at..][0..len], self.v[at..][0..len], self.beta1, self.beta2, @floatCast(self.lr / c1), @floatCast(1 / @sqrt(c2)), self.eps, self.lr * self.weight_decay);
                 at += len;
             }
             return;
@@ -88,7 +94,7 @@ pub const Adam = struct {
         var off: usize = 0;
         inline for (params) |p| {
             const len = p.value.data.len;
-            const Ctx = struct { w: []f32, g: []const f32, m: []f32, v: []f32, b1: f32, b2: f32, step: f32, inv_sqrt_c2: f32, eps: f32 };
+            const Ctx = struct { w: []f32, g: []const f32, m: []f32, v: []f32, b1: f32, b2: f32, step: f32, inv_sqrt_c2: f32, eps: f32, decay: f32 };
             const body = struct {
                 fn run(c: Ctx, lo: usize, hi: usize) void {
                     const lanes = std.simd.suggestVectorLength(f32) orelse 1;
@@ -111,7 +117,8 @@ pub const Adam = struct {
                     const inv_sqrt_c2: V = @splat(c.inv_sqrt_c2);
                     const eps: V = @splat(c.eps);
                     const w: V = c.w[i..][0..n].*;
-                    c.w[i..][0..n].* = w - scale * m / (@sqrt(v) * inv_sqrt_c2 + eps);
+                    const decay: V = @splat(c.decay);
+                    c.w[i..][0..n].* = w - scale * m / (@sqrt(v) * inv_sqrt_c2 + eps) - decay * w;
                     c.m[i..][0..n].* = m;
                     c.v[i..][0..n].* = v;
                 }
@@ -126,6 +133,7 @@ pub const Adam = struct {
                 .step = @floatCast(self.lr / c1),
                 .inv_sqrt_c2 = @floatCast(1 / @sqrt(c2)),
                 .eps = self.eps,
+                .decay = self.lr * self.weight_decay,
             };
             kernels.parallelFor(par, len, 1 << 14, ctx, body);
             off += len;
@@ -223,6 +231,8 @@ test "gpu sgd, adam and zeroGrad match the cpu versions" {
     defer cpu_adam.deinit();
     var gpu_adam = try Adam.init(gpa, gpu_par, 0.01, .{device[1]});
     defer gpu_adam.deinit();
+    cpu_adam.weight_decay = 0.1;
+    gpu_adam.weight_decay = 0.1;
 
     for (0..5) |_| {
         for (host, device) |h, d| {
@@ -270,4 +280,21 @@ test "sgd moves weights against the gradient, also across parallel chunks, and z
     try zeroGrad(.{ .io = testing.io, .threads = 4 }, .{ small, big });
     try testing.expectEqualSlices(f32, &.{ 0, 0, 0 }, small.grad.data);
     for (big.grad.data) |g| try testing.expectEqual(@as(f32, 0), g);
+}
+
+test "adam weight decay shrinks weights even with zero gradient, and cosineLr decays to zero" {
+    const gpa = testing.allocator;
+    const One = Tensor(f32, &.{1});
+    const p: Var(One) = .{ .value = try One.fromSlice(gpa, &.{1}), .grad = try One.fromSlice(gpa, &.{0}), .needs_grad = true };
+    defer p.value.deinit(gpa);
+    defer p.grad.deinit(gpa);
+    var adam = try Adam.init(gpa, .{}, 0.1, .{p});
+    defer adam.deinit();
+    adam.weight_decay = 0.5;
+    try adam.step(.{}, .{p});
+    try testing.expectApproxEqAbs(@as(f32, 0.95), p.value.data[0], 1e-6);
+
+    try testing.expectEqual(@as(f32, 0.01), cosineLr(0.01, 0, 100));
+    try testing.expectApproxEqAbs(@as(f32, 0.005), cosineLr(0.01, 50, 100), 1e-7);
+    try testing.expectApproxEqAbs(@as(f32, 0), cosineLr(0.01, 100, 100), 1e-7);
 }

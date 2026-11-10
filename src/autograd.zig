@@ -5,6 +5,7 @@ const tensor = @import("tensor.zig");
 const kernels = @import("kernels.zig");
 const gpu_mod = @import("gpu/gpu.zig");
 const conv = @import("gpu/conv.zig");
+const drop = @import("gpu/dropout.zig");
 const Tensor = tensor.Tensor;
 
 pub const Error = gpu_mod.Error;
@@ -72,6 +73,8 @@ pub const Tape = struct {
     gpa: Allocator,
     par: kernels.Parallel = .{},
     nodes: std.ArrayList(Node) = .empty,
+    training: bool = false,
+    seed: u64 = 0,
 
     fn newTensor(self: *Tape, comptime Tn: type) Error!Tn {
         if (self.par.gpu) |dev| return .{ .data = try dev.scratch(Tn.Elem, Tn.len) };
@@ -202,6 +205,33 @@ pub const Tape = struct {
                 for (c.x.grad.data, c.x.value.data, c.out.grad.data) |*gx, v, g| {
                     gx.* += if (v > 0) g else 0;
                 }
+            }
+        }.run);
+        return out;
+    }
+
+    fn dropKernel(self: *Tape, src: []const f32, dst: []f32, seed: u64, keep: f32, accumulate: bool) Error!void {
+        if (self.par.gpu) |dev| return dev.dropout(src, dst, seed, keep, accumulate);
+        const Ctx = struct { src: []const f32, dst: []f32, seed: u64, keep: f32, accumulate: bool };
+        const body = struct {
+            fn run(c: Ctx, lo: usize, hi: usize) void {
+                for (lo..hi) |t| drop.apply(c.src.ptr, c.dst.ptr, t, c.seed, c.keep, c.accumulate);
+            }
+        }.run;
+        kernels.parallelFor(self.par, src.len, 1 << 14, Ctx{ .src = src, .dst = dst, .seed = seed, .keep = keep, .accumulate = accumulate }, body);
+    }
+
+    pub fn dropout(self: *Tape, x: anytype, keep: f32) Error!Var(@TypeOf(x.value)) {
+        if (!self.training) return x;
+        const seed = self.seed;
+        self.seed += 1;
+        const value = try self.newTensor(@TypeOf(x.value));
+        try self.dropKernel(x.value.data, value.data, seed, keep, false);
+        const out = try self.makeVar(value, x.needs_grad);
+        const Ctx = struct { x: @TypeOf(x), out: @TypeOf(out), seed: u64, keep: f32 };
+        if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .out = out, .seed = seed, .keep = keep }, struct {
+            fn run(t: *Tape, c: *const Ctx) Error!void {
+                try t.dropKernel(c.out.grad.data, c.x.grad.data, c.seed, c.keep, true);
             }
         }.run);
         return out;
@@ -689,4 +719,57 @@ test "gpu conv2d and max maxPool reproduce the cpu loss and gradients" {
         try gpu.download(got, @field(run, name).grad.data);
         for (want, got) |w, g| try testing.expectApproxEqAbs(w, g, 1e-5);
     }
+}
+
+test "dropout is the identity at eval, and backward reuses the forward mask" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const Row = Tensor(f32, &.{ 1, 1000 });
+    var t: Tape = .{ .gpa = arena.allocator() };
+    const x = try t.leaf(try Row.full(t.gpa, 1));
+    try testing.expectEqual(x.value.data.ptr, (try t.dropout(x, 0.8)).value.data.ptr);
+
+    t.training = true;
+    const y = try t.dropout(x, 0.8);
+    @memset(y.grad.data, 1);
+    try t.nodes.items[0].run(&t, t.nodes.items[0].ctx);
+    var kept: usize = 0;
+    for (y.value.data, x.grad.data) |v, g| {
+        try testing.expectEqual(v, g);
+        kept += @intFromBool(v != 0);
+    }
+    try testing.expect(kept > 700 and kept < 900);
+}
+
+test "gpu dropout draws the same mask as the cpu" {
+    const gpu = gpu_mod.Gpu.init(testing.allocator, 1 << 20) catch |err| switch (err) {
+        error.DriverNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer gpu.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const Row = Tensor(f32, &.{ 1, 1000 });
+
+    var cpu_tape: Tape = .{ .gpa = arena.allocator(), .training = true, .seed = 3 };
+    const cpu_x = try cpu_tape.leaf(try Row.full(cpu_tape.gpa, 1));
+    const want = try cpu_tape.dropout(cpu_x, 0.7);
+    @memset(want.grad.data, 1);
+    try cpu_tape.nodes.items[0].run(&cpu_tape, cpu_tape.nodes.items[0].ctx);
+
+    const ones = try gpu.alloc(f32, Row.len);
+    try gpu.fill(ones, 1);
+    var gpu_tape: Tape = .{ .gpa = arena.allocator(), .par = .{ .gpu = gpu }, .training = true, .seed = 3 };
+    const grad = try gpu.alloc(f32, Row.len);
+    try gpu.fill(grad, 0);
+    const gpu_x: Var(Row) = .{ .value = .{ .data = ones }, .grad = .{ .data = grad }, .needs_grad = true };
+    const got = try gpu_tape.dropout(gpu_x, 0.7);
+    try gpu.fill(got.grad.data, 1);
+    try gpu_tape.nodes.items[0].run(&gpu_tape, gpu_tape.nodes.items[0].ctx);
+
+    const back = try arena.allocator().alloc(f32, Row.len);
+    try gpu.download(back, got.value.data);
+    try testing.expectEqualSlices(f32, want.value.data, back);
+    try gpu.download(back, grad);
+    try testing.expectEqualSlices(f32, cpu_x.grad.data, back);
 }

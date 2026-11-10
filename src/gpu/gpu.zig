@@ -28,6 +28,7 @@ const Kernel = enum {
     col2im,
     maxPool,
     maxPoolBackward,
+    dropout,
 };
 const kernel_count = @typeInfo(Kernel).@"enum".field_names.len;
 
@@ -153,8 +154,8 @@ pub const Gpu = struct {
 
     pub fn elementwise(self: *Gpu, op: BinaryOp, a: []const f32, b: []const f32, out: []f32, dims: [4]u32, sa: [4]u32, sb: [4]u32) Error!void {
         try self.launchFlat(.elementwise, out.len, .{
-            address(a), address(b), address(out), toU32(out.len), @intFromBool(op == .mul), dims[1], dims[2], dims[3],
-            sa[0],      sa[1],      sa[2],        sa[3],          sb[0],                    sb[1],   sb[2],   sb[3],
+            address(a), address(b), address(out), toU32(out.len), @as(u32, @intFromBool(op == .mul)), dims[1], dims[2], dims[3],
+            sa[0],      sa[1],      sa[2],        sa[3],          sb[0],                              sb[1],   sb[2],   sb[3],
         });
     }
 
@@ -203,12 +204,16 @@ pub const Gpu = struct {
         try self.launchFlat(@field(Kernel, @tagName(op)), len, args);
     }
 
+    pub fn dropout(self: *Gpu, src: []const f32, dst: []f32, seed: u64, keep: f32, accumulate: bool) Error!void {
+        try self.launchFlat(.dropout, src.len, .{ address(src), address(dst), toU32(src.len), seed, keep, @as(u32, @intFromBool(accumulate)) });
+    }
+
     pub fn sgd(self: *Gpu, w: []f32, g: []const f32, lr: f32) Error!void {
         try self.launchFlat(.sgd, w.len, .{ address(w), address(g), lr, toU32(w.len) });
     }
 
-    pub fn adam(self: *Gpu, w: []f32, g: []const f32, m: []f32, v: []f32, b1: f32, b2: f32, step: f32, inv_sqrt_c2: f32, eps: f32) Error!void {
-        try self.launchFlat(.adam, w.len, .{ address(w), address(g), address(m), address(v), toU32(w.len), b1, b2, step, inv_sqrt_c2, eps });
+    pub fn adam(self: *Gpu, w: []f32, g: []const f32, m: []f32, v: []f32, b1: f32, b2: f32, step: f32, inv_sqrt_c2: f32, eps: f32, decay: f32) Error!void {
+        try self.launchFlat(.adam, w.len, .{ address(w), address(g), address(m), address(v), toU32(w.len), b1, b2, step, inv_sqrt_c2, eps, decay });
     }
 
     pub fn gather(self: *Gpu, images: []const f32, labels_src: []const u8, order: []const u32, batch: []f32, labels_out: []u8, start: usize, rows: usize, pixels: usize) Error!void {

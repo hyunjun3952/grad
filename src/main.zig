@@ -15,6 +15,8 @@ const hidden = config.hidden;
 const classes = 10;
 const train_batch = config.batch;
 const eval_batch = 1000;
+const learning_rate = 0.002;
+const weight_decay = 0.01;
 
 const Mlp = struct {
     l1: grad.nn.Linear(pixels, hidden),
@@ -40,7 +42,7 @@ const Mlp = struct {
     }
 
     fn forward(self: Mlp, tape: *Tape, x: anytype) grad.autograd.Error!Var(Tensor(f32, &.{ @TypeOf(x.value).shape[0], classes })) {
-        return self.l2.forward(tape, try tape.relu(try self.l1.forward(tape, x)));
+        return self.l2.forward(tape, try tape.dropout(try tape.relu(try self.l1.forward(tape, x)), 0.8));
     }
 };
 
@@ -76,7 +78,7 @@ const Cnn = struct {
         const image = grad.autograd.reshape(x, &.{ n, 28, 28, 1 });
         const a = try tape.maxPool(try tape.relu(try self.c1.forward(tape, image)));
         const b = try tape.maxPool(try tape.relu(try self.c2.forward(tape, a)));
-        return self.fc.forward(tape, grad.autograd.reshape(b, &.{ n, 512 }));
+        return self.fc.forward(tape, try tape.dropout(grad.autograd.reshape(b, &.{ n, 512 }), 0.7));
     }
 };
 
@@ -154,8 +156,9 @@ pub fn main(init: std.process.Init) !void {
     defer host_model.deinit(gpa);
     const model = if (gpu) |dev| try host_model.toGpu(dev) else host_model;
     const params = model.params();
-    var adam = try grad.optim.Adam.init(gpa, par, 0.001, params);
+    var adam = try grad.optim.Adam.init(gpa, par, learning_rate, params);
     defer adam.deinit();
+    adam.weight_decay = weight_decay;
 
     const train_data = if (gpu) |dev| try train.toGpu(dev) else train;
     const test_data = if (gpu) |dev| try test_set.toGpu(dev) else test_set;
@@ -175,7 +178,7 @@ pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
 
-    try out.print("{s}, Adam, batch {d}, {s}, {d} training images\n", .{
+    try out.print("{s}, AdamW, batch {d}, {s}, {d} training images\n", .{
         if (config.cnn) "CNN conv5x16-conv5x32-fc" else "MLP 784-" ++ std.fmt.comptimePrint("{d}", .{hidden}) ++ "-10",
         train_batch,
         if (gpu != null) "GPU" else "CPU",
@@ -202,7 +205,9 @@ pub fn main(init: std.process.Init) !void {
 
             _ = arena.reset(.retain_capacity);
             if (gpu) |dev| dev.resetStep();
-            var tape: Tape = .{ .gpa = arena.allocator(), .par = par };
+            const global_step = epoch * steps + step;
+            adam.lr = grad.optim.cosineLr(learning_rate, global_step, epochs * steps);
+            var tape: Tape = .{ .gpa = arena.allocator(), .par = par, .training = true, .seed = global_step * 8 };
             try grad.optim.zeroGrad(par, params);
             const logits = try model.forward(&tape, try tape.constant(batch));
             const loss = try tape.crossEntropy(logits, labels);
