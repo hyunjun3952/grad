@@ -169,6 +169,19 @@ export fn reluBackward(x: [*]const f32, g_out: [*]const f32, g_in: [*]f32, n: u3
     if (t < n) g_in[t] += if (x[t] > 0) g_out[t] else 0;
 }
 
+export fn addRelu(a: [*]const f32, b: [*]const f32, out: [*]f32, n: u32) callconv(.nvptx_kernel) void {
+    const t = globalIndex();
+    if (t < n) out[t] = @max(a[t] + b[t], 0);
+}
+
+export fn addReluBackward(out: [*]const f32, g: [*]const f32, grad_a: [*]f32, grad_b: [*]f32, n: u32, flags: u32) callconv(.nvptx_kernel) void {
+    const t = globalIndex();
+    if (t >= n) return;
+    const v = if (out[t] > 0) g[t] else 0;
+    if (flags & 1 != 0) grad_a[t] += v;
+    if (flags & 2 != 0) grad_b[t] += v;
+}
+
 export fn addInPlace(dst: [*]f32, src: [*]const f32, n: u32) callconv(.nvptx_kernel) void {
     const t = globalIndex();
     if (t < n) dst[t] += src[t];
@@ -219,6 +232,7 @@ export fn columnReduce(
     b: [*]const f32,
     mean: [*]const f32,
     inv_std: [*]const f32,
+    mask: [*]const f32,
     out: [*]f32,
     rows: u32,
     c: u32,
@@ -245,8 +259,9 @@ export fn columnReduce(
                 first += v - m;
                 second += (v - m) * (v - m);
             } else {
-                first += v;
-                second += v * ((b[r * c + ch] - m) * s);
+                const g = if (kind == 3 and mask[r * c + ch] <= 0) 0 else v;
+                first += g;
+                second += g * ((b[r * c + ch] - m) * s);
             }
         }
     }
@@ -289,12 +304,12 @@ export fn batchNormGradFinish(sums: [*]const f32, gamma_grad: [*]f32, beta_grad:
     beta_grad[ch] += sums[ch];
     gamma_grad[ch] += sums[c + ch];
 }
-export fn batchNormApply(x: [*]const f32, y: [*]f32, len: u32, c: u32, mean: [*]const f32, inv_std: [*]const f32, gamma: [*]const f32, beta: [*]const f32) callconv(.nvptx_kernel) void {
-    if (globalIndex() < len) nm.apply(globalIndex(), x, y, c, mean, inv_std, gamma, beta);
+export fn batchNormApply(x: [*]const f32, y: [*]f32, len: u32, c: u32, mean: [*]const f32, inv_std: [*]const f32, gamma: [*]const f32, beta: [*]const f32, fuse_relu: u32) callconv(.nvptx_kernel) void {
+    if (globalIndex() < len) nm.apply(globalIndex(), x, y, c, mean, inv_std, gamma, beta, fuse_relu != 0);
 }
 
-export fn batchNormGradInput(x: [*]const f32, dy: [*]const f32, dx: [*]f32, len: u32, c: u32, mean: [*]const f32, inv_std: [*]const f32, gamma: [*]const f32, sums: [*]const f32) callconv(.nvptx_kernel) void {
-    if (globalIndex() < len) nm.gradInput(globalIndex(), x, dy, dx, c, len / c, mean, inv_std, gamma, sums);
+export fn batchNormGradInput(x: [*]const f32, dy: [*]const f32, dx: [*]f32, len: u32, c: u32, mean: [*]const f32, inv_std: [*]const f32, gamma: [*]const f32, sums: [*]const f32, mask: [*]const f32, use_mask: u32) callconv(.nvptx_kernel) void {
+    if (globalIndex() < len) nm.gradInput(globalIndex(), x, dy, dx, c, len / c, mean, inv_std, gamma, sums, mask, use_mask != 0);
 }
 
 export fn crossEntropyRows(x: [*]const f32, logp: [*]f32, labels: [*]const u8, row_loss: [*]f32, rows: u32, cols: u32, smoothing: f32) callconv(.nvptx_kernel) void {

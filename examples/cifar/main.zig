@@ -28,7 +28,7 @@ const Network = struct {
 };
 
 fn residual(tape: *Tape, first: anytype, second: anytype, x: anytype) grad.autograd.Error!@TypeOf(x) {
-    return tape.relu(try tape.add(try second.forward(tape, try tape.relu(try first.forward(tape, x))), x));
+    return tape.addRelu(try second.forward(tape, try first.forwardRelu(tape, x)), x);
 }
 
 const Cifar = struct {
@@ -50,10 +50,10 @@ const Cifar = struct {
         const n = @TypeOf(x.value).shape[0];
         const image = grad.autograd.reshape(x, &.{ n, 32, 32, 3 });
 
-        const stage1 = try tape.maxPool(try residual(tape, a2, b2, try residual(tape, a1, b1, try tape.relu(try stem.forward(tape, image)))));
-        const down2 = try tape.relu(try tape.add(try b3.forward(tape, try tape.relu(try a3.forward(tape, stage1))), try skip3.forward(tape, stage1)));
+        const stage1 = try tape.maxPool(try residual(tape, a2, b2, try residual(tape, a1, b1, try stem.forwardRelu(tape, image))));
+        const down2 = try tape.addRelu(try b3.forward(tape, try a3.forwardRelu(tape, stage1)), try skip3.forward(tape, stage1));
         const stage2 = try tape.maxPool(try residual(tape, a4, b4, down2));
-        const down3 = try tape.relu(try tape.add(try b5.forward(tape, try tape.relu(try a5.forward(tape, stage2))), try skip5.forward(tape, stage2)));
+        const down3 = try tape.addRelu(try b5.forward(tape, try a5.forwardRelu(tape, stage2)), try skip5.forward(tape, stage2));
         const stage3 = try tape.maxPool(try residual(tape, a6, b6, down3));
         const pooled = try tape.avgPool(try tape.avgPool(stage3));
         return fc.forward(tape, try tape.dropout(grad.autograd.reshape(pooled, &.{ n, 256 }), 0.2));

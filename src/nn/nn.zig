@@ -129,6 +129,10 @@ pub fn BatchNorm(comptime c: usize) type {
             return tape.batchNorm(x, self.gamma, self.beta, .{ .mean = self.mean, .variance = self.variance });
         }
 
+        pub fn forwardRelu(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(@TypeOf(x.value)) {
+            return tape.batchNormRelu(x, self.gamma, self.beta, .{ .mean = self.mean, .variance = self.variance });
+        }
+
         pub fn params(self: Self) struct { Var(V), Var(V) } {
             return .{ self.gamma, self.beta };
         }
@@ -200,6 +204,10 @@ pub fn ConvBn(comptime c_in: usize, comptime c_out: usize, comptime k: usize, co
 
         pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(Tensor(f32, &.{ @TypeOf(x.value).shape[0], (@TypeOf(x.value).shape[1] + 2 * opts.pad - k) / opts.stride + 1, (@TypeOf(x.value).shape[2] + 2 * opts.pad - k) / opts.stride + 1, c_out })) {
             return self.norm.forward(tape, try tape.conv2d(x, self.conv.inner.w, opts));
+        }
+
+        pub fn forwardRelu(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(Tensor(f32, &.{ @TypeOf(x.value).shape[0], (@TypeOf(x.value).shape[1] + 2 * opts.pad - k) / opts.stride + 1, (@TypeOf(x.value).shape[2] + 2 * opts.pad - k) / opts.stride + 1, c_out })) {
+            return self.norm.forwardRelu(tape, try tape.conv2d(x, self.conv.inner.w, opts));
         }
 
         pub fn params(self: Self) @TypeOf(.{self.conv.inner.w} ++ self.norm.params()) {

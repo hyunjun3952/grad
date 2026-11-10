@@ -184,6 +184,30 @@ pub const Tape = struct {
         return out;
     }
 
+    pub fn addRelu(self: *Tape, a: anytype, b: anytype) Error!Var(@TypeOf(a.value)) {
+        comptime if (@TypeOf(a.value) != @TypeOf(b.value)) @compileError("addRelu expects two tensors of the same shape");
+        const T = @TypeOf(a.value);
+        const value = try self.newTensor(T);
+        if (self.par.gpu) |dev| {
+            try dev.addRelu(a.value.data, b.value.data, value.data);
+        } else {
+            for (value.data, a.value.data, b.value.data) |*o, x, y| o.* = @max(x + y, 0);
+        }
+        const out = try self.makeVar(value, a.needs_grad or b.needs_grad);
+        const Ctx = struct { a: @TypeOf(a), b: @TypeOf(b), out: @TypeOf(out) };
+        if (out.needs_grad) try self.recordBackward(Ctx{ .a = a, .b = b, .out = out }, struct {
+            fn run(t: *Tape, c: *const Ctx) Error!void {
+                if (t.par.gpu) |dev| return dev.addReluBackward(c.out.value.data, c.out.grad.data, c.a.grad.data, c.b.grad.data, c.a.needs_grad, c.b.needs_grad);
+                for (c.out.value.data, c.out.grad.data, 0..) |o, g, i| {
+                    const v = if (o > 0) g else 0;
+                    if (c.a.needs_grad) c.a.grad.data[i] += v;
+                    if (c.b.needs_grad) c.b.grad.data[i] += v;
+                }
+            }
+        }.run);
+        return out;
+    }
+
     pub fn mul(self: *Tape, a: anytype, b: anytype) Error!Var(ops.BroadcastResult(@TypeOf(a.value), @TypeOf(b.value))) {
         const out = try self.makeVar(try self.elementwise(.mul, a.value, b.value), a.needs_grad or b.needs_grad);
         const Ctx = struct { a: @TypeOf(a), b: @TypeOf(b), out: @TypeOf(out) };
@@ -252,6 +276,14 @@ pub const Tape = struct {
     }
 
     pub fn batchNorm(self: *Tape, x: anytype, gamma: anytype, beta: anytype, running: anytype) Error!Var(@TypeOf(x.value)) {
+        return self.batchNormImpl(false, x, gamma, beta, running);
+    }
+
+    pub fn batchNormRelu(self: *Tape, x: anytype, gamma: anytype, beta: anytype, running: anytype) Error!Var(@TypeOf(x.value)) {
+        return self.batchNormImpl(true, x, gamma, beta, running);
+    }
+
+    fn batchNormImpl(self: *Tape, comptime fuse_relu: bool, x: anytype, gamma: anytype, beta: anytype, running: anytype) Error!Var(@TypeOf(x.value)) {
         const In = @TypeOf(x.value);
         const c = In.shape[In.rank - 1];
         const Channels = Tensor(f32, &.{c});
@@ -261,10 +293,10 @@ pub const Tape = struct {
         const value = try self.newTensor(In);
         if (self.par.gpu) |dev| {
             try dev.batchNormStats(x.value.data, mean.data, inv_std.data, running.mean.data, running.variance.data, self.training);
-            try dev.batchNormApply(x.value.data, value.data, mean.data, inv_std.data, gamma.value.data, beta.value.data);
+            try dev.batchNormApply(x.value.data, value.data, mean.data, inv_std.data, gamma.value.data, beta.value.data, fuse_relu);
         } else {
             norm.stats(x.value.data, mean.data, inv_std.data, running.mean.data, running.variance.data, self.training);
-            kernels.parallelEach(self.par, In.len, norm.apply, .{ x.value.data, value.data, c, mean.data, inv_std.data, gamma.value.data, beta.value.data });
+            kernels.parallelEach(self.par, In.len, norm.apply, .{ x.value.data, value.data, c, mean.data, inv_std.data, gamma.value.data, beta.value.data, fuse_relu });
         }
         const out = try self.makeVar(value, x.needs_grad or gamma.needs_grad or beta.needs_grad);
 
@@ -272,12 +304,13 @@ pub const Tape = struct {
         if (out.needs_grad and self.training) try self.recordBackward(Ctx{ .x = x, .gamma = gamma, .beta = beta, .mean = mean, .inv_std = inv_std, .out = out }, struct {
             fn run(t: *Tape, k: *const Ctx) Error!void {
                 const sums = try t.zeroedTensor(Tensor(f32, &.{2 * c}));
+                const mask: []const f32 = if (fuse_relu) k.out.value.data else &.{};
                 if (t.par.gpu) |dev| {
-                    try dev.batchNormGradSums(k.x.value.data, k.out.grad.data, k.mean.data, k.inv_std.data, sums.data, k.gamma.grad.data, k.beta.grad.data);
-                    if (k.x.needs_grad) try dev.batchNormGradInput(k.x.value.data, k.out.grad.data, k.x.grad.data, k.mean.data, k.inv_std.data, k.gamma.value.data, sums.data);
+                    try dev.batchNormGradSums(k.x.value.data, k.out.grad.data, k.mean.data, k.inv_std.data, sums.data, k.gamma.grad.data, k.beta.grad.data, mask);
+                    if (k.x.needs_grad) try dev.batchNormGradInput(k.x.value.data, k.out.grad.data, k.x.grad.data, k.mean.data, k.inv_std.data, k.gamma.value.data, sums.data, mask);
                 } else {
-                    norm.gradSums(k.x.value.data, k.out.grad.data, k.mean.data, k.inv_std.data, sums.data, k.gamma.grad.data, k.beta.grad.data);
-                    if (k.x.needs_grad) kernels.parallelEach(t.par, In.len, norm.gradInput, .{ k.x.value.data, k.out.grad.data, k.x.grad.data, c, rows, k.mean.data, k.inv_std.data, k.gamma.value.data, sums.data });
+                    norm.gradSums(k.x.value.data, k.out.grad.data, k.mean.data, k.inv_std.data, sums.data, k.gamma.grad.data, k.beta.grad.data, mask);
+                    if (k.x.needs_grad) kernels.parallelEach(t.par, In.len, norm.gradInput, .{ k.x.value.data, k.out.grad.data, k.x.grad.data, c, rows, k.mean.data, k.inv_std.data, k.gamma.value.data, sums.data, if (fuse_relu) k.out.value.data else k.out.grad.data, fuse_relu });
                 }
             }
         }.run);
@@ -780,6 +813,158 @@ const BnCase = struct {
         return .{ .loss = loss, .x = x, .gamma = gamma, .beta = beta, .v = v, .running_mean = running_mean, .running_var = running_var };
     }
 };
+
+const BnReluCase = struct {
+    pub const Inputs = BnCase.Inputs;
+    pub const names = BnCase.names;
+    pub const value_names = BnCase.value_names;
+    pub const labels = BnCase.labels;
+
+    fn network(t: *Tape, p: Inputs, label_slice: []const u8, comptime fused: bool) !BnCase.Result {
+        const x = try t.leaf(p.x);
+        const gamma = try t.leaf(p.gamma);
+        const beta = try t.leaf(p.beta);
+        const v = try t.leaf(p.v);
+        const running_mean = try t.zeroedTensor(BnCase.Channels);
+        const running_var = try t.filledTensor(BnCase.Channels, 1);
+        const stats = .{ .mean = running_mean, .variance = running_var };
+        const activated = if (fused) try t.batchNormRelu(x, gamma, beta, stats) else try t.relu(try t.batchNorm(x, gamma, beta, stats));
+        const loss = try t.crossEntropy(try t.matmul(activated, v), label_slice);
+        return .{ .loss = loss, .x = x, .gamma = gamma, .beta = beta, .v = v, .running_mean = running_mean, .running_var = running_var };
+    }
+
+    pub fn build(t: *Tape, p: Inputs, label_slice: []const u8) !BnCase.Result {
+        return network(t, p, label_slice, true);
+    }
+
+    pub fn acceptable(gpa: Allocator, p: Inputs) !bool {
+        var t: Tape = .{ .gpa = gpa, .training = true };
+        const running_mean = try t.zeroedTensor(BnCase.Channels);
+        const running_var = try t.filledTensor(BnCase.Channels, 1);
+        const y = try t.batchNorm(try t.constant(p.x), try t.constant(p.gamma), try t.constant(p.beta), .{ .mean = running_mean, .variance = running_var });
+        var smallest: f32 = std.math.floatMax(f32);
+        for (y.value.data) |v| smallest = @min(smallest, @abs(v));
+        return smallest > 0.05;
+    }
+};
+
+test "fused batch norm and relu gives exactly the same values and gradients as the two ops" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const p = try gradcheck.randomInputs(BnReluCase, gpa, 44);
+
+    var separate_tape: Tape = .{ .gpa = gpa, .training = true };
+    const separate = try BnReluCase.network(&separate_tape, p, &BnReluCase.labels, false);
+    try separate_tape.backward(separate.loss);
+    var fused_tape: Tape = .{ .gpa = gpa, .training = true };
+    const fused = try BnReluCase.network(&fused_tape, p, &BnReluCase.labels, true);
+    try fused_tape.backward(fused.loss);
+
+    try testing.expectEqual(separate.loss.value.data[0], fused.loss.value.data[0]);
+    inline for (BnReluCase.names) |name| {
+        try testing.expectEqualSlices(f32, @field(separate, name).grad.data, @field(fused, name).grad.data);
+    }
+    try testing.expect(fused_tape.nodes.items.len < separate_tape.nodes.items.len);
+}
+
+test "batch norm with a fused relu matches finite differences, the gpu and the tensor-core path" {
+    try gradcheck.expectFiniteDifferences(BnReluCase, 45, 1e-3, 3e-3);
+    try gradcheck.expectGpuMatchesCpu(BnReluCase, 46, 1e-5);
+    try gradcheck.expectTensorCoresClose(BnReluCase, 46, 3e-2);
+}
+
+const AddReluNet = struct {
+    const X = Tensor(f32, &.{ 4, 3 });
+    const W = Tensor(f32, &.{ 3, 5 });
+    const V = Tensor(f32, &.{ 5, 3 });
+
+    pub const Inputs = struct { x: X, w1: W, w2: W, v: V };
+    pub const names = .{ "x", "w1", "w2", "v" };
+    pub const labels = [_]u8{ 0, 2, 1, 2 };
+    const Result = struct { loss: Var(Tensor(f32, &.{})), x: Var(X), w1: Var(W), w2: Var(W), v: Var(V) };
+
+    fn network(t: *Tape, p: Inputs, label_slice: []const u8, comptime fused: bool) !Result {
+        const x = try t.leaf(p.x);
+        const w1 = try t.leaf(p.w1);
+        const w2 = try t.leaf(p.w2);
+        const v = try t.leaf(p.v);
+        const left = try t.matmul(x, w1);
+        const right = try t.matmul(x, w2);
+        const activated = if (fused) try t.addRelu(left, right) else try t.relu(try t.add(left, right));
+        const loss = try t.crossEntropy(try t.matmul(activated, v), label_slice);
+        return .{ .loss = loss, .x = x, .w1 = w1, .w2 = w2, .v = v };
+    }
+
+    pub fn build(t: *Tape, p: Inputs, label_slice: []const u8) !Result {
+        return network(t, p, label_slice, true);
+    }
+
+    pub fn acceptable(gpa: Allocator, p: Inputs) !bool {
+        var t: Tape = .{ .gpa = gpa };
+        const sum = try t.add(try t.matmul(try t.constant(p.x), try t.constant(p.w1)), try t.matmul(try t.constant(p.x), try t.constant(p.w2)));
+        var smallest: f32 = std.math.floatMax(f32);
+        for (sum.value.data) |v| smallest = @min(smallest, @abs(v));
+        return smallest > 0.05;
+    }
+};
+
+test "fused add and relu equals the two ops exactly and matches finite differences, the gpu and tensor cores" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const p = try gradcheck.randomInputs(AddReluNet, gpa, 47);
+
+    var separate_tape: Tape = .{ .gpa = gpa };
+    const separate = try AddReluNet.network(&separate_tape, p, &AddReluNet.labels, false);
+    try separate_tape.backward(separate.loss);
+    var fused_tape: Tape = .{ .gpa = gpa };
+    const fused = try AddReluNet.network(&fused_tape, p, &AddReluNet.labels, true);
+    try fused_tape.backward(fused.loss);
+    try testing.expectEqual(separate.loss.value.data[0], fused.loss.value.data[0]);
+    inline for (AddReluNet.names) |name| {
+        try testing.expectEqualSlices(f32, @field(separate, name).grad.data, @field(fused, name).grad.data);
+    }
+
+    try gradcheck.expectFiniteDifferences(AddReluNet, 48, 1e-3, 3e-3);
+    try gradcheck.expectGpuMatchesCpu(AddReluNet, 49, 1e-5);
+    try gradcheck.expectTensorCoresClose(AddReluNet, 49, 3e-2);
+}
+
+test "addRelu leaves a constant operand without a gradient, on the cpu and on the gpu" {
+    const gpu = gpu_mod.Gpu.init(testing.allocator, 1 << 20) catch |err| switch (err) {
+        error.DriverNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer gpu.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const Row = Tensor(f32, &.{ 1, 6 });
+    const left = [_]f32{ 1, -2, 3, -4, 0.5, -0.5 };
+    const right = [_]f32{ -3, 1, -1, 5, 0.25, 0.75 };
+
+    var cpu_tape: Tape = .{ .gpa = arena.allocator() };
+    const cpu_a = try cpu_tape.leaf(try Row.fromSlice(cpu_tape.gpa, &left));
+    const cpu_out = try cpu_tape.addRelu(cpu_a, try cpu_tape.constant(try Row.fromSlice(cpu_tape.gpa, &right)));
+    @memset(cpu_out.grad.data, 1);
+    try cpu_tape.nodes.items[0].run(&cpu_tape, cpu_tape.nodes.items[0].ctx);
+    try testing.expectEqualSlices(f32, &.{ 0, 0, 1, 1, 1, 1 }, cpu_a.grad.data);
+
+    const device_left = try gpu.alloc(f32, 6);
+    const device_right = try gpu.alloc(f32, 6);
+    const device_grad = try gpu.alloc(f32, 6);
+    try gpu.upload(device_left, &left);
+    try gpu.upload(device_right, &right);
+    try gpu.fill(device_grad, 0);
+    var gpu_tape: Tape = .{ .gpa = arena.allocator(), .par = .{ .gpu = gpu } };
+    const gpu_a: Var(Row) = .{ .value = .{ .data = device_left }, .grad = .{ .data = device_grad }, .needs_grad = true };
+    const gpu_out = try gpu_tape.addRelu(gpu_a, try gpu_tape.constant(Row{ .data = device_right }));
+    try gpu.fill(gpu_out.grad.data, 1);
+    try gpu_tape.nodes.items[0].run(&gpu_tape, gpu_tape.nodes.items[0].ctx);
+    var got: [6]f32 = undefined;
+    try gpu.download(&got, device_grad);
+    try testing.expectEqualSlices(f32, &.{ 0, 0, 1, 1, 1, 1 }, &got);
+}
 
 test "gpu and cpu agree on a small network" {
     try gradcheck.expectGpuMatchesCpu(SmallNet, 21, 1e-5);
