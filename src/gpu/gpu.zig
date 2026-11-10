@@ -42,6 +42,7 @@ const Kernel = enum {
     weightsToKrsc,
     convTf32Forward,
     convTf32WeightGrad,
+    convTf32WeightGradShort,
     rotateWeightsF32,
     transposeF32,
     addKrscGradient,
@@ -49,6 +50,7 @@ const Kernel = enum {
     swapWeights,
     convGemmForward,
     convGemmWeightGrad,
+    convGemmWeightGradShort,
     packWeightsRotated,
     elementwise,
     relu,
@@ -437,11 +439,15 @@ pub const Gpu = struct {
     }
 
     pub fn convTf32WeightGrad(self: *Gpu, dy_t: []const f32, positions_padded: usize, x: []const f32, out: []f32, geo: ga.ConvGeometry, c_out: usize, taps: usize) Error!void {
-        const blocks = @as(usize, ceilDiv(c_out, 128)) * ceilDiv(taps, 64);
+        const short = c_out <= 64;
+        const tile_rows: usize = if (short) 64 else 128;
+        const tile_cols: usize = if (short) 128 else 64;
+        const blocks = @as(usize, ceilDiv(c_out, tile_rows)) * ceilDiv(taps, tile_cols);
         const splits = @max(1, @min(positions_padded / 256, (128 + blocks - 1) / blocks));
         const chunk = std.mem.alignForward(usize, (positions_padded + splits - 1) / splits, 16);
         const kernel_shape = pack(ga.TensorShape, .{ .m = c_out, .n = taps, .k_padded = positions_padded, .n_padded = taps, .accumulate = true, .chunk = chunk, .transpose_out = true, .output_half = false });
-        try self.launch(.convTf32WeightGrad, .{ ceilDiv(taps, 64), ceilDiv(c_out, 128), ceilDiv(positions_padded, chunk) }, .{ dy_t, x, out, kernel_shape, geo });
+        const kernel: Kernel = if (short) .convTf32WeightGradShort else .convTf32WeightGrad;
+        try self.launch(kernel, .{ ceilDiv(taps, tile_cols), ceilDiv(c_out, tile_rows), ceilDiv(positions_padded, chunk) }, .{ dy_t, x, out, kernel_shape, geo });
     }
 
     pub fn packRotatedWeights(self: *Gpu, w: []const f32, k: usize, c_in: usize, c_out: usize) Error!Packed {
@@ -459,12 +465,16 @@ pub const Gpu = struct {
     }
 
     pub fn convImplicitWeightGrad(self: *Gpu, dy_t: Packed, x_half: []const u16, out: []f32, geo: ga.ConvGeometry, c_out: usize, taps: usize) Error!void {
-        const n_padded = std.mem.alignForward(usize, taps, 64);
-        const blocks = (dy_t.rows_padded / 128) * (n_padded / 64);
+        const short = c_out <= 64;
+        const tile_rows: usize = if (short) 64 else 128;
+        const tile_cols: usize = if (short) 128 else 64;
+        const n_padded = std.mem.alignForward(usize, taps, tile_cols);
+        const blocks = ceilDiv(c_out, tile_rows) * (n_padded / tile_cols);
         const splits = @max(1, @min(dy_t.cols_padded / 256, (128 + blocks - 1) / blocks));
         const chunk = std.mem.alignForward(usize, (dy_t.cols_padded + splits - 1) / splits, 32);
         const kernel_shape = pack(ga.TensorShape, .{ .m = c_out, .n = taps, .k_padded = dy_t.cols_padded, .n_padded = n_padded, .accumulate = true, .chunk = chunk, .transpose_out = true, .output_half = false });
-        try self.launch(.convGemmWeightGrad, .{ toU32(n_padded / 64), toU32(dy_t.rows_padded / 128), ceilDiv(dy_t.cols_padded, chunk) }, .{ dy_t.data, x_half, out, kernel_shape, geo });
+        const kernel: Kernel = if (short) .convGemmWeightGradShort else .convGemmWeightGrad;
+        try self.launch(kernel, .{ toU32(n_padded / tile_cols), ceilDiv(c_out, tile_rows), ceilDiv(dy_t.cols_padded, chunk) }, .{ dy_t.data, x_half, out, kernel_shape, geo });
     }
 
     pub fn matmulPacked(self: *Gpu, a: Packed, b: Packed, out: anytype, shape: MatmulShape, accumulate: bool, transpose_out: bool) Error!void {

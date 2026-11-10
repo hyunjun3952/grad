@@ -8,7 +8,7 @@ The goal is an engine that sits between "C with pointers" and "PyTorch": plain s
 | --- | --- | --- | --- |
 | MNIST | MLP 784-128-10 | 98.1% (10 epochs) | 0.19 s GPU, 0.26 s CPU (6 threads) |
 | MNIST | CNN conv5x16-conv5x32 + BatchNorm | 99.5% (30 epochs, light augmentation) | 0.9 s GPU, 19.5 s CPU |
-| CIFAR-10 | ResNet-14, widths 64-128-256 | 93.6-93.8% (50 epochs, flip + shift + cutout + label smoothing + EMA; varies by run) | 17.6 s GPU (bf16 tensor cores), 25.8 s (TF32), 52.8 s (strict f32) |
+| CIFAR-10 | ResNet-14, widths 64-128-256 | 93.6-93.8% (50 epochs, flip + shift + cutout + label smoothing + EMA; varies by run) | 17.2 s GPU (bf16 tensor cores), 24.6 s (TF32), 52.8 s (strict f32) |
 
 Measured on an i5-8500 (6 cores) and an RTX 3060 12 GB. About 5,200 lines including 66 tests, with no comments except for explained magic numbers.
 
@@ -63,7 +63,7 @@ The optimizer is AdamW with a cosine schedule. Checkpoints are portable between 
 
 ## Optional cuDNN backend
 
-The engine does not need cuDNN, but it can use it: `src/gpu/cudnn.zig` loads `cudnn64_9.dll` dynamically (the same way `nvcuda.dll` is loaded) and drives the legacy descriptor API, with the best algorithm per shape chosen by `cudnnFind*` and cached. `zig build bench -- cudnn` times it on the CIFAR shapes: cuDNN reaches 8 to 10 TFLOPS in f32 (TF32) and 20 to 24 TFLOPS in bf16, versus about 5 TFLOPS for the built-in f32 GEMM and 17 to 18 TFLOPS for the built-in bf16 implicit GEMM. On the CIFAR ResNet-14 an f32 epoch takes 52.8 s with the strict f32 kernels, 25.8 s with the built-in `--tf32` implicit GEMM and 24.5 s with `--cudnn`; the bf16 path (`--tensor-cores`) takes 17.6 s.
+The engine does not need cuDNN, but it can use it: `src/gpu/cudnn.zig` loads `cudnn64_9.dll` dynamically (the same way `nvcuda.dll` is loaded) and drives the legacy descriptor API, with the best algorithm per shape chosen by `cudnnFind*` and cached. `zig build bench -- cudnn` times it on the CIFAR shapes: cuDNN reaches 8 to 10 TFLOPS in f32 (TF32) and 20 to 24 TFLOPS in bf16, versus about 5 TFLOPS for the built-in f32 GEMM and 17 to 18 TFLOPS for the built-in bf16 implicit GEMM. On the CIFAR ResNet-14 an f32 epoch takes 52.8 s with the strict f32 kernels, 24.6 s with the built-in `--tf32` implicit GEMM and 24.5 s with `--cudnn`; the bf16 path (`--tensor-cores`) takes 17.2 s.
 
 ## Benchmarks
 
