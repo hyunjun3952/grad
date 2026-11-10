@@ -77,6 +77,7 @@ pub const Tape = struct {
     par: kernels.Parallel = .{},
     nodes: std.ArrayList(Node) = .empty,
     training: bool = false,
+    smoothing: f32 = 0,
     seed: u64 = 0,
 
     fn newTensor(self: *Tape, comptime Tn: type) Error!Tn {
@@ -384,25 +385,28 @@ pub const Tape = struct {
         if (self.par.gpu) |dev| {
             logp = try self.newTensor(L);
             value = try self.newTensor(Scalar);
-            try dev.crossEntropy(logits.value.data, logp.data, labels, value.data, cols);
+            try dev.crossEntropy(logits.value.data, logp.data, labels, value.data, cols, self.smoothing);
         } else {
             logp = try ops.logSoftmax(self.gpa, logits.value);
             var total: f64 = 0;
-            for (labels, 0..) |y, i| total -= logp.data[i * cols + y];
+            for (labels, 0..) |y, i| {
+                total -= (1 - self.smoothing) * logp.data[i * cols + y];
+                for (logp.data[i * cols ..][0..cols]) |lp| total -= self.smoothing / cols * lp;
+            }
             value = try Scalar.empty(self.gpa);
             value.data[0] = @floatCast(total / rows);
         }
         const out = try self.makeVar(value, logits.needs_grad);
 
-        const Ctx = struct { logits: @TypeOf(logits), logp: L, labels: []const u8, out: @TypeOf(out) };
-        if (out.needs_grad) try self.recordBackward(Ctx{ .logits = logits, .logp = logp, .labels = labels, .out = out }, struct {
+        const Ctx = struct { logits: @TypeOf(logits), logp: L, labels: []const u8, smoothing: f32, out: @TypeOf(out) };
+        if (out.needs_grad) try self.recordBackward(Ctx{ .logits = logits, .logp = logp, .labels = labels, .smoothing = self.smoothing, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
-                if (t.par.gpu) |dev| return dev.crossEntropyBackward(c.logp.data, c.labels, c.logits.grad.data, c.out.grad.data, cols);
+                if (t.par.gpu) |dev| return dev.crossEntropyBackward(c.logp.data, c.labels, c.logits.grad.data, c.out.grad.data, cols, c.smoothing);
                 const scale = c.out.grad.data[0] / rows;
                 for (0..rows) |i| {
                     for (0..cols) |j| {
-                        var p = @exp(c.logp.data[i * cols + j]);
-                        if (j == c.labels[i]) p -= 1;
+                        var p = @exp(c.logp.data[i * cols + j]) - c.smoothing / cols;
+                        if (j == c.labels[i]) p -= 1 - c.smoothing;
                         c.logits.grad.data[i * cols + j] += p * scale;
                     }
                 }
@@ -628,6 +632,21 @@ const SmallNet = struct {
     }
 };
 
+const SmoothedNet = struct {
+    pub const Inputs = SmallNet.Inputs;
+    pub const names = SmallNet.names;
+    pub const labels = SmallNet.labels;
+    pub const smoothing: f32 = 0.1;
+
+    pub fn build(t: *Tape, p: Inputs, label_slice: []const u8) !SmallNet.Result {
+        return SmallNet.build(t, p, label_slice);
+    }
+
+    pub fn acceptable(gpa: Allocator, p: Inputs) !bool {
+        return SmallNet.acceptable(gpa, p);
+    }
+};
+
 const ConvPoolNet = struct {
     const X = Tensor(f32, &.{ 2, 6, 6, 2 });
     const W = Tensor(f32, &.{ 18, 3 });
@@ -756,6 +775,24 @@ const BnCase = struct {
 test "gpu and cpu agree on a small network" {
     try gradcheck.expectGpuMatchesCpu(SmallNet, 21, 1e-5);
     try gradcheck.expectTensorCoresClose(SmallNet, 21, 3e-2);
+}
+
+test "label smoothing blends the target and its gradient with the uniform distribution" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var t: Tape = .{ .gpa = arena.allocator(), .smoothing = 0.2 };
+    const x = try t.leaf(try Tensor(f32, &.{ 1, 2 }).fromSlice(t.gpa, &.{ 1, 0 }));
+    const loss = try t.crossEntropy(x, &.{0});
+    try t.backward(loss);
+
+    try testing.expectApproxEqAbs(@as(f32, 0.4133), loss.value.data[0], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, -0.1689), x.grad.data[0], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 0.1689), x.grad.data[1], 1e-4);
+}
+
+test "gradients with label smoothing match finite differences and the gpu" {
+    try gradcheck.expectFiniteDifferences(SmoothedNet, 7, 5e-3, 3e-3);
+    try gradcheck.expectGpuMatchesCpu(SmoothedNet, 21, 1e-5);
 }
 
 test "gradients of a small network match finite differences" {

@@ -295,7 +295,7 @@ export fn batchNormGradInput(x: [*]const f32, dy: [*]const f32, dx: [*]f32, len:
     if (globalIndex() < len) nm.gradInput(globalIndex(), x, dy, dx, c, len / c, mean, inv_std, gamma, sums);
 }
 
-export fn crossEntropyRows(x: [*]const f32, logp: [*]f32, labels: [*]const u8, row_loss: [*]f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
+export fn crossEntropyRows(x: [*]const f32, logp: [*]f32, labels: [*]const u8, row_loss: [*]f32, rows: u32, cols: u32, smoothing: f32) callconv(.nvptx_kernel) void {
     const r = globalIndex();
     if (r >= rows) return;
     const base = r * cols;
@@ -306,9 +306,13 @@ export fn crossEntropyRows(x: [*]const f32, logp: [*]f32, labels: [*]const u8, r
     j = 0;
     while (j < cols) : (j += 1) total += expf(x[base + j] - mx);
     const shift = mx + logf(total);
+    var logp_sum: f32 = 0;
     j = 0;
-    while (j < cols) : (j += 1) logp[base + j] = x[base + j] - shift;
-    row_loss[r] = -logp[base + labels[r]];
+    while (j < cols) : (j += 1) {
+        logp[base + j] = x[base + j] - shift;
+        logp_sum += logp[base + j];
+    }
+    row_loss[r] = -(1 - smoothing) * logp[base + labels[r]] - smoothing / @as(f32, @floatFromInt(cols)) * logp_sum;
 }
 
 export fn crossEntropyMean(row_loss: [*]const f32, out: [*]f32, rows: u32) callconv(.nvptx_kernel) void {
@@ -319,13 +323,13 @@ export fn crossEntropyMean(row_loss: [*]const f32, out: [*]f32, rows: u32) callc
     out[0] = total / @as(f32, @floatFromInt(rows));
 }
 
-export fn crossEntropyBackward(logp: [*]const f32, labels: [*]const u8, grad: [*]f32, loss_grad: [*]const f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
+export fn crossEntropyBackward(logp: [*]const f32, labels: [*]const u8, grad: [*]f32, loss_grad: [*]const f32, rows: u32, cols: u32, smoothing: f32) callconv(.nvptx_kernel) void {
     const t = globalIndex();
     if (t >= @as(usize, rows) * cols) return;
     const r = t / cols;
     const j = t % cols;
-    var p = expf(logp[t]);
-    if (j == labels[r]) p -= 1;
+    var p = expf(logp[t]) - smoothing / @as(f32, @floatFromInt(cols));
+    if (j == labels[r]) p -= 1 - smoothing;
     grad[t] += p * (loss_grad[0] / @as(f32, @floatFromInt(rows)));
 }
 

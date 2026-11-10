@@ -66,6 +66,7 @@ fn Runner(comptime Spec: type) type {
             var use_gpu = false;
             var profile = false;
             var tensor_cores = false;
+            var smoothing: f32 = 0;
             var augment_config: augment_math.Config = .{ .channels = Spec.channels };
             var save_path: ?[]const u8 = null;
             var load_path: ?[]const u8 = null;
@@ -78,6 +79,8 @@ fn Runner(comptime Spec: type) type {
                     use_gpu = true;
                 } else if (std.mem.eql(u8, arg, "--profile")) {
                     profile = true;
+                } else if (std.mem.startsWith(u8, arg, "--smoothing=")) {
+                    smoothing = try std.fmt.parseFloat(f32, arg["--smoothing=".len..]);
                 } else if (std.mem.eql(u8, arg, "--tensor-cores")) {
                     tensor_cores = true;
                 } else if (std.mem.eql(u8, arg, "--flip")) {
@@ -187,7 +190,7 @@ fn Runner(comptime Spec: type) type {
                     if (gpu) |dev| try dev.resetStep();
                     const global_step = epoch * steps + step;
                     adam.lr = optim.cosineLr(Spec.learning_rate, global_step, epochs * steps);
-                    var tape: Tape = .{ .gpa = arena.allocator(), .par = par, .training = true, .seed = global_step * 8 };
+                    var tape: Tape = .{ .gpa = arena.allocator(), .par = par, .training = true, .smoothing = smoothing, .seed = global_step * 8 };
                     try optim.zeroGrad(par, params);
                     const logits = try Spec.forward(model, &tape, try tape.constant(batch));
                     const loss = try tape.crossEntropy(logits, labels);

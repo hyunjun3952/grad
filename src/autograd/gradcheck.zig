@@ -5,6 +5,10 @@ const Gpu = @import("../gpu/gpu.zig").Gpu;
 
 const testing = std.testing;
 
+fn smoothingOf(comptime Case: type) f32 {
+    return if (@hasDecl(Case, "smoothing")) Case.smoothing else 0;
+}
+
 pub fn randomInputs(comptime Case: type, gpa: Allocator, seed: u64) !Case.Inputs {
     var prng = std.Random.DefaultPrng.init(seed);
     var p: Case.Inputs = undefined;
@@ -20,7 +24,7 @@ pub fn randomInputs(comptime Case: type, gpa: Allocator, seed: u64) !Case.Inputs
 fn lossOf(comptime Case: type, p: Case.Inputs) !f32 {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    var t: Tape = .{ .gpa = arena.allocator(), .training = true };
+    var t: Tape = .{ .gpa = arena.allocator(), .training = true, .smoothing = smoothingOf(Case) };
     return (try Case.build(&t, p, &Case.labels)).loss.value.data[0];
 }
 
@@ -29,7 +33,7 @@ pub fn expectFiniteDifferences(comptime Case: type, seed: u64, eps: f32, toleran
     defer arena.deinit();
     const p = try randomInputs(Case, arena.allocator(), seed);
 
-    var t: Tape = .{ .gpa = arena.allocator(), .training = true };
+    var t: Tape = .{ .gpa = arena.allocator(), .training = true, .smoothing = smoothingOf(Case) };
     const run = try Case.build(&t, p, &Case.labels);
     try t.backward(run.loss);
 
@@ -67,7 +71,7 @@ fn compareWithGpu(comptime Case: type, seed: u64, tolerance: f32, tensor_cores: 
     const gpa = arena.allocator();
     const host = try randomInputs(Case, gpa, seed);
 
-    var cpu_tape: Tape = .{ .gpa = gpa, .training = true };
+    var cpu_tape: Tape = .{ .gpa = gpa, .training = true, .smoothing = smoothingOf(Case) };
     const cpu = try Case.build(&cpu_tape, host, &Case.labels);
     try cpu_tape.backward(cpu.loss);
 
@@ -79,7 +83,7 @@ fn compareWithGpu(comptime Case: type, seed: u64, tolerance: f32, tensor_cores: 
     }
     const labels = try gpu.alloc(u8, Case.labels.len);
     try gpu.upload(labels, &Case.labels);
-    var gpu_tape: Tape = .{ .gpa = gpa, .par = .{ .gpu = gpu }, .training = true };
+    var gpu_tape: Tape = .{ .gpa = gpa, .par = .{ .gpu = gpu }, .training = true, .smoothing = smoothingOf(Case) };
     const run = try Case.build(&gpu_tape, device, labels);
     try gpu_tape.backward(run.loss);
 
