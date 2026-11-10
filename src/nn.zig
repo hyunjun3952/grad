@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const Tensor = @import("tensor.zig").Tensor;
 const autograd = @import("autograd.zig");
 const optim = @import("optim.zig");
+const Gpu = @import("gpu/gpu.zig").Gpu;
 const Var = autograd.Var;
 const Tape = autograd.Tape;
 
@@ -33,7 +34,22 @@ pub fn Linear(comptime n_in: usize, comptime n_out: usize) type {
             self.b.grad.deinit(gpa);
         }
 
-        pub fn forward(self: Self, tape: *Tape, x: anytype) Allocator.Error!Var(Tensor(f32, &.{ @TypeOf(x.value).shape[0], n_out })) {
+        pub fn toGpu(self: Self, gpu: *Gpu) autograd.Error!Self {
+            const w = try gpu.alloc(f32, W.len);
+            const grad_w = try gpu.alloc(f32, W.len);
+            const b = try gpu.alloc(f32, B.len);
+            const grad_b = try gpu.alloc(f32, B.len);
+            try gpu.upload(w, self.w.value.data);
+            try gpu.upload(b, self.b.value.data);
+            try gpu.fill(grad_w, 0);
+            try gpu.fill(grad_b, 0);
+            return .{
+                .w = .{ .value = .{ .data = w }, .grad = .{ .data = grad_w }, .needs_grad = true },
+                .b = .{ .value = .{ .data = b }, .grad = .{ .data = grad_b }, .needs_grad = true },
+            };
+        }
+
+        pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(Tensor(f32, &.{ @TypeOf(x.value).shape[0], n_out })) {
             return tape.add(try tape.matmul(x, self.w), self.b);
         }
 
@@ -87,8 +103,8 @@ test "adam also trains the linear layer" {
     var prng = std.Random.DefaultPrng.init(5);
     const layer = try Linear(2, 2).init(gpa, prng.random());
     defer layer.deinit(gpa);
-    var adam = try optim.Adam.init(gpa, 0.1, layer.params());
-    defer adam.deinit(gpa);
+    var adam = try optim.Adam.init(gpa, .{}, 0.1, layer.params());
+    defer adam.deinit();
 
     const x = try Tensor(f32, &.{ 8, 2 }).fromSlice(gpa, &.{ 1, 0.5, 2, -1, 0.7, 1, 1.5, -0.3, -1, 0.5, -2, -1, -0.7, 1, -1.5, 0.3 });
     defer x.deinit(gpa);
@@ -101,10 +117,10 @@ test "adam also trains the linear layer" {
         defer arena.deinit();
         var tape: Tape = .{ .gpa = arena.allocator() };
 
-        optim.zeroGrad(.{}, layer.params());
+        try optim.zeroGrad(.{}, layer.params());
         const loss = try tape.crossEntropy(try layer.forward(&tape, try tape.constant(x)), &labels);
         try tape.backward(loss);
-        adam.step(.{}, layer.params());
+        try adam.step(.{}, layer.params());
 
         if (step == 0) first = loss.value.data[0];
         last = loss.value.data[0];
@@ -129,11 +145,11 @@ test "a linear layer learns a separable problem" {
         defer arena.deinit();
         var tape: Tape = .{ .gpa = arena.allocator() };
 
-        optim.zeroGrad(.{}, layer.params());
+        try optim.zeroGrad(.{}, layer.params());
         const logits = try layer.forward(&tape, try tape.constant(x));
         const loss = try tape.crossEntropy(logits, &labels);
         try tape.backward(loss);
-        optim.sgd(.{}, 0.5, layer.params());
+        try optim.sgd(.{}, 0.5, layer.params());
 
         if (step == 0) first = loss.value.data[0];
         last = loss.value.data[0];

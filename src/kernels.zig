@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
+const Gpu = @import("gpu/gpu.zig").Gpu;
 
 pub fn naive(comptime T: type, m: usize, k: usize, n: usize, a: []const T, b: []const T, out: []T) void {
     std.debug.assert(a.len >= m * k and b.len >= k * n and out.len >= m * n);
@@ -51,7 +52,7 @@ pub const TileConfig = struct {
     accumulate: bool = false,
 };
 
-pub const Parallel = struct { io: ?Io = null, threads: usize = 1 };
+pub const Parallel = struct { io: ?Io = null, threads: usize = 1, gpu: ?*Gpu = null };
 
 const min_flops_per_part = 2_000_000;
 const max_workers = 15;
@@ -70,7 +71,22 @@ const Mailbox = struct {
 var mailboxes: [max_workers]Mailbox = @splat(.{});
 var spawned: usize = 0;
 
+pub fn flushDenormals() void {
+    if (comptime @import("builtin").cpu.arch != .x86_64) return;
+    var csr: u32 = 0;
+    asm volatile ("stmxcsr (%[p])"
+        :
+        : [p] "r" (&csr),
+        : .{ .memory = true });
+    csr |= 0x8040;
+    asm volatile ("ldmxcsr (%[p])"
+        :
+        : [p] "r" (&csr),
+        : .{ .memory = true });
+}
+
 fn workerMain(box: *Mailbox) void {
+    flushDenormals();
     var seen: u32 = 0;
     while (true) {
         var spins: u32 = 0;
@@ -446,6 +462,28 @@ test "parallel tiled matmul matches in both split directions" {
     try expectSameResult(f32, par, 200, 193, 197);
     try expectSameResult(f32, par, 150, 200, 260);
     try expectSameResult(f64, par, 120, 150, 140);
+}
+
+test "flushDenormals makes subnormal results zero on the calling thread only" {
+    if (@import("builtin").cpu.arch != .x86_64) return error.SkipZigTest;
+    const Probe = struct {
+        fn product(flush: bool, out: *f32) void {
+            if (flush) flushDenormals();
+            var a: f32 = 1e-30;
+            var b: f32 = 1e-10;
+            const pa: *volatile f32 = &a;
+            const pb: *volatile f32 = &b;
+            out.* = pa.* * pb.*;
+        }
+    };
+    var plain: f32 = undefined;
+    var flushed: f32 = undefined;
+    const t1 = try std.Thread.spawn(.{}, Probe.product, .{ false, &plain });
+    t1.join();
+    const t2 = try std.Thread.spawn(.{}, Probe.product, .{ true, &flushed });
+    t2.join();
+    try std.testing.expect(plain != 0);
+    try std.testing.expectEqual(@as(f32, 0), flushed);
 }
 
 test "worker pool survives many park and wake cycles" {

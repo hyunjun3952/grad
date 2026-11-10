@@ -29,7 +29,7 @@ fn Broadcast(comptime rank: usize) type {
     return struct { dims: [rank]usize, a: [rank]usize, b: [rank]usize };
 }
 
-fn broadcast(comptime a: []const usize, comptime b: []const usize) Broadcast(@max(a.len, b.len)) {
+pub fn broadcast(comptime a: []const usize, comptime b: []const usize) Broadcast(@max(a.len, b.len)) {
     const rank = @max(a.len, b.len);
     var r: Broadcast(rank) = undefined;
     var acc_a: usize = 1;

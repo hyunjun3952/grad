@@ -207,7 +207,7 @@ fn stepProfile(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, rng: std.Random,
         var f: [4]i96 = undefined;
         var b: [6]i96 = undefined;
 
-        grad.optim.zeroGrad(par, params);
+        try grad.optim.zeroGrad(par, params);
         const zeroed = lap.lap();
         const vx = try tape.constant(x);
         _ = lap.lap();
@@ -230,7 +230,7 @@ fn stepProfile(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, rng: std.Random,
             b[i] = lap.lap();
         }
 
-        grad.optim.sgd(par, 0.01, params);
+        try grad.optim.sgd(par, 0.01, params);
         const upd = lap.lap();
         const elapsed = lap.last - start;
 
@@ -254,10 +254,10 @@ fn stepProfile(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, rng: std.Random,
     try out.print("{s:<22} {d:>10.1}\n", .{ "zero grad", @as(f64, @floatFromInt(zero)) * to_us });
     try out.print("{s:<22} {d:>10.1}\n", .{ "sgd update", @as(f64, @floatFromInt(update)) * to_us });
     try out.print("{s:<22} {d:>10.1}  ({d:.0} steps/s)\n", .{ "total step", @as(f64, @floatFromInt(total)) * to_us, 1e6 / (@as(f64, @floatFromInt(total)) * to_us) });
-    var adam = try grad.optim.Adam.init(gpa, 0.001, params);
-    defer adam.deinit(gpa);
+    var adam = try grad.optim.Adam.init(gpa, par, 0.001, params);
+    defer adam.deinit();
     const adam_start = Io.Clock.awake.now(io).nanoseconds;
-    for (0..reps) |_| adam.step(par, params);
+    for (0..reps) |_| try adam.step(par, params);
     const adam_ns = Io.Clock.awake.now(io).nanoseconds - adam_start;
     try out.print("{s:<22} {d:>10.1}  (in place of sgd)\n", .{ "adam update", @as(f64, @floatFromInt(adam_ns)) * to_us });
     const matmul_flops = 2.0 * batch * n_hidden * (n_in + n_out) * 3;

@@ -89,7 +89,7 @@ pub fn matmulInto(
     b: anytype,
     out: anytype,
     comptime opts: MatmulOpts,
-) Allocator.Error!void {
+) !void {
     const A = @TypeOf(a);
     comptime {
         if (@TypeOf(out) != MatmulResult(A, @TypeOf(b), opts)) {
@@ -99,6 +99,8 @@ pub fn matmulInto(
     const M = @TypeOf(out).shape[0];
     const N = @TypeOf(out).shape[1];
     const K = if (opts.trans_a) A.shape[0] else A.shape[1];
+
+    if (par.gpu) |g| return g.matmul(a.data, b.data, out.data, opts.trans_a, opts.trans_b, opts.accumulate, M, N, K);
 
     const cfg: kernels.TileConfig = .{ .trans_a = opts.trans_a, .trans_b = opts.trans_b, .accumulate = opts.accumulate };
     const work = try gpa.alloc(A.Elem, kernels.tiledWorkLenFor(A.Elem, cfg, par, M, K, N));
@@ -112,10 +114,11 @@ pub fn matmul(
     a: anytype,
     b: anytype,
     comptime opts: MatmulOpts,
-) Allocator.Error!MatmulResult(@TypeOf(a), @TypeOf(b), opts) {
+) !MatmulResult(@TypeOf(a), @TypeOf(b), opts) {
     comptime {
         if (opts.accumulate) @compileError("matmul returns a fresh tensor; use matmulInto to accumulate");
     }
+    std.debug.assert(par.gpu == null);
     const out = try MatmulResult(@TypeOf(a), @TypeOf(b), opts).empty(gpa);
     errdefer out.deinit(gpa);
     try matmulInto(gpa, par, a, b, out, opts);
