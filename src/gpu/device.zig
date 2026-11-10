@@ -789,3 +789,25 @@ export fn packWeightsRotated(src: [*]const f32, dst: [*]u16, args: ga.RotateArgs
     const source_tap = (args.k - 1 - tap / args.k) * args.k + (args.k - 1 - tap % args.k);
     dst[t] = if (j < args.c_in) bf16.encode(src[(source_tap * args.c_in + j) * args.c_out + co]) else 0;
 }
+
+export fn weightsToKrsc(src: [*]const f32, dst: [*]f32, args: ga.LayoutArgs) callconv(.nvptx_kernel) void {
+    const t: u32 = @intCast(globalIndex());
+    const total = args.k * args.r * args.r * args.c;
+    if (t >= total) return;
+    const ci = t % args.c;
+    const kx = t / args.c % args.r;
+    const ky = t / args.c / args.r % args.r;
+    const o = t / args.c / args.r / args.r;
+    dst[t] = src[((ky * args.r + kx) * args.c + ci) * args.k + o];
+}
+
+export fn addKrscGradient(src: [*]const f32, dst: [*]f32, args: ga.LayoutArgs) callconv(.nvptx_kernel) void {
+    const t: u32 = @intCast(globalIndex());
+    const total = args.k * args.r * args.r * args.c;
+    if (t >= total) return;
+    const ci = t % args.c;
+    const kx = t / args.c % args.r;
+    const ky = t / args.c / args.r % args.r;
+    const o = t / args.c / args.r / args.r;
+    dst[((ky * args.r + kx) * args.c + ci) * args.k + o] += src[t];
+}

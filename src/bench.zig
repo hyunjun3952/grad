@@ -294,6 +294,76 @@ fn gpuMatmul(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
     try out.writeAll("\n");
 }
 
+fn cudnnConvolutions(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, dir: [:0]const u8) !void {
+    const dev = grad.gpu.Gpu.init(gpa, 1 << 20) catch |err| switch (err) {
+        error.DriverNotFound => return,
+        else => return err,
+    };
+    defer dev.deinit();
+    var lib = grad.gpu.cudnn.Cudnn.open(dir) catch |err| {
+        try out.print("cuDNN could not be loaded from {s}: {s}\n", .{ dir, @errorName(err) });
+        return;
+    };
+    defer lib.close();
+    try out.print("cuDNN {d} convolutions, NHWC, best algorithm per shape (data only, no packing), best of 20\n{s:<30}{s:<10}{s:>10}{s:>10}{s:>10}\n", .{ lib.version(), "case", "type", "fwd", "dgrad", "wgrad" });
+    const cases = [_]struct { name: []const u8, g: grad.gpu.cudnn.Geometry }{
+        .{ .name = "stage 1: 64x32x32, 64->64", .g = .{ .n = 64, .h = 32, .w = 32, .c = 64, .k = 64, .r = 3, .pad = 1, .stride = 1 } },
+        .{ .name = "stage 2: 64x16x16, 128->128", .g = .{ .n = 64, .h = 16, .w = 16, .c = 128, .k = 128, .r = 3, .pad = 1, .stride = 1 } },
+        .{ .name = "stage 3: 64x8x8, 256->256", .g = .{ .n = 64, .h = 8, .w = 8, .c = 256, .k = 256, .r = 3, .pad = 1, .stride = 1 } },
+    };
+    for (cases) |case| {
+        for ([_]grad.gpu.cudnn.DataType{ .float, .bfloat16 }) |data| {
+            const g = case.g;
+            const size: usize = if (data == .float) 4 else 2;
+            const plan = try lib.plan(g, data, 1 << 30);
+            defer lib.destroyPlan(plan);
+            const x = try dev.alloc(u8, g.n * g.h * g.w * g.c * size);
+            const y = try dev.alloc(u8, g.n * g.h * g.w * g.k * size);
+            const w = try dev.alloc(u8, g.k * g.r * g.r * g.c * size);
+            const workspace = try dev.alloc(u8, plan.workspaceBytes() + 256);
+            const host = try gpa.alloc(u8, @max(x.len, y.len));
+            defer gpa.free(host);
+            if (data == .float) {
+                for (std.mem.bytesAsSlice(f32, host)) |*v| v.* = 0.01;
+            } else {
+                for (std.mem.bytesAsSlice(u16, host)) |*v| v.* = 0x3C23;
+            }
+            try dev.upload(x, host[0..x.len]);
+            try dev.upload(y, host[0..y.len]);
+            try dev.upload(w, host[0..w.len]);
+
+            const flops = 2.0 * @as(f64, @floatFromInt(g.n * g.h * g.w)) * @as(f64, @floatFromInt(g.r * g.r * g.c)) * @as(f64, @floatFromInt(g.k));
+            var tflops: [3]f64 = undefined;
+            const addr = struct {
+                fn of(slice: []u8) u64 {
+                    return @intFromPtr(slice.ptr);
+                }
+            }.of;
+            for (0..3) |direction| {
+                switch (direction) {
+                    0 => try lib.forward(plan, addr(x), addr(w), addr(y), addr(workspace), false),
+                    1 => try lib.backwardData(plan, addr(w), addr(y), addr(x), addr(workspace), false),
+                    else => try lib.backwardFilter(plan, addr(x), addr(y), addr(w), addr(workspace), false),
+                }
+                try dev.cu.sync();
+                const t0 = Io.Clock.awake.now(io);
+                for (0..20) |_| {
+                    switch (direction) {
+                        0 => try lib.forward(plan, addr(x), addr(w), addr(y), addr(workspace), false),
+                        1 => try lib.backwardData(plan, addr(w), addr(y), addr(x), addr(workspace), false),
+                        else => try lib.backwardFilter(plan, addr(x), addr(y), addr(w), addr(workspace), false),
+                    }
+                }
+                try dev.cu.sync();
+                const ns: f64 = @floatFromInt(Io.Clock.awake.now(io).nanoseconds - t0.nanoseconds);
+                tflops[direction] = flops * 20 / ns / 1000;
+            }
+            try out.print("{s:<30}{s:<10}{d:>10.2}{d:>10.2}{d:>10.2}\n", .{ case.name, @tagName(data), tflops[0], tflops[1], tflops[2] });
+        }
+    }
+    try out.writeAll("\n");
+}
+
 fn implicitGemm(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
     const dev = grad.gpu.Gpu.init(gpa, 2 << 30) catch |err| switch (err) {
         error.DriverNotFound => return,
@@ -427,6 +497,11 @@ pub fn main(init: std.process.Init) !void {
     const rng = prng.random();
 
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len > 1 and std.mem.eql(u8, args[1], "cudnn")) {
+        try cudnnConvolutions(io, gpa, out, if (args.len > 2) args[2] else "data/cudnn");
+        try out.flush();
+        return;
+    }
     if (args.len > 1 and std.mem.eql(u8, args[1], "tc")) {
         try gpuTensorCore(io, gpa, out);
         try implicitGemm(io, gpa, out);

@@ -349,7 +349,9 @@ pub const Tape = struct {
         const channels_out = Out.shape[3];
         const kc = k * k * In.shape[3];
         const dev = self.par.gpu;
-        const packed_path = if (dev) |g| g.tensorWorthwhile(rows, channels_out, kc) else false;
+        const use_cudnn = if (dev) |g| g.cudnn_lib != null else false;
+        const cudnn_geometry: gpu_mod.cudnn.Geometry = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = In.shape[3], .k = channels_out, .r = k, .pad = opts.pad, .stride = opts.stride };
+        const packed_path = if (dev) |g| g.tensorWorthwhile(rows, channels_out, kc) and !use_cudnn else false;
         const implicit_shape = opts.stride == 1 and In.shape[3] % 64 == 0 and channels_out % 32 == 0;
         const implicit_path = implicit_shape and packed_path;
         const geometry: ga.ConvGeometry = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = In.shape[3], .k = k, .stride = opts.stride, .pad = opts.pad, .out_h = Out.shape[1], .out_w = Out.shape[2], .positions = rows };
@@ -357,7 +359,12 @@ pub const Tape = struct {
         var col: Col = undefined;
         var col_half: ?gpu_mod.Gpu.Packed = null;
         var x_half: []const u16 = &.{};
-        if (implicit_path) {
+        if (use_cudnn) {
+            const g = dev.?;
+            const mark = g.step_used;
+            defer g.step_used = mark;
+            try g.cudnnForward(cudnn_geometry, x.value.data, try g.weightsToKrsc(w.value.data, k, In.shape[3], channels_out), value.data);
+        } else if (implicit_path) {
             const g = dev.?;
             x_half = (try g.packMatrix(x.value.data, In.len / In.shape[3], In.shape[3], In.len / In.shape[3], In.shape[3], false)).data;
             const w_half = try g.packMatrix(w.value.data, kc, channels_out, kc, std.mem.alignForward(usize, channels_out, 64), false);
@@ -375,10 +382,23 @@ pub const Tape = struct {
         }
         const out = try self.makeVar(value, x.needs_grad or w.needs_grad);
 
-        const Ctx = struct { x: @TypeOf(x), w: @TypeOf(w), col: Col, col_half: ?gpu_mod.Gpu.Packed, x_half: []const u16, out: @TypeOf(out) };
-        if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .w = w, .col = col, .col_half = col_half, .x_half = x_half, .out = out }, struct {
+        const Ctx = struct { x: @TypeOf(x), w: @TypeOf(w), col: Col, col_half: ?gpu_mod.Gpu.Packed, x_half: []const u16, use_cudnn: bool, out: @TypeOf(out) };
+        if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .w = w, .col = col, .col_half = col_half, .x_half = x_half, .use_cudnn = use_cudnn, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
                 const grad: Flat = .{ .data = c.out.grad.data };
+                if (c.use_cudnn) {
+                    const g = t.par.gpu.?;
+                    const mark = g.step_used;
+                    defer g.step_used = mark;
+                    const w_krsc = try g.weightsToKrsc(c.w.value.data, k, In.shape[3], channels_out);
+                    if (c.x.needs_grad) try g.cudnnBackwardData(cudnn_geometry, w_krsc, c.out.grad.data, c.x.grad.data);
+                    if (c.w.needs_grad) {
+                        const dw_krsc = try g.scratch(f32, w_krsc.len);
+                        try g.cudnnBackwardFilter(cudnn_geometry, c.x.value.data, c.out.grad.data, dw_krsc);
+                        try g.addKrscGradient(dw_krsc, c.w.grad.data, k, In.shape[3], channels_out);
+                    }
+                    return;
+                }
                 if (c.x.needs_grad and c.x_half.len != 0) {
                     const g = t.par.gpu.?;
                     const mark = g.step_used;
@@ -1031,6 +1051,7 @@ test "conv2d with padding and stride matches a direct convolution, finite differ
             try gradcheck.expectFiniteDifferences(Case, 31, 1e-3, 3e-3);
             try gradcheck.expectGpuMatchesCpu(Case, 32, 1e-5);
             try gradcheck.expectTensorCoresClose(Case, 32, 3e-2);
+            try gradcheck.expectCudnnClose(Case, 32, 3e-2);
         }
     }
 }
@@ -1041,6 +1062,7 @@ test "implicit-GEMM convolutions on tensor cores match a direct convolution and 
         try Case.expectDirectConvolution();
         try gradcheck.expectGpuMatchesCpu(Case, 33, 1e-4);
         try gradcheck.expectTensorCoresClose(Case, 33, 0.15);
+        try gradcheck.expectCudnnClose(Case, 33, 0.15);
     }
 }
 test "batch norm gradients match finite differences, and the gpu matches the cpu including running statistics" {

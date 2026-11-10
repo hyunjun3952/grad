@@ -50,22 +50,32 @@ pub fn expectFiniteDifferences(comptime Case: type, seed: u64, eps: f32, toleran
     }
 }
 
+const Backend = enum { builtin, tensor_cores, cudnn };
+
 pub fn expectGpuMatchesCpu(comptime Case: type, seed: u64, tolerance: f32) !void {
-    return compareWithGpu(Case, seed, tolerance, false);
+    return compareWithGpu(Case, seed, tolerance, .builtin);
 }
 
 pub fn expectTensorCoresClose(comptime Case: type, seed: u64, tolerance: f32) !void {
-    return compareWithGpu(Case, seed, tolerance, true);
+    return compareWithGpu(Case, seed, tolerance, .tensor_cores);
 }
 
-fn compareWithGpu(comptime Case: type, seed: u64, tolerance: f32, tensor_cores: bool) !void {
+pub fn expectCudnnClose(comptime Case: type, seed: u64, tolerance: f32) !void {
+    return compareWithGpu(Case, seed, tolerance, .cudnn);
+}
+
+fn compareWithGpu(comptime Case: type, seed: u64, tolerance: f32, backend: Backend) !void {
     const gpu = Gpu.init(testing.allocator, 64 << 20) catch |err| switch (err) {
         error.DriverNotFound => return error.SkipZigTest,
         else => return err,
     };
     defer gpu.deinit();
-    gpu.tensor_cores = tensor_cores;
+    gpu.tensor_cores = backend == .tensor_cores;
     gpu.tensor_core_min_work = 0;
+    if (backend == .cudnn) gpu.enableCudnn("data/cudnn") catch |err| switch (err) {
+        error.CudnnNotFound => return error.SkipZigTest,
+        else => return err,
+    };
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const gpa = arena.allocator();

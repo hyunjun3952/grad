@@ -48,6 +48,7 @@ Build options such as `-Dcnn=true -Dhidden=2048 -Dbatch=256` go before the `--`;
 | `--gpu` | Train on the GPU. |
 | `--tensor-cores` | Use bf16 tensor-core GEMMs for large matrix products (f32 accumulate, f32 master weights). |
 | `--shift=N`, `--rotate=DEG`, `--zoom=F`, `--flip` | Random affine augmentation applied on the fly, on the CPU or on the GPU. |
+| `--cudnn[=DIR]` | Run convolutions through cuDNN (f32 with TF32 tensor cores) instead of the built-in kernels. The DLLs are loaded at run time from `data/cudnn` (or DIR); if they cannot be found the built-in kernels are used. Fetch them with `scripts/fetch-cudnn.ps1` (about 1.3 GB, never committed). |
 | `--smoothing=F` | Label smoothing for the cross-entropy loss (CPU and GPU). |
 | `--save=PATH`, `--load=PATH` | Write or read a checkpoint (weights, batch-norm statistics, Adam state, progress). |
 | `--until=N` | Stop after epoch `N` but keep the schedule of the full run, so that a later `--load` continues exactly. |
@@ -56,13 +57,18 @@ Build options such as `-Dcnn=true -Dhidden=2048 -Dbatch=256` go before the `--`;
 
 The optimizer is AdamW with a cosine schedule. Checkpoints are portable between CPU and GPU.
 
+## Optional cuDNN backend
+
+The engine does not need cuDNN, but it can use it: `src/gpu/cudnn.zig` loads `cudnn64_9.dll` dynamically (the same way `nvcuda.dll` is loaded) and drives the legacy descriptor API, with the best algorithm per shape chosen by `cudnnFind*` and cached. `zig build bench -- cudnn` times it on the CIFAR shapes: cuDNN reaches 8 to 10 TFLOPS in f32 (TF32) and 20 to 24 TFLOPS in bf16, versus about 5 TFLOPS for the built-in f32 GEMM and 17 to 18 TFLOPS for the built-in bf16 implicit GEMM. On the CIFAR ResNet-14 an f32 epoch takes 52.8 s with the built-in kernels and 24.5 s with `--cudnn`.
+
 ## Benchmarks
 
 ```powershell
 zig build bench                 # CPU matmul kernels, allocation overhead, thread scaling
 zig build bench -- step         # per-op profile of an MLP training step
 zig build bench -- gpu          # FP32 GEMM on the device
-zig build bench -- tc           # FP32 vs bf16 tensor-core GEMM, packing included
+zig build bench -- tc           # FP32 vs bf16 tensor-core GEMM, packing included, implicit-GEMM convolutions
+zig build bench -- cudnn        # cuDNN convolutions on the CIFAR shapes (needs the DLLs)
 ```
 
 On this machine: the CPU GEMM reaches about 108 GFLOPS per thread (packed B, 6x2 register tile); the GPU FP32 GEMM about 5 TFLOPS; the bf16 tensor-core kernel 12.8 to 21.6 TFLOPS on square and MLP shapes (end to end, packing included), with a relative RMS error of about 2e-3 against FP32.

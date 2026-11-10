@@ -7,7 +7,7 @@ const ga = @import("args.zig");
 
 const ptx = @embedFile("kernels_ptx");
 
-pub const Error = Allocator.Error || error{ DriverNotFound, MissingSymbol, CudaFailed };
+pub const Error = Allocator.Error || error{ DriverNotFound, MissingSymbol, CudaFailed, CudnnNotFound, CudnnFailed, NoAlgorithm };
 
 pub const BinaryOp = enum { add, mul };
 
@@ -16,6 +16,8 @@ pub const Augment = @import("math/augment.zig").Config;
 pub const MatmulOpts = struct { trans_a: bool = false, trans_b: bool = false, accumulate: bool = false };
 
 pub const ConvGeometry = ga.ConvGeometry;
+
+pub const cudnn = @import("cudnn.zig");
 
 pub const MatmulShape = struct { m: usize, n: usize, k: usize };
 
@@ -37,6 +39,8 @@ const Kernel = enum {
     packHalfTransposed,
     im2colHalf,
     sgemmTensor,
+    weightsToKrsc,
+    addKrscGradient,
     convGemmForward,
     convGemmWeightGrad,
     packWeightsRotated,
@@ -110,13 +114,15 @@ fn ceilDiv(x: usize, y: usize) u32 {
 const slot_fill = kernel_count;
 const slot_upload = kernel_count + 1;
 const slot_download = kernel_count + 2;
-const slot_count = kernel_count + 3;
+const slot_cudnn = kernel_count + 3;
+const slot_count = kernel_count + 4;
 
 fn slotName(slot: usize) []const u8 {
     return switch (slot) {
         slot_fill => "fill (memset)",
         slot_upload => "upload",
         slot_download => "download",
+        slot_cudnn => "cudnn convolution",
         else => @tagName(@as(Kernel, @fromBackingInt(@intCast(slot)))),
     };
 }
@@ -137,6 +143,12 @@ pub const Gpu = struct {
     zero_base: usize,
     zero_size: usize,
     zero_used: usize,
+    cudnn_lib: ?cudnn.Cudnn,
+    cudnn_plans: std.ArrayList(PlanEntry),
+    cudnn_workspace: usize,
+    cudnn_workspace_bytes: usize,
+
+    const PlanEntry = struct { geometry: cudnn.Geometry, plan: cudnn.Plan };
 
     pub fn init(gpa: Allocator, step_bytes: usize) Error!*Gpu {
         const self = try gpa.create(Gpu);
@@ -146,6 +158,10 @@ pub const Gpu = struct {
         self.tensor_cores = false;
         self.tensor_core_min_work = 1 << 22;
         self.owned = .empty;
+        self.cudnn_lib = null;
+        self.cudnn_plans = .empty;
+        self.cudnn_workspace = 0;
+        self.cudnn_workspace_bytes = 0;
         self.cu = try cuda.Cuda.open();
         errdefer self.cu.close();
 
@@ -164,6 +180,12 @@ pub const Gpu = struct {
     }
 
     pub fn deinit(self: *Gpu) void {
+        if (self.cudnn_lib) |*lib| {
+            for (self.cudnn_plans.items) |entry| lib.destroyPlan(entry.plan);
+            lib.close();
+        }
+        self.cudnn_plans.deinit(self.gpa);
+        if (self.cudnn_workspace != 0) self.cu.free(self.cudnn_workspace);
         for (self.owned.items) |ptr| self.cu.free(ptr);
         self.cu.free(self.step_base);
         self.cu.free(self.zero_base);
@@ -202,6 +224,56 @@ pub const Gpu = struct {
         try self.cu.memsetD32(self.zero_base, 0, std.mem.alignForward(usize, self.zero_used, 4) / 4);
         try self.timerStop(slot_fill, started);
         self.zero_used = 0;
+    }
+
+    pub fn enableCudnn(self: *Gpu, dir: [:0]const u8) Error!void {
+        if (self.cudnn_lib != null) return;
+        self.cudnn_lib = try cudnn.Cudnn.open(dir);
+    }
+
+    fn cudnnPlan(self: *Gpu, geometry: cudnn.Geometry) Error!cudnn.Plan {
+        for (self.cudnn_plans.items) |entry| {
+            if (std.meta.eql(entry.geometry, geometry)) return entry.plan;
+        }
+        const plan = try self.cudnn_lib.?.plan(geometry, .float, 512 << 20);
+        try self.cudnn_plans.append(self.gpa, .{ .geometry = geometry, .plan = plan });
+        if (plan.workspaceBytes() > self.cudnn_workspace_bytes) {
+            if (self.cudnn_workspace != 0) self.cu.free(self.cudnn_workspace);
+            self.cudnn_workspace_bytes = plan.workspaceBytes();
+            self.cudnn_workspace = try self.cu.alloc(self.cudnn_workspace_bytes);
+        }
+        return plan;
+    }
+
+    pub fn weightsToKrsc(self: *Gpu, w: []const f32, r: usize, c: usize, k: usize) Error![]f32 {
+        const dst = try self.scratch(f32, k * r * r * c);
+        try self.launchFlat(.weightsToKrsc, dst.len, .{ w, dst, pack(ga.LayoutArgs, .{ .r = r, .c = c, .k = k }) });
+        return dst;
+    }
+
+    pub fn addKrscGradient(self: *Gpu, src: []const f32, dst: []f32, r: usize, c: usize, k: usize) Error!void {
+        try self.launchFlat(.addKrscGradient, src.len, .{ src, dst, pack(ga.LayoutArgs, .{ .r = r, .c = c, .k = k }) });
+    }
+
+    pub fn cudnnForward(self: *Gpu, geometry: cudnn.Geometry, x: []const f32, w_krsc: []const f32, y: []f32) Error!void {
+        const plan = try self.cudnnPlan(geometry);
+        const started = try self.timerStart();
+        try self.cudnn_lib.?.forward(plan, @intFromPtr(x.ptr), @intFromPtr(w_krsc.ptr), @intFromPtr(y.ptr), self.cudnn_workspace, false);
+        try self.timerStop(slot_cudnn, started);
+    }
+
+    pub fn cudnnBackwardData(self: *Gpu, geometry: cudnn.Geometry, w_krsc: []const f32, dy: []const f32, dx: []f32) Error!void {
+        const plan = try self.cudnnPlan(geometry);
+        const started = try self.timerStart();
+        try self.cudnn_lib.?.backwardData(plan, @intFromPtr(w_krsc.ptr), @intFromPtr(dy.ptr), @intFromPtr(dx.ptr), self.cudnn_workspace, true);
+        try self.timerStop(slot_cudnn, started);
+    }
+
+    pub fn cudnnBackwardFilter(self: *Gpu, geometry: cudnn.Geometry, x: []const f32, dy: []const f32, dw_krsc: []f32) Error!void {
+        const plan = try self.cudnnPlan(geometry);
+        const started = try self.timerStart();
+        try self.cudnn_lib.?.backwardFilter(plan, @intFromPtr(x.ptr), @intFromPtr(dy.ptr), @intFromPtr(dw_krsc.ptr), self.cudnn_workspace, false);
+        try self.timerStop(slot_cudnn, started);
     }
 
     pub fn startProfile(self: *Gpu, io: Io) void {
