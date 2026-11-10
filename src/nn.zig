@@ -59,7 +59,73 @@ pub fn Linear(comptime n_in: usize, comptime n_out: usize) type {
     };
 }
 
-pub fn Conv2d(comptime c_in: usize, comptime c_out: usize, comptime k: usize) type {
+pub fn BatchNorm(comptime c: usize) type {
+    const V = Tensor(f32, &.{c});
+
+    return struct {
+        const Self = @This();
+
+        gamma: Var(V),
+        beta: Var(V),
+        mean: V,
+        variance: V,
+
+        pub fn init(gpa: Allocator) Allocator.Error!Self {
+            const gamma = try V.full(gpa, 1);
+            errdefer gamma.deinit(gpa);
+            const grad_gamma = try V.zeros(gpa);
+            errdefer grad_gamma.deinit(gpa);
+            const beta = try V.zeros(gpa);
+            errdefer beta.deinit(gpa);
+            const grad_beta = try V.zeros(gpa);
+            errdefer grad_beta.deinit(gpa);
+            const mean = try V.zeros(gpa);
+            errdefer mean.deinit(gpa);
+            return .{
+                .gamma = .{ .value = gamma, .grad = grad_gamma, .needs_grad = true },
+                .beta = .{ .value = beta, .grad = grad_beta, .needs_grad = true },
+                .mean = mean,
+                .variance = try V.full(gpa, 1),
+            };
+        }
+
+        pub fn deinit(self: Self, gpa: Allocator) void {
+            self.gamma.value.deinit(gpa);
+            self.gamma.grad.deinit(gpa);
+            self.beta.value.deinit(gpa);
+            self.beta.grad.deinit(gpa);
+            self.mean.deinit(gpa);
+            self.variance.deinit(gpa);
+        }
+
+        pub fn toGpu(self: Self, gpu: *Gpu) autograd.Error!Self {
+            var out: Self = undefined;
+            inline for (.{ "gamma", "beta" }) |name| {
+                const value = try gpu.alloc(f32, c);
+                const grad = try gpu.alloc(f32, c);
+                try gpu.upload(value, @field(self, name).value.data);
+                try gpu.fill(grad, 0);
+                @field(out, name) = .{ .value = .{ .data = value }, .grad = .{ .data = grad }, .needs_grad = true };
+            }
+            inline for (.{ "mean", "variance" }) |name| {
+                const statistic = try gpu.alloc(f32, c);
+                try gpu.upload(statistic, @field(self, name).data);
+                @field(out, name) = .{ .data = statistic };
+            }
+            return out;
+        }
+
+        pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(@TypeOf(x.value)) {
+            return tape.batchNorm(x, self.gamma, self.beta, .{ .mean = self.mean, .variance = self.variance });
+        }
+
+        pub fn params(self: Self) struct { Var(V), Var(V) } {
+            return .{ self.gamma, self.beta };
+        }
+    };
+}
+
+pub fn Conv2d(comptime c_in: usize, comptime c_out: usize, comptime k: usize, comptime opts: autograd.ConvOpts) type {
     const Inner = Linear(k * k * c_in, c_out);
 
     return struct {
@@ -79,8 +145,8 @@ pub fn Conv2d(comptime c_in: usize, comptime c_out: usize, comptime k: usize) ty
             return .{ .inner = try self.inner.toGpu(gpu) };
         }
 
-        pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(Tensor(f32, &.{ @TypeOf(x.value).shape[0], @TypeOf(x.value).shape[1] - k + 1, @TypeOf(x.value).shape[2] - k + 1, c_out })) {
-            return tape.add(try tape.conv2d(x, self.inner.w), self.inner.b);
+        pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(Tensor(f32, &.{ @TypeOf(x.value).shape[0], (@TypeOf(x.value).shape[1] + 2 * opts.pad - k) / opts.stride + 1, (@TypeOf(x.value).shape[2] + 2 * opts.pad - k) / opts.stride + 1, c_out })) {
+            return tape.add(try tape.conv2d(x, self.inner.w, opts), self.inner.b);
         }
 
         pub fn params(self: Self) @TypeOf(self.inner.params()) {

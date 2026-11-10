@@ -47,37 +47,45 @@ const Mlp = struct {
 };
 
 const Cnn = struct {
-    c1: grad.nn.Conv2d(1, 16, 5),
-    c2: grad.nn.Conv2d(16, 32, 5),
+    c1: grad.nn.Conv2d(1, 16, 5, .{}),
+    n1: grad.nn.BatchNorm(16),
+    c2: grad.nn.Conv2d(16, 32, 5, .{}),
+    n2: grad.nn.BatchNorm(32),
     fc: grad.nn.Linear(512, classes),
 
     fn init(gpa: Allocator, rng: std.Random) Allocator.Error!Cnn {
-        const c1 = try grad.nn.Conv2d(1, 16, 5).init(gpa, rng);
+        const c1 = try grad.nn.Conv2d(1, 16, 5, .{}).init(gpa, rng);
         errdefer c1.deinit(gpa);
-        const c2 = try grad.nn.Conv2d(16, 32, 5).init(gpa, rng);
+        const n1 = try grad.nn.BatchNorm(16).init(gpa);
+        errdefer n1.deinit(gpa);
+        const c2 = try grad.nn.Conv2d(16, 32, 5, .{}).init(gpa, rng);
         errdefer c2.deinit(gpa);
-        return .{ .c1 = c1, .c2 = c2, .fc = try grad.nn.Linear(512, classes).init(gpa, rng) };
+        const n2 = try grad.nn.BatchNorm(32).init(gpa);
+        errdefer n2.deinit(gpa);
+        return .{ .c1 = c1, .n1 = n1, .c2 = c2, .n2 = n2, .fc = try grad.nn.Linear(512, classes).init(gpa, rng) };
     }
 
     fn deinit(self: Cnn, gpa: Allocator) void {
         self.c1.deinit(gpa);
+        self.n1.deinit(gpa);
         self.c2.deinit(gpa);
+        self.n2.deinit(gpa);
         self.fc.deinit(gpa);
     }
 
     fn toGpu(self: Cnn, gpu: *Gpu) !Cnn {
-        return .{ .c1 = try self.c1.toGpu(gpu), .c2 = try self.c2.toGpu(gpu), .fc = try self.fc.toGpu(gpu) };
+        return .{ .c1 = try self.c1.toGpu(gpu), .n1 = try self.n1.toGpu(gpu), .c2 = try self.c2.toGpu(gpu), .n2 = try self.n2.toGpu(gpu), .fc = try self.fc.toGpu(gpu) };
     }
 
-    fn params(self: Cnn) @TypeOf(self.c1.params() ++ self.c2.params() ++ self.fc.params()) {
-        return self.c1.params() ++ self.c2.params() ++ self.fc.params();
+    fn params(self: Cnn) @TypeOf(self.c1.params() ++ self.n1.params() ++ self.c2.params() ++ self.n2.params() ++ self.fc.params()) {
+        return self.c1.params() ++ self.n1.params() ++ self.c2.params() ++ self.n2.params() ++ self.fc.params();
     }
 
     fn forward(self: Cnn, tape: *Tape, x: anytype) grad.autograd.Error!Var(Tensor(f32, &.{ @TypeOf(x.value).shape[0], classes })) {
         const n = @TypeOf(x.value).shape[0];
         const image = grad.autograd.reshape(x, &.{ n, 28, 28, 1 });
-        const a = try tape.maxPool(try tape.relu(try self.c1.forward(tape, image)));
-        const b = try tape.maxPool(try tape.relu(try self.c2.forward(tape, a)));
+        const a = try tape.maxPool(try tape.relu(try self.n1.forward(tape, try self.c1.forward(tape, image))));
+        const b = try tape.maxPool(try tape.relu(try self.n2.forward(tape, try self.c2.forward(tape, a))));
         return self.fc.forward(tape, try tape.dropout(grad.autograd.reshape(b, &.{ n, 512 }), 0.7));
     }
 };
@@ -94,7 +102,7 @@ fn accuracy(gpa: Allocator, par: grad.kernels.Parallel, model: Model, data: grad
     var start: usize = 0;
     while (start + eval_batch <= data.count()) : (start += eval_batch) {
         _ = arena.reset(.retain_capacity);
-        if (par.gpu) |dev| dev.resetStep();
+        if (par.gpu) |dev| try dev.resetStep();
         var tape: Tape = .{ .gpa = arena.allocator(), .par = par };
         const x: Tensor(f32, &.{ eval_batch, pixels }) = .{ .data = data.images[start * pixels ..][0 .. eval_batch * pixels] };
         const logits = try model.forward(&tape, try tape.constant(x));
@@ -127,12 +135,15 @@ pub fn main(init: std.process.Init) !void {
     grad.kernels.flushDenormals();
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     var use_gpu = false;
+    var profile = false;
     var epochs: usize = 5;
     var data_dir: []const u8 = "data/mnist";
     var positional: usize = 0;
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--gpu")) {
             use_gpu = true;
+        } else if (std.mem.eql(u8, arg, "--profile")) {
+            profile = true;
         } else {
             if (positional == 0) epochs = try std.fmt.parseInt(usize, arg, 10) else data_dir = arg;
             positional += 1;
@@ -147,6 +158,9 @@ pub fn main(init: std.process.Init) !void {
 
     const gpu: ?*Gpu = if (use_gpu) try Gpu.init(gpa, 1 << 30) else null;
     defer if (gpu) |dev| dev.deinit();
+    if (gpu) |dev| {
+        if (profile) dev.startProfile(io);
+    }
     const threads = std.Thread.getCpuCount() catch 1;
     const par: grad.kernels.Parallel = .{ .io = io, .threads = threads, .gpu = gpu };
 
@@ -177,6 +191,7 @@ pub fn main(init: std.process.Init) !void {
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
+    const loss_total: []f32 = if (gpu) |dev| try dev.alloc(f32, 1) else &.{};
 
     try out.print("{s}, AdamW, batch {d}, {s}, {d} training images\n", .{
         if (config.cnn) "CNN conv5x16-conv5x32-fc" else "MLP 784-" ++ std.fmt.comptimePrint("{d}", .{hidden}) ++ "-10",
@@ -193,6 +208,7 @@ pub fn main(init: std.process.Init) !void {
         if (gpu) |dev| try dev.upload(order_device, order);
 
         var loss_sum: f64 = 0;
+        if (gpu) |dev| try dev.fill(loss_total, 0);
         for (0..steps) |step| {
             if (gpu) |dev| {
                 try dev.gather(train_data.images, train_data.labels, order_device, batch.data, labels, step * train_batch, train_batch, pixels);
@@ -204,7 +220,7 @@ pub fn main(init: std.process.Init) !void {
             }
 
             _ = arena.reset(.retain_capacity);
-            if (gpu) |dev| dev.resetStep();
+            if (gpu) |dev| try dev.resetStep();
             const global_step = epoch * steps + step;
             adam.lr = grad.optim.cosineLr(learning_rate, global_step, epochs * steps);
             var tape: Tape = .{ .gpa = arena.allocator(), .par = par, .training = true, .seed = global_step * 8 };
@@ -213,12 +229,15 @@ pub fn main(init: std.process.Init) !void {
             const loss = try tape.crossEntropy(logits, labels);
             try tape.backward(loss);
             try adam.step(par, params);
-            loss_sum += try tape.scalar(loss);
+            if (gpu) |dev| try dev.addInPlace(loss_total, loss.value.data) else loss_sum += loss.value.data[0];
         }
+        if (gpu) |dev| loss_sum = try dev.scalar(loss_total);
 
         const seconds = @as(f64, @floatFromInt(Io.Clock.awake.now(io).nanoseconds - started.nanoseconds)) / 1e9;
         const acc = try accuracy(gpa, par, model, test_data, test_set.labels);
         try out.print("epoch {d}/{d}  train loss {d:.4}  test accuracy {d:.2}%  ({d:.2} s)\n", .{ epoch + 1, epochs, loss_sum / @as(f64, @floatFromInt(steps)), acc, seconds });
         try out.flush();
     }
+    if (gpu) |dev| try dev.printProfile(out);
+    try out.flush();
 }

@@ -54,7 +54,7 @@ fn checkMatmul(gpu: *Gpu, m: usize, n: usize, k: usize, ta: bool, tb: bool, accu
         for (want) |*w| w.* += 1;
     }
 
-    gpu.resetStep();
+    try gpu.resetStep();
     const da = try gpu.scratch(f32, a.len);
     const db = try gpu.scratch(f32, b.len);
     const dc = try gpu.scratch(f32, got.len);

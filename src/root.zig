@@ -14,4 +14,5 @@ test {
     _ = @import("gpu/parity.zig");
     _ = @import("gpu/conv.zig");
     _ = @import("gpu/dropout.zig");
+    _ = @import("gpu/norm.zig");
 }

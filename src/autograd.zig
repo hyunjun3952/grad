@@ -6,6 +6,7 @@ const kernels = @import("kernels.zig");
 const gpu_mod = @import("gpu/gpu.zig");
 const conv = @import("gpu/conv.zig");
 const drop = @import("gpu/dropout.zig");
+const norm = @import("gpu/norm.zig");
 const Tensor = tensor.Tensor;
 
 pub const Error = gpu_mod.Error;
@@ -47,6 +48,8 @@ pub fn reshape(x: anytype, comptime shape: []const usize) Var(Tensor(@TypeOf(x.v
     return .{ .value = .{ .data = x.value.data }, .grad = .{ .data = x.grad.data }, .needs_grad = x.needs_grad };
 }
 
+pub const ConvOpts = struct { stride: usize = 1, pad: usize = 0 };
+
 fn kernelSize(comptime In: type, comptime W: type) usize {
     if (In.rank != 4 or W.rank != 2) @compileError("conv2d expects (n, h, w, c) input and (k*k*c, out) weights");
     const k = std.math.sqrt(W.shape[0] / In.shape[3]);
@@ -54,9 +57,9 @@ fn kernelSize(comptime In: type, comptime W: type) usize {
     return k;
 }
 
-fn ConvOut(comptime In: type, comptime W: type) type {
+fn ConvOut(comptime In: type, comptime W: type, comptime opts: ConvOpts) type {
     const k = kernelSize(In, W);
-    return Tensor(f32, &.{ In.shape[0], In.shape[1] - k + 1, In.shape[2] - k + 1, W.shape[1] });
+    return Tensor(f32, &.{ In.shape[0], (In.shape[1] + 2 * opts.pad - k) / opts.stride + 1, (In.shape[2] + 2 * opts.pad - k) / opts.stride + 1, W.shape[1] });
 }
 
 fn PoolOut(comptime In: type) type {
@@ -81,12 +84,23 @@ pub const Tape = struct {
         return Tn.empty(self.gpa);
     }
 
+    fn zeroedTensor(self: *Tape, comptime Tn: type) Error!Tn {
+        if (self.par.gpu) |dev| return .{ .data = try dev.scratchZeroed(Tn.Elem, Tn.len) };
+        const tensor_zeroed = try Tn.empty(self.gpa);
+        @memset(tensor_zeroed.data, 0);
+        return tensor_zeroed;
+    }
+
     fn makeVar(self: *Tape, value: anytype, needs_grad: bool) Error!Var(@TypeOf(value)) {
         const Tn = @TypeOf(value);
         var grad: Tn = undefined;
         if (needs_grad) {
-            grad = try self.newTensor(Tn);
-            if (self.par.gpu) |dev| try dev.fill(grad.data, 0) else @memset(grad.data, 0);
+            if (self.par.gpu) |dev| {
+                grad = .{ .data = try dev.scratchZeroed(Tn.Elem, Tn.len) };
+            } else {
+                grad = try self.newTensor(Tn);
+                @memset(grad.data, 0);
+            }
         }
         return .{ .value = value, .grad = grad, .needs_grad = needs_grad };
     }
@@ -237,6 +251,64 @@ pub const Tape = struct {
         return out;
     }
 
+    fn eachIndex(self: *Tape, len: usize, comptime f: anytype, args: anytype) void {
+        const Ctx = @TypeOf(args);
+        const body = struct {
+            fn run(c: Ctx, lo: usize, hi: usize) void {
+                for (lo..hi) |t| @call(.auto, f, .{t} ++ c);
+            }
+        }.run;
+        kernels.parallelFor(self.par, len, 1 << 14, args, body);
+    }
+
+    pub fn batchNorm(self: *Tape, x: anytype, gamma: anytype, beta: anytype, running: anytype) Error!Var(@TypeOf(x.value)) {
+        const In = @TypeOf(x.value);
+        const c = In.shape[In.rank - 1];
+        const Channels = Tensor(f32, &.{c});
+        const rows = In.len / c;
+        const mean = try self.newTensor(Channels);
+        const inv_std = try self.newTensor(Channels);
+        const value = try self.newTensor(In);
+        if (self.par.gpu) |dev| {
+            try dev.batchNormStats(x.value.data, mean.data, inv_std.data, running.mean.data, running.variance.data, self.training);
+            try dev.batchNormApply(x.value.data, value.data, mean.data, inv_std.data, gamma.value.data, beta.value.data);
+        } else {
+            norm.stats(x.value.data, mean.data, inv_std.data, running.mean.data, running.variance.data, self.training);
+            self.eachIndex(In.len, norm.apply, .{ x.value.data.ptr, value.data.ptr, c, mean.data.ptr, inv_std.data.ptr, gamma.value.data.ptr, beta.value.data.ptr });
+        }
+        const out = try self.makeVar(value, x.needs_grad or gamma.needs_grad or beta.needs_grad);
+
+        const Ctx = struct { x: @TypeOf(x), gamma: @TypeOf(gamma), beta: @TypeOf(beta), mean: Channels, inv_std: Channels, out: @TypeOf(out) };
+        if (out.needs_grad and self.training) try self.recordBackward(Ctx{ .x = x, .gamma = gamma, .beta = beta, .mean = mean, .inv_std = inv_std, .out = out }, struct {
+            fn run(t: *Tape, k: *const Ctx) Error!void {
+                const sums = try t.zeroedTensor(Tensor(f32, &.{2 * c}));
+                if (t.par.gpu) |dev| {
+                    try dev.batchNormGradSums(k.x.value.data, k.out.grad.data, k.mean.data, k.inv_std.data, sums.data, k.gamma.grad.data, k.beta.grad.data);
+                    if (k.x.needs_grad) try dev.batchNormGradInput(k.x.value.data, k.out.grad.data, k.x.grad.data, k.mean.data, k.inv_std.data, k.gamma.value.data, sums.data);
+                } else {
+                    norm.gradSums(k.x.value.data, k.out.grad.data, k.mean.data, k.inv_std.data, sums.data, k.gamma.grad.data, k.beta.grad.data);
+                    if (k.x.needs_grad) t.eachIndex(In.len, norm.gradInput, .{ k.x.value.data.ptr, k.out.grad.data.ptr, k.x.grad.data.ptr, c, rows, k.mean.data.ptr, k.inv_std.data.ptr, k.gamma.value.data.ptr, sums.data.ptr });
+                }
+            }
+        }.run);
+        return out;
+    }
+
+    pub fn avgPool(self: *Tape, x: anytype) Error!Var(PoolOut(@TypeOf(x.value))) {
+        const In = @TypeOf(x.value);
+        const d: conv.Dims = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = In.shape[3], .k = 2 };
+        const value = try self.newTensor(PoolOut(In));
+        try self.convKernel(.avgPool, .{ x.value.data, value.data }, d);
+        const out = try self.makeVar(value, x.needs_grad);
+        const Ctx = struct { x: @TypeOf(x), out: @TypeOf(out) };
+        if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .out = out }, struct {
+            fn run(t: *Tape, k: *const Ctx) Error!void {
+                try t.convKernel(.avgPoolBackward, .{ k.out.grad.data, k.x.grad.data }, d);
+            }
+        }.run);
+        return out;
+    }
+
     fn convKernel(self: *Tape, comptime op: conv.Op, slices: anytype, d: conv.Dims) Error!void {
         if (self.par.gpu) |dev| return dev.convKernel(op, slices, d);
         const f = @field(conv, @tagName(op));
@@ -244,19 +316,19 @@ pub const Tape = struct {
         const body = struct {
             fn run(c: Ctx, lo: usize, hi: usize) void {
                 for (lo..hi) |t| switch (c.s.len) {
-                    2 => f(c.s[0].ptr, c.s[1].ptr, t, c.d),
-                    else => f(c.s[0].ptr, c.s[1].ptr, c.s[2].ptr, t, c.d),
+                    2 => f(c.s[0].ptr, c.s[1].ptr, @intCast(t), c.d),
+                    else => f(c.s[0].ptr, c.s[1].ptr, c.s[2].ptr, @intCast(t), c.d),
                 };
             }
         }.run;
         kernels.parallelFor(self.par, conv.workItems(op, d), 1 << 12, Ctx{ .s = slices, .d = d }, body);
     }
 
-    pub fn conv2d(self: *Tape, x: anytype, w: anytype) Error!Var(ConvOut(@TypeOf(x.value), @TypeOf(w.value))) {
+    pub fn conv2d(self: *Tape, x: anytype, w: anytype, comptime opts: ConvOpts) Error!Var(ConvOut(@TypeOf(x.value), @TypeOf(w.value), opts)) {
         const In = @TypeOf(x.value);
-        const Out = ConvOut(In, @TypeOf(w.value));
+        const Out = ConvOut(In, @TypeOf(w.value), opts);
         const k = comptime kernelSize(In, @TypeOf(w.value));
-        const d: conv.Dims = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = In.shape[3], .k = k };
+        const d: conv.Dims = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = In.shape[3], .k = k, .stride = opts.stride, .pad = opts.pad };
         const rows = Out.len / Out.shape[3];
         const Col = Tensor(f32, &.{ rows, k * k * In.shape[3] });
         const Flat = Tensor(f32, &.{ rows, Out.shape[3] });
@@ -590,7 +662,7 @@ fn convForward(t: *Tape, p: ConvParams, labels: []const u8) !ConvRun {
     const w = try t.leaf(p.w);
     const b = try t.leaf(p.b);
     const v = try t.leaf(p.v);
-    const act = try t.add(try t.conv2d(x, w), b);
+    const act = try t.add(try t.conv2d(x, w, .{}), b);
     const flat = reshape(try t.maxPool(act), &.{ 2, 12 });
     const loss = try t.crossEntropy(try t.matmul(flat, v), labels);
     return .{ .loss = loss, .act = act, .x = x, .w = w, .b = b, .v = v };
@@ -683,7 +755,7 @@ test "conv2d matches a direct convolution and its gradients match finite differe
     }
 }
 
-test "gpu conv2d and max maxPool reproduce the cpu loss and gradients" {
+test "gpu conv2d and max pool reproduce the cpu loss and gradients" {
     const gpu = gpu_mod.Gpu.init(testing.allocator, 64 << 20) catch |err| switch (err) {
         error.DriverNotFound => return error.SkipZigTest,
         else => return err,
@@ -772,4 +844,299 @@ test "gpu dropout draws the same mask as the cpu" {
     try testing.expectEqualSlices(f32, want.value.data, back);
     try gpu.download(back, grad);
     try testing.expectEqualSlices(f32, cpu_x.grad.data, back);
+}
+
+fn ConvCase(comptime opts: ConvOpts) type {
+    return struct {
+        const In = Tensor(f32, &.{ 2, 5, 5, 2 });
+        const Wt = Tensor(f32, &.{ 18, 3 });
+        const Out = ConvOut(In, Wt, opts);
+        const Inputs = struct { x: In, w: Wt };
+        const Result = struct { loss: Var(Tensor(f32, &.{})), y: Var(Out), x: Var(In), w: Var(Wt) };
+        const targets = [_]u8{ 1, 4 };
+        const input_names = .{ "x", "w" };
+
+        fn build(t: *Tape, p: Inputs, label_slice: []const u8) !Result {
+            const x = try t.leaf(p.x);
+            const w = try t.leaf(p.w);
+            const y = try t.conv2d(x, w, opts);
+            const loss = try t.crossEntropy(reshape(y, &.{ 2, Out.len / 2 }), label_slice);
+            return .{ .loss = loss, .y = y, .x = x, .w = w };
+        }
+
+        fn lossValue(p: Inputs) !f32 {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            var t: Tape = .{ .gpa = arena.allocator() };
+            return (try build(&t, p, &targets)).loss.value.data[0];
+        }
+
+        fn randomParams(gpa: Allocator, seed: u64) !Inputs {
+            var prng = std.Random.DefaultPrng.init(seed);
+            var p: Inputs = undefined;
+            inline for (input_names) |name| {
+                @field(p, name) = try @FieldType(Inputs, name).empty(gpa);
+                for (@field(p, name).data) |*v| v.* = prng.random().float(f32) * 2 - 1;
+            }
+            return p;
+        }
+
+        fn expectDirectConvolutionAndFiniteDifferences() !void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const p = try randomParams(arena.allocator(), 31);
+            var t: Tape = .{ .gpa = arena.allocator() };
+            const run = try build(&t, p, &targets);
+            try t.backward(run.loss);
+
+            const oh = Out.shape[1];
+            const ow = Out.shape[2];
+            for (0..2) |n| {
+                for (0..oh) |oy| {
+                    for (0..ow) |ox| {
+                        for (0..3) |oc| {
+                            var want: f32 = 0;
+                            for (0..3) |ky| {
+                                for (0..3) |kx| {
+                                    const py = oy * opts.stride + ky;
+                                    const px = ox * opts.stride + kx;
+                                    if (py < opts.pad or px < opts.pad or py - opts.pad >= 5 or px - opts.pad >= 5) continue;
+                                    for (0..2) |c| {
+                                        want += p.x.data[((n * 5 + py - opts.pad) * 5 + px - opts.pad) * 2 + c] * p.w.data[((ky * 3 + kx) * 2 + c) * 3 + oc];
+                                    }
+                                }
+                            }
+                            try testing.expectApproxEqAbs(want, run.y.value.data[((n * oh + oy) * ow + ox) * 3 + oc], 1e-5);
+                        }
+                    }
+                }
+            }
+
+            const eps = 1e-3;
+            inline for (input_names) |name| {
+                for (@field(p, name).data, 0..) |*v, i| {
+                    const old = v.*;
+                    v.* = old + eps;
+                    const plus = try lossValue(p);
+                    v.* = old - eps;
+                    const minus = try lossValue(p);
+                    v.* = old;
+                    try testing.expectApproxEqAbs((plus - minus) / (2 * eps), @field(run, name).grad.data[i], 3e-3);
+                }
+            }
+        }
+
+        fn expectGpuMatchesCpu() !void {
+            const gpu = gpu_mod.Gpu.init(testing.allocator, 16 << 20) catch |err| switch (err) {
+                error.DriverNotFound => return error.SkipZigTest,
+                else => return err,
+            };
+            defer gpu.deinit();
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const gpa = arena.allocator();
+            const host = try randomParams(gpa, 32);
+
+            var cpu_tape: Tape = .{ .gpa = gpa };
+            const cpu = try build(&cpu_tape, host, &targets);
+            try cpu_tape.backward(cpu.loss);
+
+            var device: Inputs = undefined;
+            inline for (input_names) |name| {
+                const slice = try gpu.alloc(f32, @field(host, name).data.len);
+                try gpu.upload(slice, @field(host, name).data);
+                @field(device, name) = .{ .data = slice };
+            }
+            const device_labels = try gpu.alloc(u8, targets.len);
+            try gpu.upload(device_labels, &targets);
+            var gpu_tape: Tape = .{ .gpa = gpa, .par = .{ .gpu = gpu } };
+            const run = try build(&gpu_tape, device, device_labels);
+            try gpu_tape.backward(run.loss);
+
+            try testing.expectApproxEqAbs(cpu.loss.value.data[0], try gpu_tape.scalar(run.loss), 1e-5);
+            inline for (input_names) |name| {
+                const want = @field(cpu, name).grad.data;
+                const got = try gpa.alloc(f32, want.len);
+                try gpu.download(got, @field(run, name).grad.data);
+                for (want, got) |w, g| try testing.expectApproxEqAbs(w, g, 1e-5);
+            }
+        }
+    };
+}
+
+test "conv2d with padding and stride matches a direct convolution, finite differences and the gpu" {
+    inline for (.{ ConvOpts{ .stride = 1, .pad = 1 }, ConvOpts{ .stride = 2, .pad = 1 }, ConvOpts{ .stride = 2, .pad = 0 } }) |opts| {
+        try ConvCase(opts).expectDirectConvolutionAndFiniteDifferences();
+        try ConvCase(opts).expectGpuMatchesCpu();
+    }
+}
+
+const BnX = Tensor(f32, &.{ 6, 3 });
+const BnV = Tensor(f32, &.{ 3, 4 });
+const BnC = Tensor(f32, &.{3});
+const bn_labels = [_]u8{ 0, 3, 1, 2, 3, 0 };
+const bn_names = .{ "x", "gamma", "beta", "v" };
+const BnInputs = struct { x: BnX, gamma: BnC, beta: BnC, v: BnV };
+const BnResult = struct { loss: Var(Tensor(f32, &.{})), x: Var(BnX), gamma: Var(BnC), beta: Var(BnC), v: Var(BnV) };
+
+fn buildBn(t: *Tape, p: BnInputs, running_mean: BnC, running_var: BnC, labels: []const u8) !BnResult {
+    const x = try t.leaf(p.x);
+    const gamma = try t.leaf(p.gamma);
+    const beta = try t.leaf(p.beta);
+    const v = try t.leaf(p.v);
+    const normalized = try t.batchNorm(x, gamma, beta, .{ .mean = running_mean, .variance = running_var });
+    const loss = try t.crossEntropy(try t.matmul(normalized, v), labels);
+    return .{ .loss = loss, .x = x, .gamma = gamma, .beta = beta, .v = v };
+}
+
+fn bnLoss(p: BnInputs) !f32 {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var t: Tape = .{ .gpa = arena.allocator(), .training = true };
+    const mean = try BnC.zeros(t.gpa);
+    const variance = try BnC.full(t.gpa, 1);
+    return (try buildBn(&t, p, mean, variance, &bn_labels)).loss.value.data[0];
+}
+
+fn randomBnInputs(gpa: Allocator, seed: u64) !BnInputs {
+    var prng = std.Random.DefaultPrng.init(seed);
+    var p: BnInputs = undefined;
+    inline for (bn_names) |name| {
+        @field(p, name) = try @FieldType(BnInputs, name).empty(gpa);
+        for (@field(p, name).data) |*v| v.* = prng.random().float(f32) * 2 - 1;
+    }
+    return p;
+}
+
+test "batch norm gradients match finite differences and running statistics follow the batch" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const p = try randomBnInputs(gpa, 41);
+
+    var t: Tape = .{ .gpa = gpa, .training = true };
+    const running_mean = try BnC.zeros(gpa);
+    const running_var = try BnC.full(gpa, 1);
+    const run = try buildBn(&t, p, running_mean, running_var, &bn_labels);
+    try t.backward(run.loss);
+
+    for (0..3) |ch| {
+        var sum: f32 = 0;
+        for (0..6) |r| sum += p.x.data[r * 3 + ch];
+        try testing.expectApproxEqAbs(0.1 * sum / 6, running_mean.data[ch], 1e-6);
+    }
+
+    const eps = 1e-3;
+    inline for (bn_names) |name| {
+        for (@field(p, name).data, 0..) |*v, i| {
+            const old = v.*;
+            v.* = old + eps;
+            const plus = try bnLoss(p);
+            v.* = old - eps;
+            const minus = try bnLoss(p);
+            v.* = old;
+            try testing.expectApproxEqAbs((plus - minus) / (2 * eps), @field(run, name).grad.data[i], 3e-3);
+        }
+    }
+}
+
+test "batch norm at eval time uses the running statistics" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const p = try randomBnInputs(gpa, 42);
+    const running_mean = try BnC.fromSlice(gpa, &.{ 0.5, -0.5, 0 });
+    const running_var = try BnC.fromSlice(gpa, &.{ 4, 1, 0.25 });
+
+    var t: Tape = .{ .gpa = gpa };
+    const x = try t.constant(p.x);
+    const y = try t.batchNorm(x, try t.constant(p.gamma), try t.constant(p.beta), .{ .mean = running_mean, .variance = running_var });
+    for (0..6) |r| {
+        for (0..3) |ch| {
+            const want = p.gamma.data[ch] * (p.x.data[r * 3 + ch] - running_mean.data[ch]) / @sqrt(running_var.data[ch] + 1e-5) + p.beta.data[ch];
+            try testing.expectApproxEqAbs(want, y.value.data[r * 3 + ch], 1e-5);
+        }
+    }
+    try testing.expectEqualSlices(f32, &.{ 0.5, -0.5, 0 }, running_mean.data);
+}
+
+test "gpu batch norm reproduces the cpu loss, gradients and running statistics" {
+    const gpu = gpu_mod.Gpu.init(testing.allocator, 16 << 20) catch |err| switch (err) {
+        error.DriverNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer gpu.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const host = try randomBnInputs(gpa, 43);
+
+    var cpu_tape: Tape = .{ .gpa = gpa, .training = true };
+    const cpu_mean = try BnC.zeros(gpa);
+    const cpu_var = try BnC.full(gpa, 1);
+    const cpu = try buildBn(&cpu_tape, host, cpu_mean, cpu_var, &bn_labels);
+    try cpu_tape.backward(cpu.loss);
+
+    var device: BnInputs = undefined;
+    inline for (bn_names) |name| {
+        const slice = try gpu.alloc(f32, @field(host, name).data.len);
+        try gpu.upload(slice, @field(host, name).data);
+        @field(device, name) = .{ .data = slice };
+    }
+    const gpu_mean: BnC = .{ .data = try gpu.alloc(f32, 3) };
+    const gpu_var: BnC = .{ .data = try gpu.alloc(f32, 3) };
+    try gpu.fill(gpu_mean.data, 0);
+    try gpu.fill(gpu_var.data, 1);
+    const labels = try gpu.alloc(u8, bn_labels.len);
+    try gpu.upload(labels, &bn_labels);
+    var gpu_tape: Tape = .{ .gpa = gpa, .par = .{ .gpu = gpu }, .training = true };
+    const run = try buildBn(&gpu_tape, device, gpu_mean, gpu_var, labels);
+    try gpu_tape.backward(run.loss);
+
+    try testing.expectApproxEqAbs(cpu.loss.value.data[0], try gpu_tape.scalar(run.loss), 1e-5);
+    const back = try gpa.alloc(f32, 24);
+    inline for (bn_names) |name| {
+        const want = @field(cpu, name).grad.data;
+        try gpu.download(back[0..want.len], @field(run, name).grad.data);
+        for (want, back[0..want.len]) |w, g| try testing.expectApproxEqAbs(w, g, 1e-5);
+    }
+    try gpu.download(back[0..3], gpu_mean.data);
+    for (cpu_mean.data, back[0..3]) |w, g| try testing.expectApproxEqAbs(w, g, 1e-6);
+    try gpu.download(back[0..3], gpu_var.data);
+    for (cpu_var.data, back[0..3]) |w, g| try testing.expectApproxEqAbs(w, g, 1e-6);
+}
+
+test "average pooling takes window means and spreads gradients evenly, also on the gpu" {
+    const gpu = gpu_mod.Gpu.init(testing.allocator, 1 << 20) catch |err| switch (err) {
+        error.DriverNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer gpu.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const Img = Tensor(f32, &.{ 1, 2, 4, 2 });
+    const values = [_]f32{ 1, 10, 2, 20, 5, 0, 6, 0, 3, 30, 4, 40, 7, 0, 8, 0 };
+
+    var t: Tape = .{ .gpa = arena.allocator() };
+    const x = try t.leaf(try Img.fromSlice(t.gpa, &values));
+    const y = try t.avgPool(x);
+    try testing.expectEqualSlices(f32, &.{ 2.5, 25, 6.5, 0 }, y.value.data);
+    @memset(y.grad.data, 4);
+    try t.nodes.items[0].run(&t, t.nodes.items[0].ctx);
+    for (x.grad.data) |g| try testing.expectEqual(@as(f32, 1), g);
+
+    const dx = try gpu.alloc(f32, Img.len);
+    const dev_x = try gpu.alloc(f32, Img.len);
+    try gpu.upload(dev_x, &values);
+    try gpu.fill(dx, 0);
+    var gpu_tape: Tape = .{ .gpa = arena.allocator(), .par = .{ .gpu = gpu } };
+    const gy = try gpu_tape.avgPool(Var(Img){ .value = .{ .data = dev_x }, .grad = .{ .data = dx }, .needs_grad = true });
+    var back: [4]f32 = undefined;
+    try gpu.download(&back, gy.value.data);
+    try testing.expectEqualSlices(f32, y.value.data, &back);
+    try gpu.fill(gy.grad.data, 4);
+    try gpu_tape.nodes.items[0].run(&gpu_tape, gpu_tape.nodes.items[0].ctx);
+    var grads: [16]f32 = undefined;
+    try gpu.download(&grads, dx);
+    for (grads) |g| try testing.expectEqual(@as(f32, 1), g);
 }

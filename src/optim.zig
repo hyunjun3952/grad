@@ -1,11 +1,21 @@
 const std = @import("std");
 const kernels = @import("kernels.zig");
+const ga = @import("gpu/args.zig");
+
+fn tensorTable(params: anytype) ga.TensorTable {
+    comptime std.debug.assert(params.len <= ga.max_tensors);
+    var table = std.mem.zeroes(ga.TensorTable);
+    table.count = params.len;
+    inline for (params, 0..) |p, i| {
+        table.len[i] = @intCast(p.value.data.len);
+        table.w[i] = @intFromPtr(p.value.data.ptr);
+        table.g[i] = @intFromPtr(p.grad.data.ptr);
+    }
+    return table;
+}
 
 pub fn zeroGrad(par: kernels.Parallel, params: anytype) !void {
-    if (par.gpu) |dev| {
-        inline for (params) |p| try dev.fill(p.grad.data, 0);
-        return;
-    }
+    if (par.gpu) |dev| return dev.zeroGrads(tensorTable(params));
     inline for (params) |p| {
         const G = @TypeOf(p.grad.data);
         const body = struct {
@@ -18,10 +28,7 @@ pub fn zeroGrad(par: kernels.Parallel, params: anytype) !void {
 }
 
 pub fn sgd(par: kernels.Parallel, lr: f32, params: anytype) !void {
-    if (par.gpu) |dev| {
-        inline for (params) |p| try dev.sgd(p.value.data, p.grad.data, lr);
-        return;
-    }
+    if (par.gpu) |dev| return dev.sgd(tensorTable(params), lr);
     inline for (params) |p| {
         const E = @TypeOf(p.value).Elem;
         const Ctx = struct { w: []E, g: []const E, lr: E };
@@ -82,15 +89,22 @@ pub const Adam = struct {
         const c2 = 1 - std.math.pow(f64, self.beta2, t);
 
         if (par.gpu) |dev| {
+            var table = tensorTable(params);
             var at: usize = 0;
-            inline for (params) |p| {
-                const len = p.value.data.len;
-                try dev.adam(p.value.data, p.grad.data, self.m[at..][0..len], self.v[at..][0..len], self.beta1, self.beta2, @floatCast(self.lr / c1), @floatCast(1 / @sqrt(c2)), self.eps, self.lr * self.weight_decay);
-                at += len;
+            inline for (params, 0..) |p, i| {
+                table.m[i] = @intFromPtr(self.m.ptr) + @sizeOf(f32) * at;
+                table.v[i] = @intFromPtr(self.v.ptr) + @sizeOf(f32) * at;
+                at += p.value.data.len;
             }
-            return;
+            return dev.adam(table, .{
+                .beta1 = self.beta1,
+                .beta2 = self.beta2,
+                .step = @floatCast(self.lr / c1),
+                .inv_sqrt_c2 = @floatCast(1 / @sqrt(c2)),
+                .eps = self.eps,
+                .decay = self.lr * self.weight_decay,
+            });
         }
-
         var off: usize = 0;
         inline for (params) |p| {
             const len = p.value.data.len;

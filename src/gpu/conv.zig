@@ -1,21 +1,31 @@
 const std = @import("std");
 
-pub const Op = enum { im2col, col2im, maxPool, maxPoolBackward };
+pub const Op = enum { im2col, col2im, maxPool, maxPoolBackward, avgPool, avgPoolBackward };
 
-pub const Dims = struct { n: usize, h: usize, w: usize, c: usize, k: usize };
+const Index = u32;
+
+pub const Dims = struct { n: Index, h: Index, w: Index, c: Index, k: Index, stride: Index = 1, pad: Index = 0 };
+
+pub fn outHeight(d: Dims) Index {
+    return (d.h + 2 * d.pad - d.k) / d.stride + 1;
+}
+
+pub fn outWidth(d: Dims) Index {
+    return (d.w + 2 * d.pad - d.k) / d.stride + 1;
+}
 
 pub fn workItems(op: Op, d: Dims) usize {
     return switch (op) {
-        .im2col => d.n * (d.h - d.k + 1) * (d.w - d.k + 1) * d.k * d.k * d.c,
-        .col2im => d.n * d.h * d.w * d.c,
-        .maxPool, .maxPoolBackward => d.n * (d.h / 2) * (d.w / 2) * d.c,
+        .im2col => @as(usize, d.n) * outHeight(d) * outWidth(d) * d.k * d.k * d.c,
+        .col2im => @as(usize, d.n) * d.h * d.w * d.c,
+        .maxPool, .maxPoolBackward, .avgPool, .avgPoolBackward => @as(usize, d.n) * (d.h / 2) * (d.w / 2) * d.c,
     };
 }
 
-pub inline fn im2col(x: [*]const f32, col: [*]f32, t: usize, d: Dims) void {
+pub inline fn im2col(x: [*]const f32, col: [*]f32, t: Index, d: Dims) void {
     const kc = d.k * d.k * d.c;
-    const ow = d.w - d.k + 1;
-    const oh = d.h - d.k + 1;
+    const ow = outWidth(d);
+    const oh = outHeight(d);
     const row = t / kc;
     const cc = t % kc;
     const ch = cc % d.c;
@@ -24,49 +34,74 @@ pub inline fn im2col(x: [*]const f32, col: [*]f32, t: usize, d: Dims) void {
     const ox = row % ow;
     const oy = row / ow % oh;
     const n = row / ow / oh;
-    col[t] = x[((n * d.h + oy + ky) * d.w + ox + kx) * d.c + ch];
+    const py = oy * d.stride + ky;
+    const px = ox * d.stride + kx;
+    const inside = py >= d.pad and px >= d.pad and py - d.pad < d.h and px - d.pad < d.w;
+    col[t] = if (inside) x[((n * d.h + py - d.pad) * d.w + px - d.pad) * d.c + ch] else 0;
 }
 
-pub inline fn col2im(dcol: [*]const f32, dx: [*]f32, t: usize, d: Dims) void {
+pub inline fn col2im(dcol: [*]const f32, dx: [*]f32, t: Index, d: Dims) void {
     const kc = d.k * d.k * d.c;
-    const ow = d.w - d.k + 1;
-    const oh = d.h - d.k + 1;
+    const ow = outWidth(d);
+    const oh = outHeight(d);
     const ch = t % d.c;
-    const x = t / d.c % d.w;
-    const y = t / d.c / d.w % d.h;
+    const x = t / d.c % d.w + d.pad;
+    const y = t / d.c / d.w % d.h + d.pad;
     const n = t / d.c / d.w / d.h;
     var total: f32 = 0;
-    for (0..d.k) |ky| {
-        if (y < ky or y - ky >= oh) continue;
-        for (0..d.k) |kx| {
-            if (x < kx or x - kx >= ow) continue;
-            const row = (n * oh + y - ky) * ow + x - kx;
+    var ky: Index = 0;
+    while (ky < d.k) : (ky += 1) {
+        if (y < ky or (y - ky) % d.stride != 0 or (y - ky) / d.stride >= oh) continue;
+        var kx: Index = 0;
+        while (kx < d.k) : (kx += 1) {
+            if (x < kx or (x - kx) % d.stride != 0 or (x - kx) / d.stride >= ow) continue;
+            const row = (n * oh + (y - ky) / d.stride) * ow + (x - kx) / d.stride;
             total += dcol[row * kc + (ky * d.k + kx) * d.c + ch];
         }
     }
     dx[t] += total;
 }
 
-inline fn firstMax(x: [*]const f32, t: usize, d: Dims) usize {
+inline fn windowOffsets(d: Dims) [4]Index {
+    return .{ 0, d.c, d.w * d.c, d.w * d.c + d.c };
+}
+
+inline fn windowStart(t: Index, d: Dims) Index {
     const ow = d.w / 2;
     const oh = d.h / 2;
     const ch = t % d.c;
     const ox = t / d.c % ow;
     const oy = t / d.c / ow % oh;
     const n = t / d.c / ow / oh;
-    const base = ((n * d.h + 2 * oy) * d.w + 2 * ox) * d.c + ch;
+    return ((n * d.h + 2 * oy) * d.w + 2 * ox) * d.c + ch;
+}
+
+inline fn firstMax(x: [*]const f32, t: Index, d: Dims) Index {
+    const base = windowStart(t, d);
     var best = base;
-    for ([_]usize{ d.c, d.w * d.c, d.w * d.c + d.c }) |off| {
+    for (windowOffsets(d)) |off| {
         if (x[base + off] > x[best]) best = base + off;
     }
     return best;
 }
 
-pub inline fn maxPool(x: [*]const f32, out: [*]f32, t: usize, d: Dims) void {
+pub inline fn avgPool(x: [*]const f32, out: [*]f32, t: Index, d: Dims) void {
+    const base = windowStart(t, d);
+    var total: f32 = 0;
+    for (windowOffsets(d)) |off| total += x[base + off];
+    out[t] = total / 4;
+}
+
+pub inline fn avgPoolBackward(gout: [*]const f32, gin: [*]f32, t: Index, d: Dims) void {
+    const base = windowStart(t, d);
+    for (windowOffsets(d)) |off| gin[base + off] += gout[t] / 4;
+}
+
+pub inline fn maxPool(x: [*]const f32, out: [*]f32, t: Index, d: Dims) void {
     out[t] = x[firstMax(x, t, d)];
 }
 
-pub inline fn maxPoolBackward(x: [*]const f32, gout: [*]const f32, gin: [*]f32, t: usize, d: Dims) void {
+pub inline fn maxPoolBackward(x: [*]const f32, gout: [*]const f32, gin: [*]f32, t: Index, d: Dims) void {
     gin[firstMax(x, t, d)] += gout[t];
 }
 
