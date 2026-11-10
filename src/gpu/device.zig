@@ -446,16 +446,23 @@ export fn adam(table: ga.TensorTable, hp: ga.AdamArgs) callconv(.nvptx_kernel) v
     v[0] = v_new;
     w[0] -= hp.step * m_new / (@sqrt(v_new) * hp.inv_sqrt_c2 + hp.eps) + hp.decay * w[0];
 }
-export fn gather(images: [*]const f32, labels_src: [*]const u8, order: [*]const u32, batch: [*]f32, labels_out: [*]u8, args: ga.GatherArgs) callconv(.nvptx_kernel) void {
+export fn gather(images: [*]const f32, labels_src: [*]const u8, order: [*]const u32, batch: [*]f32, labels_out: [*]u8, labels_other: [*]u8, args: ga.GatherArgs) callconv(.nvptx_kernel) void {
     const t = globalIndex();
     if (t >= @as(usize, args.rows) * args.pixels) return;
     const r = t / args.pixels;
     const p = t % args.pixels;
-    const idx: usize = order[args.start + r];
+    const box: aug.Box = .{ .x0 = args.x0, .y0 = args.y0, .x1 = args.x1, .y1 = args.y1 };
+    const partner = (r + 1) % args.rows;
+    const side = aug.side(args.pixels, args.channels);
+    const from = if (box.contains(p, side, args.channels)) partner else r;
+    const idx: usize = order[args.start + from];
     const config: aug.Config = .{ .max_shift = args.max_shift, .max_angle = args.max_angle, .max_scale = args.max_scale, .flip = args.flip != 0, .cutout = args.cutout, .channels = args.channels, .seed = args.seed };
     const source = images + idx * args.pixels;
-    batch[t] = if (config.active()) aug.pixel(source, p, aug.side(args.pixels, args.channels), args.channels, aug.transformOf(args.start + r, config)) else source[p];
-    if (p == 0) labels_out[r] = labels_src[idx];
+    batch[t] = if (config.active()) aug.pixel(source, p, side, args.channels, aug.transformOf(args.start + from, config)) else source[p];
+    if (p == 0) {
+        labels_out[r] = labels_src[order[args.start + r]];
+        labels_other[r] = labels_src[order[args.start + partner]];
+    }
 }
 
 fn TensorTile(comptime tile_rows: usize, comptime tile_cols: usize) type {

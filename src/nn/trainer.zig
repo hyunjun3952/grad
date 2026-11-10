@@ -26,6 +26,20 @@ fn printProgress(out: *Io.Writer, epoch: usize, epochs: usize, done: usize, step
     try out.flush();
 }
 
+const Mix = struct { box: augment_math.Box = .{}, kept: f32 = 1 };
+
+fn drawMix(side: u32, probability: f32, seed: u64) Mix {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rng = prng.random();
+    if (rng.float(f32) >= probability) return .{};
+    const cut: u32 = @intFromFloat(@as(f32, @floatFromInt(side)) * @sqrt(1 - rng.float(f32)));
+    const cx = rng.uintLessThan(u32, side);
+    const cy = rng.uintLessThan(u32, side);
+    const box: augment_math.Box = .{ .x0 = cx -| cut / 2, .y0 = cy -| cut / 2, .x1 = @min(side, cx + (cut + 1) / 2), .y1 = @min(side, cy + (cut + 1) / 2) };
+    const area: f32 = @floatFromInt((box.x1 - box.x0) * (box.y1 - box.y0));
+    return .{ .box = box, .kept = 1 - area / @as(f32, @floatFromInt(side * side)) };
+}
+
 fn Runner(comptime Spec: type) type {
     const pixels = Spec.side * Spec.side * Spec.channels;
 
@@ -89,6 +103,7 @@ fn Runner(comptime Spec: type) type {
             var until: ?usize = null;
             var warmup_epochs: usize = 0;
             var ema_decay: f32 = 0;
+            var cutmix: f32 = 0;
             var data_dir: []const u8 = Spec.data_dir;
             var positional: usize = 0;
             for (args[1..]) |arg| {
@@ -118,6 +133,8 @@ fn Runner(comptime Spec: type) type {
                     augment_config.max_scale = try std.fmt.parseFloat(f32, arg["--zoom=".len..]);
                 } else if (std.mem.startsWith(u8, arg, "--cutout=")) {
                     augment_config.cutout = try std.fmt.parseFloat(f32, arg["--cutout=".len..]);
+                } else if (std.mem.startsWith(u8, arg, "--cutmix=")) {
+                    cutmix = try std.fmt.parseFloat(f32, arg["--cutmix=".len..]);
                 } else if (std.mem.startsWith(u8, arg, "--ema=")) {
                     ema_decay = try std.fmt.parseFloat(f32, arg["--ema=".len..]);
                 } else if (std.mem.startsWith(u8, arg, "--warmup=")) {
@@ -185,7 +202,8 @@ fn Runner(comptime Spec: type) type {
             defer if (gpu == null) gpa.free(batch.data);
             var labels_host: [Spec.batch]u8 = undefined;
             const labels: []u8 = if (gpu) |dev| try dev.alloc(u8, Spec.batch) else &labels_host;
-
+            var other_host: [Spec.batch]u8 = undefined;
+            const other_labels: []u8 = if (gpu) |dev| try dev.alloc(u8, Spec.batch) else &other_host;
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const loss_total: []f32 = if (gpu) |dev| try dev.alloc(f32, 1) else &.{};
@@ -210,18 +228,25 @@ fn Runner(comptime Spec: type) type {
                 var augment = augment_config;
                 augment.seed = epoch;
                 for (0..steps) |step| {
+                    const mix = drawMix(Spec.side, cutmix, 0x5EED0000 + epoch * steps + step);
+                    var step_augment = augment;
+                    step_augment.box = mix.box;
                     if (gpu) |dev| {
-                        try dev.gather(train_data.images, train_data.labels, order_device, batch.data, labels, step * Spec.batch, augment);
+                        try dev.gather(train_data.images, train_data.labels, order_device, batch.data, labels, other_labels, step * Spec.batch, step_augment);
                     } else {
-                        for (order[step * Spec.batch ..][0..Spec.batch], 0..) |idx, row| {
+                        const rows = order[step * Spec.batch ..][0..Spec.batch];
+                        for (rows, 0..) |idx, row| {
+                            const partner = (row + 1) % Spec.batch;
                             const row_pixels = batch.data[row * pixels ..][0..pixels];
-                            if (augment.active()) {
-                                const transform = augment_math.transformOf(step * Spec.batch + row, augment);
-                                for (row_pixels, 0..) |*v, p| v.* = augment_math.pixel(train.images[idx * pixels ..].ptr, p, Spec.side, Spec.channels, transform);
-                            } else {
-                                @memcpy(row_pixels, train.images[idx * pixels ..][0..pixels]);
+                            const own = augment_math.transformOf(step * Spec.batch + row, step_augment);
+                            const other = augment_math.transformOf(step * Spec.batch + partner, step_augment);
+                            for (row_pixels, 0..) |*v, p| {
+                                const pasted = step_augment.box.contains(p, Spec.side, Spec.channels);
+                                const source = train.images[(if (pasted) rows[partner] else idx) * pixels ..];
+                                v.* = if (step_augment.active()) augment_math.pixel(source.ptr, p, Spec.side, Spec.channels, if (pasted) other else own) else source[p];
                             }
                             labels[row] = train.labels[idx];
+                            other_labels[row] = train.labels[rows[partner]];
                         }
                     }
 
@@ -232,7 +257,10 @@ fn Runner(comptime Spec: type) type {
                     var tape: Tape = .{ .gpa = arena.allocator(), .par = par, .training = true, .smoothing = smoothing, .seed = global_step * 8 };
                     try optim.zeroGrad(par, params);
                     const logits = try Spec.forward(model, &tape, try tape.constant(batch));
-                    const loss = try tape.crossEntropy(logits, labels);
+                    const loss = if (mix.kept == 1) try tape.crossEntropy(logits, labels) else try tape.add(
+                        try tape.mul(try tape.crossEntropy(logits, labels), try tape.constant(try tape.filledTensor(Tensor(f32, &.{}), mix.kept))),
+                        try tape.mul(try tape.crossEntropy(logits, other_labels), try tape.constant(try tape.filledTensor(Tensor(f32, &.{}), 1 - mix.kept))),
+                    );
                     try tape.backward(loss);
                     try adam.step(par, params);
                     if (ema_decay > 0) try average.update(par, adam.t);

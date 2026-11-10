@@ -611,11 +611,11 @@ pub const Gpu = struct {
         try self.launchTable(.adam, table, .{hp});
     }
 
-    pub fn gather(self: *Gpu, images: []const f32, labels_src: []const u8, order: []const u32, batch: []f32, labels_out: []u8, start: usize, augment: Augment) Error!void {
+    pub fn gather(self: *Gpu, images: []const f32, labels_src: []const u8, order: []const u32, batch: []f32, labels_out: []u8, labels_other: []u8, start: usize, augment: Augment) Error!void {
         const rows = labels_out.len;
         const pixels = batch.len / rows;
-        const args = pack(ga.GatherArgs, .{ .start = start, .rows = rows, .pixels = pixels, .max_shift = augment.max_shift, .max_angle = augment.max_angle, .max_scale = augment.max_scale, .channels = augment.channels, .flip = augment.flip, .cutout = augment.cutout, .seed = augment.seed });
-        try self.launchFlat(.gather, rows * pixels, .{ images, labels_src, order, batch, labels_out, args });
+        const args = pack(ga.GatherArgs, .{ .start = start, .rows = rows, .pixels = pixels, .max_shift = augment.max_shift, .max_angle = augment.max_angle, .max_scale = augment.max_scale, .channels = augment.channels, .flip = augment.flip, .cutout = augment.cutout, .x0 = augment.box.x0, .y0 = augment.box.y0, .x1 = augment.box.x1, .y1 = augment.box.y1, .seed = augment.seed });
+        try self.launchFlat(.gather, rows * pixels, .{ images, labels_src, order, batch, labels_out, labels_other, args });
     }
 };
 

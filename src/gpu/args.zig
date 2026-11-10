@@ -23,7 +23,7 @@ pub const ElementwiseArgs = extern struct { len: u32, multiply: u32, dims: [4]u3
 
 pub const SumArgs = extern struct { out_len: u32, reduce_count: u32, mask: u32, accumulate: u32, dims: [4]u32, strides: [4]u32 };
 
-pub const GatherArgs = extern struct { start: u32, rows: u32, pixels: u32, max_shift: u32, max_angle: f32, max_scale: f32, channels: u32, flip: u32, cutout: f32, seed: u64 };
+pub const GatherArgs = extern struct { start: u32, rows: u32, pixels: u32, max_shift: u32, max_angle: f32, max_scale: f32, channels: u32, flip: u32, cutout: f32, x0: u32, y0: u32, x1: u32, y1: u32, seed: u64 };
 
 pub const PackArgs = extern struct { rows: u32, cols: u32, rows_padded: u32, cols_padded: u32, src_stride: u32, transpose: u32 };
 

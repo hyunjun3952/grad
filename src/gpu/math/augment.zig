@@ -1,12 +1,26 @@
 const std = @import("std");
 const drop = @import("dropout.zig");
 
+pub const Box = struct {
+    x0: u32 = 0,
+    y0: u32 = 0,
+    x1: u32 = 0,
+    y1: u32 = 0,
+
+    pub inline fn contains(self: Box, index: usize, width: usize, channels: usize) bool {
+        const x = (index / channels) % width;
+        const y = (index / channels) / width;
+        return x >= self.x0 and x < self.x1 and y >= self.y0 and y < self.y1;
+    }
+};
+
 pub const Config = struct {
     max_shift: u32 = 0,
     max_angle: f32 = 0,
     max_scale: f32 = 0,
     flip: bool = false,
     cutout: f32 = 0,
+    box: Box = .{},
     channels: u32 = 1,
     seed: u64 = 0,
 
@@ -177,31 +191,38 @@ test "gpu gather applies the same augmentation as the cpu" {
     const labels = [_]u8{ 4, 5, 6, 7 };
     const order = [_]u32{ 2, 0, 1, 3 };
     const start = 2;
-    const config: Config = .{ .max_shift = 2, .max_angle = 25, .max_scale = 0.15, .seed = 5 };
+    const config: Config = .{ .max_shift = 2, .max_angle = 25, .max_scale = 0.15, .box = .{ .x0 = 3, .y0 = 5, .x1 = 20, .y1 = 12 }, .seed = 5 };
 
     const d_images = try gpu.alloc(f32, images.len);
     const d_labels = try gpu.alloc(u8, labels.len);
     const d_order = try gpu.alloc(u32, order.len);
     const d_batch = try gpu.alloc(f32, 2 * 784);
     const d_out_labels = try gpu.alloc(u8, 2);
+    const d_other_labels = try gpu.alloc(u8, 2);
     try gpu.upload(d_images, &images);
     try gpu.upload(d_labels, &labels);
     try gpu.upload(d_order, &order);
-    try gpu.gather(d_images, d_labels, d_order, d_batch, d_out_labels, start, config);
+    try gpu.gather(d_images, d_labels, d_order, d_batch, d_out_labels, d_other_labels, start, config);
 
     var got: [2 * 784]f32 = undefined;
     var got_labels: [2]u8 = undefined;
+    var other_labels: [2]u8 = undefined;
     try gpu.download(&got, d_batch);
     try gpu.download(&got_labels, d_out_labels);
+    try gpu.download(&other_labels, d_other_labels);
     try std.testing.expectEqualSlices(u8, &.{ 5, 7 }, &got_labels);
+    try std.testing.expectEqualSlices(u8, &.{ 7, 5 }, &other_labels);
+    var pasted: usize = 0;
     for (0..2) |r| {
-        const tr = transformOf(start + r, config);
         for (0..784) |p| {
-            try std.testing.expectApproxEqAbs(pixel(images[order[start + r] * 784 ..].ptr, p, 28, 1, tr), got[r * 784 + p], 1e-5);
+            const from = if (config.box.contains(p, 28, 1)) (r + 1) % 2 else r;
+            pasted += @intFromBool(from != r);
+            const tr = transformOf(start + from, config);
+            try std.testing.expectApproxEqAbs(pixel(images[order[start + from] * 784 ..].ptr, p, 28, 1, tr), got[r * 784 + p], 1e-5);
         }
     }
+    try std.testing.expectEqual(@as(usize, 2 * 17 * 7), pasted);
 }
-
 test "flipping mirrors the image, and colour channels are sampled independently" {
     var mirrored: ?Transform = null;
     for (0..64) |sample| {
