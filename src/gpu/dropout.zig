@@ -9,7 +9,7 @@ pub inline fn hash(seed: u64, t: usize) u64 {
     return z ^ (z >> 32);
 }
 
-pub inline fn apply(src: [*]const f32, dst: [*]f32, t: usize, seed: u64, keep: f32, accumulate: bool) void {
+pub inline fn apply(t: usize, src: [*]const f32, dst: [*]f32, seed: u64, keep: f32, accumulate: bool) void {
     // Top 24 bits give an exact f32 in [0, 1): 16777216 = 2^24.
     const u = @as(f32, @floatFromInt(hash(seed, t) >> 40)) * (1.0 / 16777216.0);
     const v = if (u < keep) src[t] / keep else 0;
@@ -19,7 +19,7 @@ test "the kept fraction follows the keep probability and kept values are scaled"
     var src: [20000]f32 = undefined;
     var dst: [20000]f32 = undefined;
     @memset(&src, 1);
-    for (0..src.len) |t| apply(&src, &dst, t, 7, 0.8, false);
+    for (0..src.len) |t| apply(t, &src, &dst, 7, 0.8, false);
     var kept: usize = 0;
     for (dst) |v| {
         if (v != 0) {

@@ -58,14 +58,39 @@ const Kernel = enum {
 };
 const kernel_count = @typeInfo(Kernel).@"enum".field_names.len;
 
-fn address(slice: anytype) u64 {
-    return @intFromPtr(slice.ptr);
-}
-
 fn toU32(x: usize) u32 {
     return @intCast(x);
 }
 
+fn KernelArg(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .pointer => u64,
+        .bool => u32,
+        .@"enum" => u32,
+        .int, .comptime_int => if (T == u64 or T == u32) T else u32,
+        else => T,
+    };
+}
+
+fn kernelArg(value: anytype) KernelArg(@TypeOf(value)) {
+    return switch (@typeInfo(@TypeOf(value))) {
+        .pointer => @intFromPtr(value.ptr),
+        .bool => @intFromBool(value),
+        .@"enum" => @backingInt(value),
+        .int, .comptime_int => if (KernelArg(@TypeOf(value)) == u32) toU32(value) else value,
+        else => value,
+    };
+}
+
+fn pack(comptime T: type, values: anytype) T {
+    var out: T = undefined;
+    inline for (@typeInfo(T).@"struct".field_names) |name| {
+        const FieldType = @FieldType(T, name);
+        const value = @field(values, name);
+        @field(out, name) = if (@typeInfo(FieldType) == .int) kernelArg(value) else value;
+    }
+    return out;
+}
 fn ceilDiv(x: usize, y: usize) u32 {
     return @intCast((x + y - 1) / y);
 }
@@ -227,11 +252,16 @@ pub const Gpu = struct {
 
     fn launch(self: *Gpu, kernel: Kernel, grid: [3]u32, args: anytype) Error!void {
         if (grid[0] == 0 or grid[1] == 0) return;
-        var copy = args;
-        var pointers: [copy.len]?*anyopaque = undefined;
-        inline for (0..copy.len) |i| {
-            if (@sizeOf(@TypeOf(copy[i])) < 4) @compileError("kernel arguments must be at least 32 bits wide; widen flags with @as(u32, ...)");
-            pointers[i] = &copy[i];
+        const types = comptime blk: {
+            var t: [args.len]type = undefined;
+            for (&t, 0..) |*e, i| e.* = KernelArg(@TypeOf(args[i]));
+            break :blk t;
+        };
+        var converted: @Tuple(&types) = undefined;
+        var pointers: [args.len]?*anyopaque = undefined;
+        inline for (0..args.len) |i| {
+            converted[i] = kernelArg(args[i]);
+            pointers[i] = &converted[i];
         }
         const started = try self.timerStart();
         try self.cu.launch(self.fns[@backingInt(kernel)], grid, .{ 256, 1, 1 }, &pointers);
@@ -243,45 +273,35 @@ pub const Gpu = struct {
     }
 
     pub fn matmul(self: *Gpu, a: []const f32, b: []const f32, out: []f32, shape: MatmulShape, opts: MatmulOpts) Error!void {
-        const m = shape.m;
-        const n = shape.n;
-        const k = shape.k;
-        const trans_a = opts.trans_a;
-        const trans_b = opts.trans_b;
-        const accumulate = opts.accumulate;
-        std.debug.assert(!(trans_a and trans_b));
-        const tile: usize = if (n <= 32 and m <= 64) 2 else if (n <= 32) 1 else 0;
-        const transpose: usize = if (trans_a) 2 else if (trans_b) 1 else 0;
+        std.debug.assert(!(opts.trans_a and opts.trans_b));
+        const tile: usize = if (shape.n <= 32 and shape.m <= 64) 2 else if (shape.n <= 32) 1 else 0;
+        const transpose: usize = if (opts.trans_a) 2 else if (opts.trans_b) 1 else 0;
         const kernel: Kernel = @fromBackingInt(@backingInt(Kernel.sgemmNN) + @as(u5, @intCast(tile * 3 + transpose)));
         const tile_m: usize = if (tile == 2) 32 else 128;
         const tile_n: usize = if (tile == 0) 128 else 32;
-        const blocks = @as(usize, ceilDiv(n, tile_n)) * ceilDiv(m, tile_m);
-        const splits = @max(1, @min(k / 256, (128 + blocks - 1) / blocks));
-        const chunk = std.mem.alignForward(usize, (k + splits - 1) / splits, 8);
-        if (splits > 1 and !accumulate) try self.fill(out, 0);
-        const kernel_shape: ga.GemmShape = .{
-            .m = toU32(m),
-            .n = toU32(n),
-            .k = toU32(k),
-            .accumulate = @intFromBool(accumulate),
-            .chunk = toU32(chunk),
-        };
-        try self.launch(kernel, .{ ceilDiv(n, tile_n), ceilDiv(m, tile_m), ceilDiv(k, chunk) }, .{ address(a), address(b), address(out), kernel_shape });
+        const blocks = @as(usize, ceilDiv(shape.n, tile_n)) * ceilDiv(shape.m, tile_m);
+        const splits = @max(1, @min(shape.k / 256, (128 + blocks - 1) / blocks));
+        const chunk = std.mem.alignForward(usize, (shape.k + splits - 1) / splits, 8);
+        if (splits > 1 and !opts.accumulate) try self.fill(out, 0);
+        const kernel_shape = pack(ga.GemmShape, .{ .m = shape.m, .n = shape.n, .k = shape.k, .accumulate = opts.accumulate, .chunk = chunk });
+        try self.launch(kernel, .{ ceilDiv(shape.n, tile_n), ceilDiv(shape.m, tile_m), ceilDiv(shape.k, chunk) }, .{ a, b, out, kernel_shape });
     }
+
     pub fn elementwise(self: *Gpu, op: BinaryOp, a: []const f32, b: []const f32, out: []f32, plan: BroadcastPlan) Error!void {
-        const args: ga.ElementwiseArgs = .{ .len = toU32(out.len), .multiply = @intFromBool(op == .mul), .dims = plan.dims, .a_strides = plan.a_strides, .b_strides = plan.b_strides };
-        try self.launchFlat(.elementwise, out.len, .{ address(a), address(b), address(out), args });
+        const args = pack(ga.ElementwiseArgs, .{ .len = out.len, .multiply = op == .mul, .dims = plan.dims, .a_strides = plan.a_strides, .b_strides = plan.b_strides });
+        try self.launchFlat(.elementwise, out.len, .{ a, b, out, args });
     }
+
     pub fn relu(self: *Gpu, x: []const f32, out: []f32) Error!void {
-        try self.launchFlat(.relu, x.len, .{ address(x), address(out), toU32(x.len) });
+        try self.launchFlat(.relu, x.len, .{ x, out, x.len });
     }
 
     pub fn reluBackward(self: *Gpu, x: []const f32, g_out: []const f32, g_in: []f32) Error!void {
-        try self.launchFlat(.reluBackward, x.len, .{ address(x), address(g_out), address(g_in), toU32(x.len) });
+        try self.launchFlat(.reluBackward, x.len, .{ x, g_out, g_in, x.len });
     }
 
     pub fn addInPlace(self: *Gpu, dst: []f32, src: []const f32) Error!void {
-        try self.launchFlat(.addInPlace, dst.len, .{ address(dst), address(src), toU32(dst.len) });
+        try self.launchFlat(.addInPlace, dst.len, .{ dst, src, dst.len });
     }
 
     pub fn sumTo(self: *Gpu, in: []const f32, out: []f32, plan: ReducePlan, accumulate: bool) Error!void {
@@ -289,43 +309,33 @@ pub const Gpu = struct {
             if (!accumulate) try self.fill(out, 0);
             return self.columnSums(in, out);
         }
-        const args: ga.SumArgs = .{ .out_len = toU32(out.len), .reduce_count = toU32(in.len / out.len), .mask = plan.mask, .accumulate = @intFromBool(accumulate), .dims = plan.dims, .strides = plan.strides };
-        try self.launch(.sumTo, .{ toU32(out.len), 1, 1 }, .{ address(in), address(out), args });
+        const args = pack(ga.SumArgs, .{ .out_len = out.len, .reduce_count = in.len / out.len, .mask = plan.mask, .accumulate = accumulate, .dims = plan.dims, .strides = plan.strides });
+        try self.launch(.sumTo, .{ toU32(out.len), 1, 1 }, .{ in, out, args });
     }
+
     pub fn crossEntropy(self: *Gpu, logits: []const f32, logp: []f32, labels: []const u8, loss: []f32, cols: usize) Error!void {
         const rows = labels.len;
         const row_loss = try self.scratch(f32, rows);
-        try self.launchFlat(.crossEntropyRows, rows, .{ address(logits), address(logp), address(labels), address(row_loss), toU32(rows), toU32(cols) });
-        try self.launchFlat(.crossEntropyMean, 1, .{ address(row_loss), address(loss), toU32(rows) });
+        try self.launchFlat(.crossEntropyRows, rows, .{ logits, logp, labels, row_loss, rows, cols });
+        try self.launchFlat(.crossEntropyMean, 1, .{ row_loss, loss, rows });
     }
 
     pub fn crossEntropyBackward(self: *Gpu, logp: []const f32, labels: []const u8, grad: []f32, loss_grad: []const f32, cols: usize) Error!void {
         const rows = labels.len;
-        try self.launchFlat(.crossEntropyBackward, rows * cols, .{ address(logp), address(labels), address(grad), address(loss_grad), toU32(rows), toU32(cols) });
+        try self.launchFlat(.crossEntropyBackward, rows * cols, .{ logp, labels, grad, loss_grad, rows, cols });
     }
 
     pub fn convKernel(self: *Gpu, comptime op: conv.Op, slices: anytype, d: conv.Dims) Error!void {
         const len = conv.workItems(op, d);
-        const types = comptime blk: {
-            var t: [slices.len + 2]type = undefined;
-            for (&t, 0..) |*e, i| e.* = if (i < slices.len) u64 else if (i == slices.len) u32 else conv.Dims;
-            break :blk t;
-        };
-        var args: @Tuple(&types) = undefined;
-        inline for (slices, 0..) |s, i| args[i] = address(s);
-        args[slices.len] = toU32(len);
-        args[slices.len + 1] = d;
-        try self.launchFlat(@field(Kernel, @tagName(op)), len, args);
+        try self.launchFlat(@field(Kernel, @tagName(op)), len, slices ++ .{ len, d });
     }
+
     const ColumnKind = enum(u32) { sum, squared_deviation, gradient_sums };
 
     fn columnReduce(self: *Gpu, a: []const f32, b: []const f32, mean: []const f32, inv_std: []const f32, out: []f32, kind: ColumnKind, scale: f32, channels: usize) Error!void {
         const rows = a.len / channels;
         const blocks: u32 = @min(256, ceilDiv(rows, 8 * 16));
-        try self.launch(.columnReduce, .{ blocks, ceilDiv(channels, 32), 1 }, .{
-            address(a),  address(b),      address(mean), address(inv_std),  address(out),
-            toU32(rows), toU32(channels), blocks * 8,    @backingInt(kind), scale,
-        });
+        try self.launch(.columnReduce, .{ blocks, ceilDiv(channels, 32), 1 }, .{ a, b, mean, inv_std, out, rows, channels, blocks * 8, kind, scale });
     }
 
     pub fn columnSums(self: *Gpu, in: []const f32, out: []f32) Error!void {
@@ -339,22 +349,24 @@ pub const Gpu = struct {
             try self.columnReduce(x, x, sums[0..c], sums[0..c], sums[0..c], .sum, 1, c);
             try self.columnReduce(x, x, sums[0..c], sums[0..c], sums[c..], .squared_deviation, 1 / @as(f32, @floatFromInt(x.len / c)), c);
         }
-        try self.launchFlat(.batchNormFinish, c, .{ address(sums), address(mean), address(inv_std), address(running_mean), address(running_var), toU32(x.len / c), toU32(c), @as(u32, @intFromBool(training)) });
+        try self.launchFlat(.batchNormFinish, c, .{ sums, mean, inv_std, running_mean, running_var, x.len / c, c, training });
     }
+
     pub fn batchNormApply(self: *Gpu, x: []const f32, y: []f32, mean: []const f32, inv_std: []const f32, gamma: []const f32, beta: []const f32) Error!void {
-        try self.launchFlat(.batchNormApply, x.len, .{ address(x), address(y), toU32(x.len), toU32(mean.len), address(mean), address(inv_std), address(gamma), address(beta) });
+        try self.launchFlat(.batchNormApply, x.len, .{ x, y, x.len, mean.len, mean, inv_std, gamma, beta });
     }
 
     pub fn batchNormGradSums(self: *Gpu, x: []const f32, dy: []const f32, mean: []const f32, inv_std: []const f32, sums: []f32, gamma_grad: []f32, beta_grad: []f32) Error!void {
         try self.columnReduce(dy, x, mean, inv_std, sums, .gradient_sums, 1, mean.len);
-        try self.launchFlat(.batchNormGradFinish, mean.len, .{ address(sums), address(gamma_grad), address(beta_grad), toU32(mean.len) });
+        try self.launchFlat(.batchNormGradFinish, mean.len, .{ sums, gamma_grad, beta_grad, mean.len });
     }
+
     pub fn batchNormGradInput(self: *Gpu, x: []const f32, dy: []const f32, dx: []f32, mean: []const f32, inv_std: []const f32, gamma: []const f32, sums: []const f32) Error!void {
-        try self.launchFlat(.batchNormGradInput, x.len, .{ address(x), address(dy), address(dx), toU32(x.len), toU32(mean.len), address(mean), address(inv_std), address(gamma), address(sums) });
+        try self.launchFlat(.batchNormGradInput, x.len, .{ x, dy, dx, x.len, mean.len, mean, inv_std, gamma, sums });
     }
 
     pub fn dropout(self: *Gpu, src: []const f32, dst: []f32, seed: u64, keep: f32, accumulate: bool) Error!void {
-        try self.launchFlat(.dropout, src.len, .{ address(src), address(dst), toU32(src.len), seed, keep, @as(u32, @intFromBool(accumulate)) });
+        try self.launchFlat(.dropout, src.len, .{ src, dst, src.len, seed, keep, accumulate });
     }
 
     fn launchTable(self: *Gpu, kernel: Kernel, table: ga.TensorTable, args: anytype) Error!void {
@@ -374,11 +386,12 @@ pub const Gpu = struct {
     pub fn adam(self: *Gpu, table: ga.TensorTable, hp: ga.AdamArgs) Error!void {
         try self.launchTable(.adam, table, .{hp});
     }
+
     pub fn gather(self: *Gpu, images: []const f32, labels_src: []const u8, order: []const u32, batch: []f32, labels_out: []u8, start: usize, augment: Augment) Error!void {
         const rows = labels_out.len;
         const pixels = batch.len / rows;
-        const args: ga.GatherArgs = .{ .start = toU32(start), .rows = toU32(rows), .pixels = toU32(pixels), .max_shift = augment.max_shift, .seed = augment.seed };
-        try self.launchFlat(.gather, rows * pixels, .{ address(images), address(labels_src), address(order), address(batch), address(labels_out), args });
+        const args = pack(ga.GatherArgs, .{ .start = start, .rows = rows, .pixels = pixels, .max_shift = augment.max_shift, .seed = augment.seed });
+        try self.launchFlat(.gather, rows * pixels, .{ images, labels_src, order, batch, labels_out, args });
     }
 };
 

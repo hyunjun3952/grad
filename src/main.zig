@@ -18,88 +18,28 @@ const eval_batch = 1000;
 const learning_rate = 0.002;
 const weight_decay = 0.01;
 
-const Mlp = struct {
-    l1: grad.nn.Linear(pixels, hidden),
-    l2: grad.nn.Linear(hidden, classes),
+const nn = grad.nn;
 
-    fn init(gpa: Allocator, rng: std.Random) Allocator.Error!Mlp {
-        const l1 = try grad.nn.Linear(pixels, hidden).init(gpa, rng);
-        errdefer l1.deinit(gpa);
-        return .{ .l1 = l1, .l2 = try grad.nn.Linear(hidden, classes).init(gpa, rng) };
+const MlpLayers = struct { nn.Linear(pixels, hidden), nn.Linear(hidden, classes) };
+const CnnLayers = struct { nn.Conv2d(1, 16, 5, .{}), nn.BatchNorm(16), nn.Conv2d(16, 32, 5, .{}), nn.BatchNorm(32), nn.Linear(512, classes) };
+const Model = if (config.cnn) CnnLayers else MlpLayers;
+
+fn Logits(comptime X: type) type {
+    return Var(Tensor(f32, &.{ X.shape[0], classes }));
+}
+
+fn forward(model: Model, tape: *Tape, x: anytype) grad.autograd.Error!Logits(@TypeOf(x.value)) {
+    if (!config.cnn) {
+        const l1, const l2 = model;
+        return l2.forward(tape, try tape.dropout(try tape.relu(try l1.forward(tape, x)), 0.8));
     }
-
-    fn deinit(self: Mlp, gpa: Allocator) void {
-        self.l1.deinit(gpa);
-        self.l2.deinit(gpa);
-    }
-
-    fn toGpu(self: Mlp, gpu: *Gpu) !Mlp {
-        return .{ .l1 = try self.l1.toGpu(gpu), .l2 = try self.l2.toGpu(gpu) };
-    }
-
-    fn params(self: Mlp) @TypeOf(self.l1.params() ++ self.l2.params()) {
-        return self.l1.params() ++ self.l2.params();
-    }
-
-    fn state(self: Mlp) @TypeOf(self.l1.state() ++ self.l2.state()) {
-        return self.l1.state() ++ self.l2.state();
-    }
-
-    fn forward(self: Mlp, tape: *Tape, x: anytype) grad.autograd.Error!Var(Tensor(f32, &.{ @TypeOf(x.value).shape[0], classes })) {
-        return self.l2.forward(tape, try tape.dropout(try tape.relu(try self.l1.forward(tape, x)), 0.8));
-    }
-};
-
-const Cnn = struct {
-    c1: grad.nn.Conv2d(1, 16, 5, .{}),
-    n1: grad.nn.BatchNorm(16),
-    c2: grad.nn.Conv2d(16, 32, 5, .{}),
-    n2: grad.nn.BatchNorm(32),
-    fc: grad.nn.Linear(512, classes),
-
-    fn init(gpa: Allocator, rng: std.Random) Allocator.Error!Cnn {
-        const c1 = try grad.nn.Conv2d(1, 16, 5, .{}).init(gpa, rng);
-        errdefer c1.deinit(gpa);
-        const n1 = try grad.nn.BatchNorm(16).init(gpa);
-        errdefer n1.deinit(gpa);
-        const c2 = try grad.nn.Conv2d(16, 32, 5, .{}).init(gpa, rng);
-        errdefer c2.deinit(gpa);
-        const n2 = try grad.nn.BatchNorm(32).init(gpa);
-        errdefer n2.deinit(gpa);
-        return .{ .c1 = c1, .n1 = n1, .c2 = c2, .n2 = n2, .fc = try grad.nn.Linear(512, classes).init(gpa, rng) };
-    }
-
-    fn deinit(self: Cnn, gpa: Allocator) void {
-        self.c1.deinit(gpa);
-        self.n1.deinit(gpa);
-        self.c2.deinit(gpa);
-        self.n2.deinit(gpa);
-        self.fc.deinit(gpa);
-    }
-
-    fn toGpu(self: Cnn, gpu: *Gpu) !Cnn {
-        return .{ .c1 = try self.c1.toGpu(gpu), .n1 = try self.n1.toGpu(gpu), .c2 = try self.c2.toGpu(gpu), .n2 = try self.n2.toGpu(gpu), .fc = try self.fc.toGpu(gpu) };
-    }
-
-    fn params(self: Cnn) @TypeOf(self.c1.params() ++ self.n1.params() ++ self.c2.params() ++ self.n2.params() ++ self.fc.params()) {
-        return self.c1.params() ++ self.n1.params() ++ self.c2.params() ++ self.n2.params() ++ self.fc.params();
-    }
-
-    fn state(self: Cnn) @TypeOf(self.c1.state() ++ self.n1.state() ++ self.c2.state() ++ self.n2.state() ++ self.fc.state()) {
-        return self.c1.state() ++ self.n1.state() ++ self.c2.state() ++ self.n2.state() ++ self.fc.state();
-    }
-
-    fn forward(self: Cnn, tape: *Tape, x: anytype) grad.autograd.Error!Var(Tensor(f32, &.{ @TypeOf(x.value).shape[0], classes })) {
-        const n = @TypeOf(x.value).shape[0];
-        const image = grad.autograd.reshape(x, &.{ n, 28, 28, 1 });
-        const a = try tape.maxPool(try tape.relu(try self.n1.forward(tape, try self.c1.forward(tape, image))));
-        const b = try tape.maxPool(try tape.relu(try self.n2.forward(tape, try self.c2.forward(tape, a))));
-        return self.fc.forward(tape, try tape.dropout(grad.autograd.reshape(b, &.{ n, 512 }), 0.7));
-    }
-};
-
-const Model = if (config.cnn) Cnn else Mlp;
-
+    const c1, const n1, const c2, const n2, const fc = model;
+    const n = @TypeOf(x.value).shape[0];
+    const image = grad.autograd.reshape(x, &.{ n, 28, 28, 1 });
+    const a = try tape.maxPool(try tape.relu(try n1.forward(tape, try c1.forward(tape, image))));
+    const b = try tape.maxPool(try tape.relu(try n2.forward(tape, try c2.forward(tape, a))));
+    return fc.forward(tape, try tape.dropout(grad.autograd.reshape(b, &.{ n, 512 }), 0.7));
+}
 fn accuracy(gpa: Allocator, par: grad.kernels.Parallel, model: Model, data: grad.mnist.Dataset, host_labels: []const u8) !f64 {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -113,7 +53,7 @@ fn accuracy(gpa: Allocator, par: grad.kernels.Parallel, model: Model, data: grad
         if (par.gpu) |dev| try dev.resetStep();
         var tape: Tape = .{ .gpa = arena.allocator(), .par = par };
         const x: Tensor(f32, &.{ eval_batch, pixels }) = .{ .data = data.images[start * pixels ..][0 .. eval_batch * pixels] };
-        const logits = try model.forward(&tape, try tape.constant(x));
+        const logits = try forward(model, &tape, try tape.constant(x));
         const values: []const f32 = if (par.gpu) |dev| blk: {
             try dev.download(host_logits, logits.value.data);
             break :blk host_logits;
@@ -183,11 +123,11 @@ pub fn main(init: std.process.Init) !void {
 
     var prng = std.Random.DefaultPrng.init(1234);
     const rng = prng.random();
-    const host_model = try Model.init(gpa, rng);
-    defer host_model.deinit(gpa);
-    const model = if (gpu) |dev| try host_model.toGpu(dev) else host_model;
-    const params = model.params();
-    if (load_path) |path| try grad.checkpoint.load(gpa, io, path, gpu, model.state());
+    const host_model = try nn.initAll(Model, gpa, rng);
+    defer nn.deinitAll(host_model, gpa);
+    const model = if (gpu) |dev| try nn.toGpuAll(host_model, dev) else host_model;
+    const params = nn.params(model);
+    if (load_path) |path| try grad.checkpoint.load(gpa, io, path, gpu, nn.state(model));
     var adam = try grad.optim.Adam.init(gpa, par, learning_rate, params);
     defer adam.deinit();
     adam.weight_decay = weight_decay;
@@ -247,7 +187,7 @@ pub fn main(init: std.process.Init) !void {
             adam.lr = grad.optim.cosineLr(learning_rate, global_step, epochs * steps);
             var tape: Tape = .{ .gpa = arena.allocator(), .par = par, .training = true, .seed = global_step * 8 };
             try grad.optim.zeroGrad(par, params);
-            const logits = try model.forward(&tape, try tape.constant(batch));
+            const logits = try forward(model, &tape, try tape.constant(batch));
             const loss = try tape.crossEntropy(logits, labels);
             try tape.backward(loss);
             try adam.step(par, params);
@@ -261,7 +201,7 @@ pub fn main(init: std.process.Init) !void {
         try out.flush();
     }
     if (save_path) |path| {
-        try grad.checkpoint.save(gpa, io, path, gpu, model.state());
+        try grad.checkpoint.save(gpa, io, path, gpu, nn.state(model));
         try out.print("saved {s}\n", .{path});
     }
     if (gpu) |dev| try dev.printProfile(out);

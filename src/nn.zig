@@ -19,11 +19,16 @@ pub fn Linear(comptime n_in: usize, comptime n_out: usize) type {
 
         pub fn init(gpa: Allocator, rng: std.Random) Allocator.Error!Self {
             const w = try W.empty(gpa);
+            errdefer w.deinit(gpa);
             const std_dev = @sqrt(2.0 / @as(f32, n_in));
             for (w.data) |*v| v.* = rng.floatNorm(f32) * std_dev;
+            const grad_w = try W.zeros(gpa);
+            errdefer grad_w.deinit(gpa);
+            const b = try B.zeros(gpa);
+            errdefer b.deinit(gpa);
             return .{
-                .w = .{ .value = w, .grad = try W.zeros(gpa), .needs_grad = true },
-                .b = .{ .value = try B.zeros(gpa), .grad = try B.zeros(gpa), .needs_grad = true },
+                .w = .{ .value = w, .grad = grad_w, .needs_grad = true },
+                .b = .{ .value = b, .grad = try B.zeros(gpa), .needs_grad = true },
             };
         }
 
@@ -74,7 +79,8 @@ pub fn BatchNorm(comptime c: usize) type {
         mean: V,
         variance: V,
 
-        pub fn init(gpa: Allocator) Allocator.Error!Self {
+        pub fn init(gpa: Allocator, rng: std.Random) Allocator.Error!Self {
+            _ = rng;
             const gamma = try V.full(gpa, 1);
             errdefer gamma.deinit(gpa);
             const grad_gamma = try V.zeros(gpa);
@@ -167,7 +173,83 @@ pub fn Conv2d(comptime c_in: usize, comptime c_out: usize, comptime k: usize, co
     };
 }
 
+fn Gathered(comptime Layers: type, comptime method: []const u8) type {
+    comptime var types: []const type = &.{};
+    inline for (@typeInfo(Layers).@"struct".field_types) |Layer| {
+        const Items = @TypeOf(@field(Layer, method)(@as(Layer, undefined)));
+        types = types ++ @typeInfo(Items).@"struct".field_types;
+    }
+    return @Tuple(types);
+}
+
+fn gather(layers: anytype, comptime method: []const u8) Gathered(@TypeOf(layers), method) {
+    var out: Gathered(@TypeOf(layers), method) = undefined;
+    comptime var at: usize = 0;
+    inline for (layers) |layer| {
+        inline for (@field(@TypeOf(layer), method)(layer)) |item| {
+            out[at] = item;
+            at += 1;
+        }
+    }
+    return out;
+}
+
+pub fn initAll(comptime Layers: type, gpa: Allocator, rng: std.Random) Allocator.Error!Layers {
+    var layers: Layers = undefined;
+    inline for (@typeInfo(Layers).@"struct".field_types, 0..) |Layer, i| {
+        layers[i] = Layer.init(gpa, rng) catch |err| {
+            inline for (0..i) |built| layers[built].deinit(gpa);
+            return err;
+        };
+    }
+    return layers;
+}
+
+pub fn deinitAll(layers: anytype, gpa: Allocator) void {
+    inline for (layers) |layer| layer.deinit(gpa);
+}
+
+pub fn toGpuAll(layers: anytype, gpu: *Gpu) autograd.Error!@TypeOf(layers) {
+    var out: @TypeOf(layers) = undefined;
+    inline for (layers, 0..) |layer, i| out[i] = try layer.toGpu(gpu);
+    return out;
+}
+
+pub fn params(layers: anytype) Gathered(@TypeOf(layers), "params") {
+    return gather(layers, "params");
+}
+
+pub fn state(layers: anytype) Gathered(@TypeOf(layers), "state") {
+    return gather(layers, "state");
+}
+
 const testing = std.testing;
+
+test "layer tuples initialise, concatenate parameters and state in order, and free everything" {
+    const Layers = struct { Linear(2, 3), BatchNorm(3), Conv2d(1, 2, 3, .{}) };
+    var prng = std.Random.DefaultPrng.init(8);
+    const layers = try initAll(Layers, testing.allocator, prng.random());
+    defer deinitAll(layers, testing.allocator);
+
+    const all_params = params(layers);
+    try testing.expectEqual(@as(usize, 6), all_params.len);
+    try testing.expectEqual(layers[0].w.value.data.ptr, all_params[0].value.data.ptr);
+    try testing.expectEqual(layers[1].gamma.value.data.ptr, all_params[2].value.data.ptr);
+    try testing.expectEqual(layers[2].inner.b.value.data.ptr, all_params[5].value.data.ptr);
+
+    const all_state = state(layers);
+    try testing.expectEqual(@as(usize, 8), all_state.len);
+    try testing.expectEqual(layers[1].variance.data.ptr, all_state[5].ptr);
+    try testing.expectEqual(@as(usize, 2 * 3), all_state[0].len);
+}
+
+test "a failing layer initialisation releases the layers built before it" {
+    var prng = std.Random.DefaultPrng.init(9);
+    for (0..8) |fail_index| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        try testing.expectError(error.OutOfMemory, initAll(struct { Linear(2, 3), Linear(3, 4) }, failing.allocator(), prng.random()));
+    }
+}
 
 test "forward is x*w + b and params exposes both parameters" {
     const gpa = testing.allocator;

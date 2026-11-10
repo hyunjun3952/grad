@@ -22,7 +22,7 @@ pub fn workItems(op: Op, d: Dims) usize {
     };
 }
 
-pub inline fn im2col(x: [*]const f32, col: [*]f32, t: Index, d: Dims) void {
+pub inline fn im2col(t: Index, x: [*]const f32, col: [*]f32, d: Dims) void {
     const kc = d.k * d.k * d.c;
     const ow = outWidth(d);
     const oh = outHeight(d);
@@ -40,7 +40,7 @@ pub inline fn im2col(x: [*]const f32, col: [*]f32, t: Index, d: Dims) void {
     col[t] = if (inside) x[((n * d.h + py - d.pad) * d.w + px - d.pad) * d.c + ch] else 0;
 }
 
-pub inline fn col2im(dcol: [*]const f32, dx: [*]f32, t: Index, d: Dims) void {
+pub inline fn col2im(t: Index, dcol: [*]const f32, dx: [*]f32, d: Dims) void {
     const kc = d.k * d.k * d.c;
     const ow = outWidth(d);
     const oh = outHeight(d);
@@ -85,23 +85,23 @@ inline fn firstMax(x: [*]const f32, t: Index, d: Dims) Index {
     return best;
 }
 
-pub inline fn avgPool(x: [*]const f32, out: [*]f32, t: Index, d: Dims) void {
+pub inline fn avgPool(t: Index, x: [*]const f32, out: [*]f32, d: Dims) void {
     const base = windowStart(t, d);
     var total: f32 = 0;
     for (windowOffsets(d)) |off| total += x[base + off];
     out[t] = total / 4;
 }
 
-pub inline fn avgPoolBackward(gout: [*]const f32, gin: [*]f32, t: Index, d: Dims) void {
+pub inline fn avgPoolBackward(t: Index, gout: [*]const f32, gin: [*]f32, d: Dims) void {
     const base = windowStart(t, d);
     for (windowOffsets(d)) |off| gin[base + off] += gout[t] / 4;
 }
 
-pub inline fn maxPool(x: [*]const f32, out: [*]f32, t: Index, d: Dims) void {
+pub inline fn maxPool(t: Index, x: [*]const f32, out: [*]f32, d: Dims) void {
     out[t] = x[firstMax(x, t, d)];
 }
 
-pub inline fn maxPoolBackward(x: [*]const f32, gout: [*]const f32, gin: [*]f32, t: Index, d: Dims) void {
+pub inline fn maxPoolBackward(t: Index, x: [*]const f32, gout: [*]const f32, gin: [*]f32, d: Dims) void {
     gin[firstMax(x, t, d)] += gout[t];
 }
 
@@ -110,14 +110,14 @@ test "max maxPool picks the first maximum, so a tied window routes its gradient 
     const gout = [_]f32{5};
     var gin = [_]f32{ 0, 0, 0, 0 };
     const d: Dims = .{ .n = 1, .h = 2, .w = 2, .c = 1, .k = 2 };
-    maxPoolBackward(&x, &gout, &gin, 0, d);
+    maxPoolBackward(0, &x, &gout, &gin, d);
     try std.testing.expectEqualSlices(f32, &.{ 5, 0, 0, 0 }, &gin);
 
     const y = [_]f32{ 1, 3, 3, 2 };
     var out: [1]f32 = undefined;
-    maxPool(&y, &out, 0, d);
+    maxPool(0, &y, &out, d);
     try std.testing.expectEqual(@as(f32, 3), out[0]);
     gin = .{ 0, 0, 0, 0 };
-    maxPoolBackward(&y, &gout, &gin, 0, d);
+    maxPoolBackward(0, &y, &gout, &gin, d);
     try std.testing.expectEqualSlices(f32, &.{ 0, 5, 0, 0 }, &gin);
 }

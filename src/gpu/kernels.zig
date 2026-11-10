@@ -329,31 +329,31 @@ export fn crossEntropyBackward(logp: [*]const f32, labels: [*]const u8, grad: [*
 }
 
 export fn im2col(x: [*]const f32, col: [*]f32, len: u32, d: cv.Dims) callconv(.nvptx_kernel) void {
-    if (globalIndex() < len) cv.im2col(x, col, @intCast(globalIndex()), d);
+    if (globalIndex() < len) cv.im2col(@intCast(globalIndex()), x, col, d);
 }
 
 export fn col2im(dcol: [*]const f32, dx: [*]f32, len: u32, d: cv.Dims) callconv(.nvptx_kernel) void {
-    if (globalIndex() < len) cv.col2im(dcol, dx, @intCast(globalIndex()), d);
+    if (globalIndex() < len) cv.col2im(@intCast(globalIndex()), dcol, dx, d);
 }
 
 export fn maxPool(x: [*]const f32, out: [*]f32, len: u32, d: cv.Dims) callconv(.nvptx_kernel) void {
-    if (globalIndex() < len) cv.maxPool(x, out, @intCast(globalIndex()), d);
+    if (globalIndex() < len) cv.maxPool(@intCast(globalIndex()), x, out, d);
 }
 
 export fn avgPool(x: [*]const f32, out: [*]f32, len: u32, d: cv.Dims) callconv(.nvptx_kernel) void {
-    if (globalIndex() < len) cv.avgPool(x, out, @intCast(globalIndex()), d);
+    if (globalIndex() < len) cv.avgPool(@intCast(globalIndex()), x, out, d);
 }
 
 export fn avgPoolBackward(gout: [*]const f32, gin: [*]f32, len: u32, d: cv.Dims) callconv(.nvptx_kernel) void {
-    if (globalIndex() < len) cv.avgPoolBackward(gout, gin, @intCast(globalIndex()), d);
+    if (globalIndex() < len) cv.avgPoolBackward(@intCast(globalIndex()), gout, gin, d);
 }
 
 export fn maxPoolBackward(x: [*]const f32, gout: [*]const f32, gin: [*]f32, len: u32, d: cv.Dims) callconv(.nvptx_kernel) void {
-    if (globalIndex() < len) cv.maxPoolBackward(x, gout, gin, @intCast(globalIndex()), d);
+    if (globalIndex() < len) cv.maxPoolBackward(@intCast(globalIndex()), x, gout, gin, d);
 }
 
 export fn dropout(src: [*]const f32, dst: [*]f32, len: u32, seed: u64, keep: f32, accumulate: u32) callconv(.nvptx_kernel) void {
-    if (globalIndex() < len) drop.apply(src, dst, globalIndex(), seed, keep, accumulate != 0);
+    if (globalIndex() < len) drop.apply(globalIndex(), src, dst, seed, keep, accumulate != 0);
 }
 
 const Slot = struct { w: u64, g: u64, m: u64, v: u64, at: usize, valid: bool };

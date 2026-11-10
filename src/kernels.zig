@@ -166,6 +166,31 @@ pub fn parallelFor(par: Parallel, len: usize, min_chunk: usize, ctx: anytype, co
     parallelRun(par, parts, &job, Task.run);
 }
 
+fn PlainArg(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .pointer => @FieldType(struct { ptr: @TypeOf(@as(T, undefined).ptr) }, "ptr"),
+        .comptime_int => usize,
+        else => T,
+    };
+}
+
+pub fn parallelEach(par: Parallel, len: usize, comptime f: anytype, args: anytype) void {
+    const types = comptime blk: {
+        var t: [args.len]type = undefined;
+        for (&t, 0..) |*e, i| e.* = PlainArg(@TypeOf(args[i]));
+        break :blk t;
+    };
+    var plain: @Tuple(&types) = undefined;
+    inline for (0..args.len) |i| plain[i] = if (@typeInfo(@TypeOf(args[i])) == .pointer) args[i].ptr else args[i];
+    const Index = @typeInfo(@TypeOf(f)).@"fn".param_types[0].?;
+    const body = struct {
+        fn run(c: @TypeOf(plain), lo: usize, hi: usize) void {
+            for (lo..hi) |t| @call(.auto, f, .{@as(Index, @intCast(t))} ++ c);
+        }
+    }.run;
+    parallelFor(par, len, 1 << 13, plain, body);
+}
+
 fn splitFor(comptime T: type, comptime cfg: TileConfig, par: Parallel, m: usize, k: usize, n: usize) Split {
     const by_rows = m >= n;
     const unit = if (by_rows) cfg.mr else cfg.nv * laneCount(T);
