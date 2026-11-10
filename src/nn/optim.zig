@@ -41,8 +41,9 @@ pub fn sgd(par: kernels.Parallel, lr: f32, params: anytype) !void {
     }
 }
 
-pub fn cosineLr(base: f32, step: usize, total: usize) f32 {
-    const progress = @as(f32, @floatFromInt(step)) / @as(f32, @floatFromInt(total));
+pub fn cosineLr(base: f32, step: usize, total: usize, warmup: usize) f32 {
+    if (step < warmup) return base * @as(f32, @floatFromInt(step + 1)) / @as(f32, @floatFromInt(warmup));
+    const progress = @as(f32, @floatFromInt(step - warmup)) / @as(f32, @floatFromInt(total - warmup));
     return 0.5 * base * (1 + @cos(std.math.pi * progress));
 }
 
@@ -159,6 +160,97 @@ pub const Adam = struct {
     }
 };
 
+pub const Ema = struct {
+    gpa: std.mem.Allocator,
+    on_gpu: bool,
+    values: []f32,
+    live: [][]f32,
+    shadow: [][]f32,
+    decay: f32 = 0,
+
+    pub fn init(gpa: std.mem.Allocator, par: kernels.Parallel, slices: anytype) !Ema {
+        var total: usize = 0;
+        inline for (slices) |s| total += s.len;
+        const live = try gpa.alloc([]f32, slices.len);
+        errdefer gpa.free(live);
+        const shadow = try gpa.alloc([]f32, slices.len);
+        errdefer gpa.free(shadow);
+        const on_gpu = par.gpu != null;
+        const values = if (par.gpu) |dev| try dev.alloc(f32, total) else try gpa.alloc(f32, total);
+        errdefer if (!on_gpu) gpa.free(values);
+        var at: usize = 0;
+        inline for (slices, 0..) |s, i| {
+            live[i] = s;
+            shadow[i] = values[at..][0..s.len];
+            at += s.len;
+        }
+        if (par.gpu) |dev| {
+            const host = try gpa.alloc(f32, total);
+            defer gpa.free(host);
+            var copied: usize = 0;
+            for (live) |s| {
+                try dev.download(host[copied..][0..s.len], s);
+                copied += s.len;
+            }
+            try dev.upload(values, host);
+        } else {
+            for (live, shadow) |s, d| @memcpy(d, s);
+        }
+        return .{ .gpa = gpa, .on_gpu = on_gpu, .values = values, .live = live, .shadow = shadow };
+    }
+
+    pub fn deinit(self: Ema) void {
+        if (!self.on_gpu) self.gpa.free(self.values);
+        self.gpa.free(self.live);
+        self.gpa.free(self.shadow);
+    }
+
+    pub fn state(self: Ema) struct { []f32 } {
+        return .{self.values};
+    }
+
+    pub fn update(self: Ema, par: kernels.Parallel, step: usize) !void {
+        const warm = @as(f32, @floatFromInt(step + 1)) / @as(f32, @floatFromInt(step + 10));
+        try self.apply(par, .average, @min(self.decay, warm));
+    }
+
+    pub fn swap(self: Ema, par: kernels.Parallel) !void {
+        try self.apply(par, .swap, 0);
+    }
+
+    fn apply(self: Ema, par: kernels.Parallel, comptime op: enum { average, swap }, decay: f32) !void {
+        if (par.gpu) |dev| {
+            var first: usize = 0;
+            while (first < self.live.len) : (first += ga.max_tensors) {
+                var table = std.mem.zeroes(ga.TensorTable);
+                const count = @min(ga.max_tensors, self.live.len - first);
+                table.count = @intCast(count);
+                for (0..count) |i| {
+                    table.len[i] = @intCast(self.live[first + i].len);
+                    table.w[i] = @intFromPtr(self.live[first + i].ptr);
+                    table.g[i] = @intFromPtr(self.shadow[first + i].ptr);
+                }
+                if (op == .average) try dev.ema(table, decay) else try dev.swapWeights(table);
+            }
+            return;
+        }
+        const Ctx = struct { live: []f32, shadow: []f32, decay: f32 };
+        const body = struct {
+            fn run(c: Ctx, lo: usize, hi: usize) void {
+                for (c.live[lo..hi], c.shadow[lo..hi]) |*w, *s| {
+                    if (op == .average) {
+                        s.* = c.decay * s.* + (1 - c.decay) * w.*;
+                    } else {
+                        const kept = w.*;
+                        w.* = s.*;
+                        s.* = kept;
+                    }
+                }
+            }
+        }.run;
+        for (self.live, self.shadow) |w, s| kernels.parallelFor(par, w.len, 1 << 14, Ctx{ .live = w, .shadow = s, .decay = decay }, body);
+    }
+};
 const testing = std.testing;
 const Tensor = @import("../tensor/tensor.zig").Tensor;
 const Gpu = @import("../gpu/gpu.zig").Gpu;
@@ -312,7 +404,65 @@ test "adam weight decay shrinks weights even with zero gradient, and cosineLr de
     try adam.step(.{}, .{p});
     try testing.expectApproxEqAbs(@as(f32, 0.95), p.value.data[0], 1e-6);
 
-    try testing.expectEqual(@as(f32, 0.01), cosineLr(0.01, 0, 100));
-    try testing.expectApproxEqAbs(@as(f32, 0.005), cosineLr(0.01, 50, 100), 1e-7);
-    try testing.expectApproxEqAbs(@as(f32, 0), cosineLr(0.01, 100, 100), 1e-7);
+    try testing.expectEqual(@as(f32, 0.01), cosineLr(0.01, 0, 100, 0));
+    try testing.expectApproxEqAbs(@as(f32, 0.005), cosineLr(0.01, 50, 100, 0), 1e-7);
+    try testing.expectApproxEqAbs(@as(f32, 0), cosineLr(0.01, 100, 100, 0), 1e-7);
+    try testing.expectApproxEqAbs(@as(f32, 0.0025), cosineLr(0.01, 0, 100, 4), 1e-7);
+    try testing.expectApproxEqAbs(@as(f32, 0.01), cosineLr(0.01, 4, 100, 4), 1e-7);
+    try testing.expectApproxEqAbs(@as(f32, 0.005), cosineLr(0.01, 54, 104, 4), 1e-7);
+}
+
+test "ema averages with a warm-up decay and swap exchanges live and shadow values, on the cpu and the gpu" {
+    const gpa = testing.allocator;
+    const gpu = Gpu.init(gpa, 1 << 20) catch |err| switch (err) {
+        error.DriverNotFound => null,
+        else => return err,
+    };
+    defer if (gpu) |dev| dev.deinit();
+    const count = 70;
+    var host: [count][5]f32 = undefined;
+    var slices: [count][]f32 = undefined;
+    var device: [count][]f32 = undefined;
+    for (&host, &slices, 0..) |*h, *s, i| {
+        for (h, 0..) |*v, j| v.* = @floatFromInt(i * 10 + j);
+        s.* = h;
+    }
+    const modes = [_]?*Gpu{ null, gpu };
+    for (modes) |maybe| {
+        const par: kernels.Parallel = .{ .gpu = maybe };
+        var live = slices;
+        if (maybe) |dev| {
+            for (&device, slices) |*d, s| {
+                d.* = try dev.alloc(f32, s.len);
+                try dev.upload(d.*, s);
+            }
+            live = device;
+        } else {
+            for (&live, 0..) |*s, i| s.* = try gpa.dupe(f32, slices[i]);
+        }
+        defer if (maybe == null) for (live) |s| gpa.free(s);
+
+        var average = try Ema.init(gpa, par, live);
+        defer average.deinit();
+        average.decay = 0.5;
+        for (live) |s| {
+            if (maybe) |dev| try dev.fill(s, 8) else @memset(s, 8);
+        }
+        try average.update(par, 0);
+        try average.swap(par);
+        var seen: [5]f32 = undefined;
+        for ([_]usize{ 0, 69 }) |i| {
+            if (maybe) |dev| try dev.download(&seen, live[i]) else seen = live[i][0..5].*;
+            for (seen, 0..) |got, j| {
+                const original: f32 = @floatFromInt(i * 10 + j);
+                const rate = 1.0 / 10.0;
+                try testing.expectApproxEqAbs(rate * original + (1 - rate) * 8, got, 1e-5);
+            }
+        }
+        try average.swap(par);
+        for ([_]usize{ 0, 69 }) |i| {
+            if (maybe) |dev| try dev.download(&seen, live[i]) else seen = live[i][0..5].*;
+            for (seen) |got| try testing.expectEqual(@as(f32, 8), got);
+        }
+    }
 }

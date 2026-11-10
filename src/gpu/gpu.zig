@@ -45,6 +45,8 @@ const Kernel = enum {
     rotateWeightsF32,
     transposeF32,
     addKrscGradient,
+    ema,
+    swapWeights,
     convGemmForward,
     convGemmWeightGrad,
     packWeightsRotated,
@@ -587,6 +589,14 @@ pub const Gpu = struct {
         try self.launchTable(.sgd, table, .{lr});
     }
 
+    pub fn ema(self: *Gpu, table: ga.TensorTable, decay: f32) Error!void {
+        try self.launchTable(.ema, table, .{decay});
+    }
+
+    pub fn swapWeights(self: *Gpu, table: ga.TensorTable) Error!void {
+        try self.launchTable(.swapWeights, table, .{});
+    }
+
     pub fn adam(self: *Gpu, table: ga.TensorTable, hp: ga.AdamArgs) Error!void {
         try self.launchTable(.adam, table, .{hp});
     }
@@ -594,7 +604,7 @@ pub const Gpu = struct {
     pub fn gather(self: *Gpu, images: []const f32, labels_src: []const u8, order: []const u32, batch: []f32, labels_out: []u8, start: usize, augment: Augment) Error!void {
         const rows = labels_out.len;
         const pixels = batch.len / rows;
-        const args = pack(ga.GatherArgs, .{ .start = start, .rows = rows, .pixels = pixels, .max_shift = augment.max_shift, .max_angle = augment.max_angle, .max_scale = augment.max_scale, .channels = augment.channels, .flip = augment.flip, .seed = augment.seed });
+        const args = pack(ga.GatherArgs, .{ .start = start, .rows = rows, .pixels = pixels, .max_shift = augment.max_shift, .max_angle = augment.max_angle, .max_scale = augment.max_scale, .channels = augment.channels, .flip = augment.flip, .cutout = augment.cutout, .seed = augment.seed });
         try self.launchFlat(.gather, rows * pixels, .{ images, labels_src, order, batch, labels_out, args });
     }
 };

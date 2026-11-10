@@ -6,15 +6,16 @@ pub const Config = struct {
     max_angle: f32 = 0,
     max_scale: f32 = 0,
     flip: bool = false,
+    cutout: f32 = 0,
     channels: u32 = 1,
     seed: u64 = 0,
 
     pub inline fn active(self: Config) bool {
-        return self.max_shift != 0 or self.max_angle != 0 or self.max_scale != 0 or self.flip;
+        return self.max_shift != 0 or self.max_angle != 0 or self.max_scale != 0 or self.flip or self.cutout != 0;
     }
 };
 
-pub const Transform = struct { a: f32, b: f32, c: f32, d: f32, dx: f32, dy: f32 };
+pub const Transform = struct { a: f32, b: f32, c: f32, d: f32, dx: f32, dy: f32, cut: f32 = 0, cut_x: f32 = 0, cut_y: f32 = 0 };
 
 pub const identity: Transform = .{ .a = 1, .b = 0, .c = 0, .d = 1, .dx = 0, .dy = 0 };
 
@@ -41,6 +42,7 @@ pub inline fn transformOf(sample: usize, config: Config) Transform {
     const angle = unit(drop.hash(config.seed, 4 * sample + 1)) * config.max_angle * (3.14159265 / 180.0);
     const zoom = 1 + unit(drop.hash(config.seed, 4 * sample + 2)) * config.max_scale;
     const mirror: f32 = if (config.flip and drop.hash(config.seed, 4 * sample + 3) & 1 == 1) -1 else 1;
+    const cut_bits = drop.hash(config.seed, 4 * sample + 3) >> 8;
     return .{
         .a = mirror * cosine(angle) / zoom,
         .b = sine(angle) / zoom,
@@ -48,6 +50,9 @@ pub inline fn transformOf(sample: usize, config: Config) Transform {
         .d = cosine(angle) / zoom,
         .dx = @floatFromInt(dx),
         .dy = @floatFromInt(dy),
+        .cut = config.cutout,
+        .cut_x = @as(f32, @floatFromInt(cut_bits & 0xFFFFFF)) / 16777216.0,
+        .cut_y = @as(f32, @floatFromInt((cut_bits >> 24) & 0xFFFFFF)) / 16777216.0,
     };
 }
 
@@ -59,6 +64,8 @@ pub inline fn pixel(image: [*]const f32, index: usize, width: usize, channels: u
     const p = index / channels;
     const channel = index % channels;
     const w: i32 = @intCast(width);
+    const wf: f32 = @floatFromInt(width);
+    if (tr.cut > 0 and @abs(@as(f32, @floatFromInt(p % width)) + 0.5 - tr.cut_x * wf) < tr.cut / 2 and @abs(@as(f32, @floatFromInt(p / width)) + 0.5 - tr.cut_y * wf) < tr.cut / 2) return 0;
     const middle = (@as(f32, @floatFromInt(width)) - 1) / 2;
     const ox = @as(f32, @floatFromInt(p % width)) - middle;
     const oy = @as(f32, @floatFromInt(p / width)) - middle;
@@ -152,7 +159,10 @@ test "transforms stay inside the configured ranges and reach both ends" {
     }
     try std.testing.expect(low and high);
     const none = transformOf(5, .{ .seed = 1 });
-    try std.testing.expectEqual(identity, none);
+    var expected = identity;
+    expected.cut_x = none.cut_x;
+    expected.cut_y = none.cut_y;
+    try std.testing.expectEqual(expected, none);
 }
 
 test "gpu gather applies the same augmentation as the cpu" {
@@ -212,4 +222,33 @@ test "flipping mirrors the image, and colour channels are sampled independently"
     try std.testing.expectEqualSlices(f32, &.{ 0, 0, 1, 10, 0, 0, 3, 30 }, &got);
     try std.testing.expect(!(Config{}).active());
     try std.testing.expect((Config{ .flip = true }).active());
+}
+
+test "cutout blanks a square around a random centre and leaves the rest unchanged" {
+    const config: Config = .{ .cutout = 2, .seed = 6 };
+    const image: [16]f32 = @splat(1);
+    var found = false;
+    var low = false;
+    var high = false;
+    for (0..400) |sample| {
+        const tr = transformOf(sample, config);
+        try std.testing.expect(tr.cut_x >= 0 and tr.cut_x < 1 and tr.cut_y >= 0 and tr.cut_y < 1);
+        low = low or tr.cut_x < 0.2;
+        high = high or tr.cut_x > 0.8;
+        if (tr.cut_x < 0.45 or tr.cut_x > 0.55 or tr.cut_y < 0.45 or tr.cut_y > 0.55) continue;
+        found = true;
+        var blank: usize = 0;
+        for (0..16) |p| {
+            const v = pixel(&image, p, 4, 1, tr);
+            try std.testing.expect(v == 0 or v == 1);
+            if (v == 0) {
+                blank += 1;
+                try std.testing.expect(p % 4 == 1 or p % 4 == 2);
+                try std.testing.expect(p / 4 == 1 or p / 4 == 2);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 4), blank);
+    }
+    try std.testing.expect(found and low and high);
+    try std.testing.expect(config.active());
 }

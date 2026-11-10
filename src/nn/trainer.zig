@@ -87,6 +87,8 @@ fn Runner(comptime Spec: type) type {
             var load_path: ?[]const u8 = null;
             var epochs: usize = 5;
             var until: ?usize = null;
+            var warmup_epochs: usize = 0;
+            var ema_decay: f32 = 0;
             var data_dir: []const u8 = Spec.data_dir;
             var positional: usize = 0;
             for (args[1..]) |arg| {
@@ -114,6 +116,12 @@ fn Runner(comptime Spec: type) type {
                     augment_config.max_angle = try std.fmt.parseFloat(f32, arg["--rotate=".len..]);
                 } else if (std.mem.startsWith(u8, arg, "--zoom=")) {
                     augment_config.max_scale = try std.fmt.parseFloat(f32, arg["--zoom=".len..]);
+                } else if (std.mem.startsWith(u8, arg, "--cutout=")) {
+                    augment_config.cutout = try std.fmt.parseFloat(f32, arg["--cutout=".len..]);
+                } else if (std.mem.startsWith(u8, arg, "--ema=")) {
+                    ema_decay = try std.fmt.parseFloat(f32, arg["--ema=".len..]);
+                } else if (std.mem.startsWith(u8, arg, "--warmup=")) {
+                    warmup_epochs = try std.fmt.parseInt(usize, arg["--warmup=".len..], 10);
                 } else if (std.mem.startsWith(u8, arg, "--until=")) {
                     until = try std.fmt.parseInt(usize, arg["--until=".len..], 10);
                 } else if (std.mem.startsWith(u8, arg, "--save=")) {
@@ -151,10 +159,13 @@ fn Runner(comptime Spec: type) type {
             var adam = try optim.Adam.init(gpa, par, Spec.learning_rate, params);
             defer adam.deinit();
             adam.weight_decay = Spec.weight_decay;
+            var average = try optim.Ema.init(gpa, par, nn.state(model));
+            defer average.deinit();
+            average.decay = ema_decay;
             var start_epoch: usize = 0;
             if (load_path) |path| {
                 var progress: [2]u32 = undefined;
-                try checkpoint.load(gpa, io, path, gpu, nn.state(model) ++ adam.state(), &progress);
+                try checkpoint.load(gpa, io, path, gpu, nn.state(model) ++ adam.state() ++ average.state(), &progress);
                 start_epoch = progress[0];
                 adam.t = progress[1];
             }
@@ -217,13 +228,14 @@ fn Runner(comptime Spec: type) type {
                     _ = arena.reset(.retain_capacity);
                     if (gpu) |dev| try dev.resetStep();
                     const global_step = epoch * steps + step;
-                    adam.lr = optim.cosineLr(Spec.learning_rate, global_step, epochs * steps);
+                    adam.lr = optim.cosineLr(Spec.learning_rate, global_step, epochs * steps, warmup_epochs * steps);
                     var tape: Tape = .{ .gpa = arena.allocator(), .par = par, .training = true, .smoothing = smoothing, .seed = global_step * 8 };
                     try optim.zeroGrad(par, params);
                     const logits = try Spec.forward(model, &tape, try tape.constant(batch));
                     const loss = try tape.crossEntropy(logits, labels);
                     try tape.backward(loss);
                     try adam.step(par, params);
+                    if (ema_decay > 0) try average.update(par, adam.t);
                     if (gpu) |dev| try dev.addInPlace(loss_total, loss.value.data) else loss_sum += loss.value.data[0];
                     if (progress and ((step + 1) % progress_every == 0 or step + 1 == steps)) {
                         const so_far = if (gpu) |dev| try dev.scalar(loss_total) else loss_sum;
@@ -234,13 +246,21 @@ fn Runner(comptime Spec: type) type {
 
                 const seconds = @as(f64, @floatFromInt(Io.Clock.awake.now(io).nanoseconds - started.nanoseconds)) / 1e9;
                 const acc = try accuracy(gpa, par, model, test_data);
+                var ema_acc: f64 = 0;
+                if (ema_decay > 0) {
+                    try average.swap(par);
+                    ema_acc = try accuracy(gpa, par, model, test_data);
+                    try average.swap(par);
+                }
                 if (progress) try out.writeAll("\r\x1b[2K");
-                try out.print("epoch {d}/{d}  train loss {d:.4}  test accuracy {d:.2}%  ({d:.2} s)\n", .{ epoch + 1, epochs, loss_sum / @as(f64, @floatFromInt(steps)), acc, seconds });
+                try out.print("epoch {d}/{d}  train loss {d:.4}  test accuracy {d:.2}%", .{ epoch + 1, epochs, loss_sum / @as(f64, @floatFromInt(steps)), acc });
+                if (ema_decay > 0) try out.print("  ema {d:.2}%", .{ema_acc});
+                try out.print("  ({d:.2} s)\n", .{seconds});
                 try out.flush();
             }
             if (save_path) |path| {
                 const counters = [_]u32{ @intCast(@max(stop_epoch, start_epoch)), adam.t };
-                try checkpoint.save(gpa, io, path, gpu, nn.state(model) ++ adam.state(), &counters);
+                try checkpoint.save(gpa, io, path, gpu, nn.state(model) ++ adam.state() ++ average.state(), &counters);
                 try out.print("saved {s}\n", .{path});
             }
             if (gpu) |dev| try dev.printProfile(out);

@@ -416,6 +416,23 @@ export fn sgd(table: ga.TensorTable, lr: f32) callconv(.nvptx_kernel) void {
     if (slot.valid) pointer([*]f32, slot.w)[slot.at] -= lr * pointer([*]const f32, slot.g)[slot.at];
 }
 
+export fn ema(table: ga.TensorTable, decay: f32) callconv(.nvptx_kernel) void {
+    const slot = locate(table, globalIndex());
+    if (!slot.valid) return;
+    const shadow = pointer([*]f32, slot.g) + slot.at;
+    shadow[0] = decay * shadow[0] + (1 - decay) * pointer([*]const f32, slot.w)[slot.at];
+}
+
+export fn swapWeights(table: ga.TensorTable) callconv(.nvptx_kernel) void {
+    const slot = locate(table, globalIndex());
+    if (!slot.valid) return;
+    const live = pointer([*]f32, slot.w) + slot.at;
+    const shadow = pointer([*]f32, slot.g) + slot.at;
+    const kept = live[0];
+    live[0] = shadow[0];
+    shadow[0] = kept;
+}
+
 export fn adam(table: ga.TensorTable, hp: ga.AdamArgs) callconv(.nvptx_kernel) void {
     const slot = locate(table, globalIndex());
     if (!slot.valid) return;
@@ -435,7 +452,7 @@ export fn gather(images: [*]const f32, labels_src: [*]const u8, order: [*]const 
     const r = t / args.pixels;
     const p = t % args.pixels;
     const idx: usize = order[args.start + r];
-    const config: aug.Config = .{ .max_shift = args.max_shift, .max_angle = args.max_angle, .max_scale = args.max_scale, .flip = args.flip != 0, .channels = args.channels, .seed = args.seed };
+    const config: aug.Config = .{ .max_shift = args.max_shift, .max_angle = args.max_angle, .max_scale = args.max_scale, .flip = args.flip != 0, .cutout = args.cutout, .channels = args.channels, .seed = args.seed };
     const source = images + idx * args.pixels;
     batch[t] = if (config.active()) aug.pixel(source, p, aug.side(args.pixels, args.channels), args.channels, aug.transformOf(args.start + r, config)) else source[p];
     if (p == 0) labels_out[r] = labels_src[idx];

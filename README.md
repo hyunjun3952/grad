@@ -8,7 +8,7 @@ The goal is an engine that sits between "C with pointers" and "PyTorch": plain s
 | --- | --- | --- | --- |
 | MNIST | MLP 784-128-10 | 98.1% (10 epochs) | 0.19 s GPU, 0.26 s CPU (6 threads) |
 | MNIST | CNN conv5x16-conv5x32 + BatchNorm | 99.5% (30 epochs, light augmentation) | 0.9 s GPU, 19.5 s CPU |
-| CIFAR-10 | ResNet-14, widths 64-128-256 | 93.3-93.6% (50 epochs, flip + shift + label smoothing; varies by run) | 17.6 s GPU (bf16 tensor cores), 25.8 s (TF32), 52.8 s (strict f32) |
+| CIFAR-10 | ResNet-14, widths 64-128-256 | 93.6-93.8% (50 epochs, flip + shift + cutout + label smoothing + EMA; varies by run) | 17.6 s GPU (bf16 tensor cores), 25.8 s (TF32), 52.8 s (strict f32) |
 
 Measured on an i5-8500 (6 cores) and an RTX 3060 12 GB. About 5,200 lines including 66 tests, with no comments except for explained magic numbers.
 
@@ -50,6 +50,9 @@ Build options such as `-Dcnn=true -Dhidden=2048 -Dbatch=256` go before the `--`;
 | `--shift=N`, `--rotate=DEG`, `--zoom=F`, `--flip` | Random affine augmentation applied on the fly, on the CPU or on the GPU. |
 | `--tf32` | Use TF32 tensor cores for the large convolutions while keeping every tensor in f32 (activations are read directly, no conversion or im2col buffer). About 2x faster than the strict f32 kernels; operands are rounded to 10 mantissa bits, accumulation stays f32. |
 | `--cudnn[=DIR]` | Run convolutions through cuDNN (f32 with TF32 tensor cores) instead of the built-in kernels. The DLLs are loaded at run time from `data/cudnn` (or DIR); if they cannot be found the built-in kernels are used. Fetch them with `scripts/fetch-cudnn.ps1` (about 1.3 GB, never committed). |
+| `--cutout=N` | Blank a random N x N square of every training image (CPU and GPU, same math). |
+| `--warmup=N` | Ramp the learning rate linearly over the first N epochs, then follow the cosine schedule. |
+| `--ema=D` | Keep an exponential moving average of all weights and batch-norm statistics (decay D, e.g. 0.999) and report its test accuracy next to the raw one. Stored in checkpoints. |
 | `--smoothing=F` | Label smoothing for the cross-entropy loss (CPU and GPU). |
 | `--save=PATH`, `--load=PATH` | Write or read a checkpoint (weights, batch-norm statistics, Adam state, progress). |
 | `--until=N` | Stop after epoch `N` but keep the schedule of the full run, so that a later `--load` continues exactly. |
