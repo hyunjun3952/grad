@@ -103,9 +103,9 @@ pub fn matmulInto(
     if (par.gpu) |g| return g.matmul(a.data, b.data, out.data, opts.trans_a, opts.trans_b, opts.accumulate, M, N, K);
 
     const cfg: kernels.TileConfig = .{ .trans_a = opts.trans_a, .trans_b = opts.trans_b, .accumulate = opts.accumulate };
-    const work = try gpa.alloc(A.Elem, kernels.tiledWorkLenFor(A.Elem, cfg, par, M, K, N));
+    const work = try gpa.alloc(A.Elem, kernels.matmulTiledWorkLen(A.Elem, cfg, par, M, K, N));
     defer gpa.free(work);
-    kernels.tiledWith(A.Elem, cfg, par, M, K, N, a.data, b.data, out.data, work);
+    kernels.matmulTiled(A.Elem, cfg, par, M, K, N, a.data, b.data, out.data, work);
 }
 
 pub fn matmul(
@@ -190,7 +190,7 @@ fn expectMatmulMatchesNaive(
 
     const want = try gpa.alloc(f32, M * N);
     defer gpa.free(want);
-    kernels.naive(f32, M, K, N, la, lb, want);
+    kernels.matmulNaive(f32, M, K, N, la, lb, want);
 
     const got = try matmul(gpa, .{}, a, b, opts);
     defer got.deinit(gpa);

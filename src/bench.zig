@@ -18,11 +18,11 @@ fn wrap(comptime f: anytype) Kernel {
 }
 
 fn tiled(m: usize, k: usize, n: usize, a: []const T, b: []const T, out: []T, work: []T) void {
-    kernels.tiledWith(T, .{}, .{}, m, k, n, a, b, out, work);
+    kernels.matmulTiled(T, .{}, .{}, m, k, n, a, b, out, work);
 }
 
 fn tiledWork(n: usize) usize {
-    return kernels.tiledWorkLenFor(T, .{}, .{}, n, n, n);
+    return kernels.matmulTiledWorkLen(T, .{}, .{}, n, n, n);
 }
 
 fn noWork(n: usize) usize {
@@ -32,8 +32,8 @@ fn noWork(n: usize) usize {
 
 const Entry = struct { name: []const u8, run: Kernel, work_len: *const fn (usize) usize = noWork };
 const entries = [_]Entry{
-    .{ .name = "naive (ijk)", .run = wrap(kernels.naive) },
-    .{ .name = "@Vector", .run = wrap(kernels.vec) },
+    .{ .name = "naive (ijk)", .run = wrap(kernels.matmulNaive) },
+    .{ .name = "@Vector", .run = wrap(kernels.matmulVector) },
     .{ .name = "tiled + packed 6x2", .run = tiled, .work_len = tiledWork },
 };
 
@@ -53,7 +53,7 @@ fn kernelTable(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, rng: std.Random)
         for (a) |*x| x.* = rng.float(T) - 0.5;
         for (b) |*x| x.* = rng.float(T) - 0.5;
 
-        kernels.naive(T, n, n, n, a, b, ref);
+        kernels.matmulNaive(T, n, n, n, a, b, ref);
 
         const flops = 2.0 * std.math.pow(f64, @floatFromInt(n), 3);
         const reps: usize = @max(3, @as(usize, @intFromFloat(2e9 / flops)));
@@ -140,12 +140,12 @@ fn scaling(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, rng: std.Random) !vo
         try out.print("{d:>4}x{d:>4}x{d:>4} ", .{ s[0], s[1], s[2] });
         for ([_]usize{ 1, 2, 3, 4, 6 }) |t| {
             const par: kernels.Parallel = if (t > 1) .{ .io = io, .threads = t } else .{};
-            const work = try gpa.alloc(T, kernels.tiledWorkLenFor(T, .{}, par, s[0], s[1], s[2]));
+            const work = try gpa.alloc(T, kernels.matmulTiledWorkLen(T, .{}, par, s[0], s[1], s[2]));
             defer gpa.free(work);
             var best: i96 = std.math.maxInt(i96);
             for (0..200) |_| {
                 const t0 = Io.Clock.awake.now(io);
-                kernels.tiledWith(T, .{}, par, s[0], s[1], s[2], a, b, c, work);
+                kernels.matmulTiled(T, .{}, par, s[0], s[1], s[2], a, b, c, work);
                 best = @min(best, Io.Clock.awake.now(io).nanoseconds - t0.nanoseconds);
             }
             try out.print("{d:>9.1}", .{@as(f64, @floatFromInt(best)) / 1000.0});
@@ -264,6 +264,36 @@ fn stepProfile(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, rng: std.Random,
     try out.print("matmul work per step: {d:.1} MFLOP = {d:.0} us at 100 GFLOPS\n", .{ matmul_flops / 1e6, matmul_flops / 1e5 });
 }
 
+fn gpuMatmul(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
+    const dev = grad.gpu.Gpu.init(gpa, 1 << 20) catch |err| switch (err) {
+        error.DriverNotFound => return out.writeAll("no NVIDIA driver\n"),
+        else => return err,
+    };
+    defer dev.deinit();
+    const shapes = [_][3]usize{ .{ 512, 512, 512 }, .{ 2048, 2048, 2048 }, .{ 4096, 4096, 4096 }, .{ 512, 4096, 784 }, .{ 784, 4096, 512 }, .{ 512, 784, 4096 } };
+    try out.print("gpu sgemm (best of 20)\n{s:<18}{s:>10}{s:>10}{s:>10}   {s}\n", .{ "m x n x k", "nn", "nt", "tn", "TFLOPS" });
+    for (shapes) |s| {
+        const m, const n, const k = s;
+        const a = try dev.alloc(T, @max(m * k, k * n));
+        const b = try dev.alloc(T, @max(m * k, k * n));
+        const c = try dev.alloc(T, m * n);
+        try dev.fill(a, 0.5);
+        try dev.fill(b, 0.25);
+        try out.print("{d:>5}x{d:>5}x{d:>5}", .{ m, n, k });
+        for ([_][2]bool{ .{ false, false }, .{ false, true }, .{ true, false } }) |t| {
+            try dev.matmul(a, b, c, t[0], t[1], false, m, n, k);
+            try dev.cu.sync();
+            const t0 = Io.Clock.awake.now(io);
+            for (0..20) |_| try dev.matmul(a, b, c, t[0], t[1], false, m, n, k);
+            try dev.cu.sync();
+            const ns: f64 = @floatFromInt(Io.Clock.awake.now(io).nanoseconds - t0.nanoseconds);
+            try out.print("{d:>10.2}", .{2.0 * @as(f64, @floatFromInt(m * n * k)) * 20 / ns / 1000});
+        }
+        try out.writeAll("\n");
+    }
+    try out.writeAll("\n");
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
@@ -276,6 +306,11 @@ pub fn main(init: std.process.Init) !void {
     const rng = prng.random();
 
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len > 1 and std.mem.eql(u8, args[1], "gpu")) {
+        try gpuMatmul(io, gpa, out);
+        try out.flush();
+        return;
+    }
     const only_step = args.len > 1 and std.mem.eql(u8, args[1], "step");
     if (!only_step) {
         try kernelTable(io, gpa, out, rng);

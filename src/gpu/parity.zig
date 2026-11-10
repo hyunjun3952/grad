@@ -48,7 +48,7 @@ fn checkMatmul(gpu: *Gpu, m: usize, n: usize, k: usize, ta: bool, tb: bool, accu
     for (0..k) |p| {
         for (0..n) |j| lb[p * n + j] = if (tb) b[j * k + p] else b[p * n + j];
     }
-    kernels.naive(f32, m, k, n, la, lb, want);
+    kernels.matmulNaive(f32, m, k, n, la, lb, want);
     @memset(got, 1);
     if (accumulate) {
         for (want) |*w| w.* += 1;
@@ -71,8 +71,9 @@ test "gpu matmul matches the cpu reference for every transpose, shape and accumu
     defer gpu.deinit();
 
     const shapes = [_][3]usize{
-        .{ 1, 1, 1 },      .{ 5, 7, 3 },      .{ 64, 64, 16 },  .{ 65, 70, 17 },
-        .{ 130, 33, 200 }, .{ 784, 128, 64 }, .{ 64, 10, 128 }, .{ 200, 300, 784 },
+        .{ 1, 1, 1 },      .{ 5, 7, 3 },       .{ 64, 64, 16 },  .{ 65, 70, 17 },
+        .{ 130, 33, 200 }, .{ 784, 128, 64 },  .{ 64, 10, 128 }, .{ 200, 300, 784 },
+        .{ 25, 16, 4000 }, .{ 400, 32, 4099 },
     };
     for (shapes) |s| {
         for ([_][2]bool{ .{ false, false }, .{ true, false }, .{ false, true } }) |t| {

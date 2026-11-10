@@ -35,12 +35,54 @@ const Mlp = struct {
         return .{ .l1 = try self.l1.toGpu(gpu), .l2 = try self.l2.toGpu(gpu) };
     }
 
+    fn params(self: Mlp) @TypeOf(self.l1.params() ++ self.l2.params()) {
+        return self.l1.params() ++ self.l2.params();
+    }
+
     fn forward(self: Mlp, tape: *Tape, x: anytype) grad.autograd.Error!Var(Tensor(f32, &.{ @TypeOf(x.value).shape[0], classes })) {
         return self.l2.forward(tape, try tape.relu(try self.l1.forward(tape, x)));
     }
 };
 
-fn accuracy(gpa: Allocator, par: grad.kernels.Parallel, model: Mlp, data: grad.mnist.Dataset, host_labels: []const u8) !f64 {
+const Cnn = struct {
+    c1: grad.nn.Conv2d(1, 16, 5),
+    c2: grad.nn.Conv2d(16, 32, 5),
+    fc: grad.nn.Linear(512, classes),
+
+    fn init(gpa: Allocator, rng: std.Random) Allocator.Error!Cnn {
+        const c1 = try grad.nn.Conv2d(1, 16, 5).init(gpa, rng);
+        errdefer c1.deinit(gpa);
+        const c2 = try grad.nn.Conv2d(16, 32, 5).init(gpa, rng);
+        errdefer c2.deinit(gpa);
+        return .{ .c1 = c1, .c2 = c2, .fc = try grad.nn.Linear(512, classes).init(gpa, rng) };
+    }
+
+    fn deinit(self: Cnn, gpa: Allocator) void {
+        self.c1.deinit(gpa);
+        self.c2.deinit(gpa);
+        self.fc.deinit(gpa);
+    }
+
+    fn toGpu(self: Cnn, gpu: *Gpu) !Cnn {
+        return .{ .c1 = try self.c1.toGpu(gpu), .c2 = try self.c2.toGpu(gpu), .fc = try self.fc.toGpu(gpu) };
+    }
+
+    fn params(self: Cnn) @TypeOf(self.c1.params() ++ self.c2.params() ++ self.fc.params()) {
+        return self.c1.params() ++ self.c2.params() ++ self.fc.params();
+    }
+
+    fn forward(self: Cnn, tape: *Tape, x: anytype) grad.autograd.Error!Var(Tensor(f32, &.{ @TypeOf(x.value).shape[0], classes })) {
+        const n = @TypeOf(x.value).shape[0];
+        const image = grad.autograd.reshape(x, &.{ n, 28, 28, 1 });
+        const a = try tape.maxPool(try tape.relu(try self.c1.forward(tape, image)));
+        const b = try tape.maxPool(try tape.relu(try self.c2.forward(tape, a)));
+        return self.fc.forward(tape, grad.autograd.reshape(b, &.{ n, 512 }));
+    }
+};
+
+const Model = if (config.cnn) Cnn else Mlp;
+
+fn accuracy(gpa: Allocator, par: grad.kernels.Parallel, model: Model, data: grad.mnist.Dataset, host_labels: []const u8) !f64 {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const host_logits = try gpa.alloc(f32, eval_batch * classes);
@@ -108,10 +150,10 @@ pub fn main(init: std.process.Init) !void {
 
     var prng = std.Random.DefaultPrng.init(1234);
     const rng = prng.random();
-    const host_model = try Mlp.init(gpa, rng);
+    const host_model = try Model.init(gpa, rng);
     defer host_model.deinit(gpa);
     const model = if (gpu) |dev| try host_model.toGpu(dev) else host_model;
-    const params = model.l1.params() ++ model.l2.params();
+    const params = model.params();
     var adam = try grad.optim.Adam.init(gpa, par, 0.001, params);
     defer adam.deinit();
 
@@ -133,9 +175,11 @@ pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
 
-    try out.print("MLP {d}-{d}-{d}, Adam, batch {d}, {s}, {d} training images\n", .{
-        pixels,                            hidden,        classes, train_batch,
-        if (gpu != null) "GPU" else "CPU", train.count(),
+    try out.print("{s}, Adam, batch {d}, {s}, {d} training images\n", .{
+        if (config.cnn) "CNN conv5x16-conv5x32-fc" else "MLP 784-" ++ std.fmt.comptimePrint("{d}", .{hidden}) ++ "-10",
+        train_batch,
+        if (gpu != null) "GPU" else "CPU",
+        train.count(),
     });
     try out.flush();
 

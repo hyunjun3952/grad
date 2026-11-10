@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const cuda = @import("cuda.zig");
+const conv = @import("conv.zig");
 
 const ptx = @embedFile("kernels_ptx");
 
@@ -9,29 +10,32 @@ pub const Error = Allocator.Error || error{ DriverNotFound, MissingSymbol, CudaF
 pub const BinaryOp = enum { add, mul };
 
 const Kernel = enum {
-    sgemm_nn,
-    sgemm_nt,
-    sgemm_tn,
-    bin_add,
-    bin_mul,
+    sgemmNN,
+    sgemmNT,
+    sgemmTN,
+    elementwise,
     relu,
-    relu_bwd,
-    add_inplace,
-    sum_to,
-    ce_rows,
-    ce_mean,
-    ce_bwd,
+    reluBackward,
+    addInPlace,
+    sumTo,
+    crossEntropyRows,
+    crossEntropyMean,
+    crossEntropyBackward,
     sgd,
     adam,
     gather,
+    im2col,
+    col2im,
+    maxPool,
+    maxPoolBackward,
 };
-const kernel_count = 15;
+const kernel_count = @typeInfo(Kernel).@"enum".field_names.len;
 
-fn dev(slice: anytype) u64 {
+fn address(slice: anytype) u64 {
     return @intFromPtr(slice.ptr);
 }
 
-fn u32Of(x: usize) u32 {
+fn toU32(x: usize) u32 {
     return @intCast(x);
 }
 
@@ -58,7 +62,7 @@ pub const Gpu = struct {
 
         const module = try self.cu.loadModule(gpa, ptx);
         inline for (0..kernel_count) |i| {
-            self.fns[i] = try self.cu.function(module, @tagName(@as(Kernel, @fromBackingInt(@intCast(i)))));
+            self.fns[i] = try self.cu.getFunction(module, @tagName(@as(Kernel, @fromBackingInt(@intCast(i)))));
         }
         self.step_base = try self.cu.alloc(step_bytes);
         self.step_size = step_bytes;
@@ -121,7 +125,7 @@ pub const Gpu = struct {
         try self.cu.launch(self.fns[@backingInt(kernel)], grid, .{ 256, 1, 1 }, &pointers);
     }
 
-    fn launch1d(self: *Gpu, kernel: Kernel, items: usize, args: anytype) Error!void {
+    fn launchFlat(self: *Gpu, kernel: Kernel, items: usize, args: anytype) Error!void {
         try self.launch(kernel, .{ ceilDiv(items, 256), 1, 1 }, args);
     }
 
@@ -138,66 +142,79 @@ pub const Gpu = struct {
         k: usize,
     ) Error!void {
         std.debug.assert(!(trans_a and trans_b));
-        const kernel: Kernel = if (trans_a) .sgemm_tn else if (trans_b) .sgemm_nt else .sgemm_nn;
+        const kernel: Kernel = if (trans_a) .sgemmTN else if (trans_b) .sgemmNT else .sgemmNN;
         const flag: u32 = @intFromBool(accumulate);
-        try self.launch(kernel, .{ ceilDiv(n, 64), ceilDiv(m, 64), 1 }, .{ dev(a), dev(b), dev(out), u32Of(m), u32Of(n), u32Of(k), flag });
+        const blocks = @as(usize, ceilDiv(n, 128)) * ceilDiv(m, 128);
+        const splits = @max(1, @min(k / 256, (128 + blocks - 1) / blocks));
+        const chunk = std.mem.alignForward(usize, (k + splits - 1) / splits, 8);
+        if (splits > 1 and !accumulate) try self.fill(out, 0);
+        try self.launch(kernel, .{ ceilDiv(n, 128), ceilDiv(m, 128), ceilDiv(k, chunk) }, .{ address(a), address(b), address(out), toU32(m), toU32(n), toU32(k), flag, toU32(chunk) });
     }
 
-    pub fn binary(self: *Gpu, op: BinaryOp, a: []const f32, b: []const f32, out: []f32, dims: [4]u32, sa: [4]u32, sb: [4]u32) Error!void {
-        const kernel: Kernel = switch (op) {
-            .add => .bin_add,
-            .mul => .bin_mul,
-        };
-        try self.launch1d(kernel, out.len, .{
-            dev(a), dev(b), dev(out), u32Of(out.len), dims[1], dims[2], dims[3],
-            sa[0],  sa[1],  sa[2],    sa[3],          sb[0],   sb[1],   sb[2],
-            sb[3],
+    pub fn elementwise(self: *Gpu, op: BinaryOp, a: []const f32, b: []const f32, out: []f32, dims: [4]u32, sa: [4]u32, sb: [4]u32) Error!void {
+        try self.launchFlat(.elementwise, out.len, .{
+            address(a), address(b), address(out), toU32(out.len), @intFromBool(op == .mul), dims[1], dims[2], dims[3],
+            sa[0],      sa[1],      sa[2],        sa[3],          sb[0],                    sb[1],   sb[2],   sb[3],
         });
     }
 
     pub fn relu(self: *Gpu, x: []const f32, out: []f32) Error!void {
-        try self.launch1d(.relu, x.len, .{ dev(x), dev(out), u32Of(x.len) });
+        try self.launchFlat(.relu, x.len, .{ address(x), address(out), toU32(x.len) });
     }
 
     pub fn reluBackward(self: *Gpu, x: []const f32, g_out: []const f32, g_in: []f32) Error!void {
-        try self.launch1d(.relu_bwd, x.len, .{ dev(x), dev(g_out), dev(g_in), u32Of(x.len) });
+        try self.launchFlat(.reluBackward, x.len, .{ address(x), address(g_out), address(g_in), toU32(x.len) });
     }
 
     pub fn addInPlace(self: *Gpu, dst: []f32, src: []const f32) Error!void {
-        try self.launch1d(.add_inplace, dst.len, .{ dev(dst), dev(src), u32Of(dst.len) });
+        try self.launchFlat(.addInPlace, dst.len, .{ address(dst), address(src), toU32(dst.len) });
     }
 
     pub fn sumTo(self: *Gpu, in: []const f32, out: []f32, dims: [4]u32, strides: [4]u32, reduced: u32, accumulate: bool) Error!void {
         const flag: u32 = @intFromBool(accumulate);
-        try self.launch1d(.sum_to, out.len, .{
-            dev(in),    dev(out),   u32Of(out.len), u32Of(in.len / out.len), reduced,
-            flag,       dims[0],    dims[1],        dims[2],                 dims[3],
-            strides[0], strides[1], strides[2],     strides[3],
+        try self.launch(.sumTo, .{ toU32(out.len), 1, 1 }, .{
+            address(in), address(out), toU32(out.len), toU32(in.len / out.len), reduced,
+            flag,        dims[0],      dims[1],        dims[2],                 dims[3],
+            strides[0],  strides[1],   strides[2],     strides[3],
         });
     }
 
     pub fn crossEntropy(self: *Gpu, logits: []const f32, logp: []f32, labels: []const u8, loss: []f32, rows: usize, cols: usize) Error!void {
         const row_loss = try self.scratch(f32, rows);
-        try self.launch1d(.ce_rows, rows, .{ dev(logits), dev(logp), dev(labels), dev(row_loss), u32Of(rows), u32Of(cols) });
-        try self.launch1d(.ce_mean, 1, .{ dev(row_loss), dev(loss), u32Of(rows) });
+        try self.launchFlat(.crossEntropyRows, rows, .{ address(logits), address(logp), address(labels), address(row_loss), toU32(rows), toU32(cols) });
+        try self.launchFlat(.crossEntropyMean, 1, .{ address(row_loss), address(loss), toU32(rows) });
     }
 
     pub fn crossEntropyBackward(self: *Gpu, logp: []const f32, labels: []const u8, grad: []f32, loss_grad: []const f32, rows: usize, cols: usize) Error!void {
-        try self.launch1d(.ce_bwd, rows * cols, .{ dev(logp), dev(labels), dev(grad), dev(loss_grad), u32Of(rows), u32Of(cols) });
+        try self.launchFlat(.crossEntropyBackward, rows * cols, .{ address(logp), address(labels), address(grad), address(loss_grad), toU32(rows), toU32(cols) });
+    }
+
+    pub fn convKernel(self: *Gpu, comptime op: conv.Op, slices: anytype, d: conv.Dims) Error!void {
+        const len = conv.workItems(op, d);
+        const types = comptime blk: {
+            var t: [slices.len + 6]type = undefined;
+            for (&t, 0..) |*e, i| e.* = if (i < slices.len) u64 else u32;
+            break :blk t;
+        };
+        var args: @Tuple(&types) = undefined;
+        inline for (slices, 0..) |s, i| args[i] = address(s);
+        args[slices.len] = toU32(len);
+        inline for (.{ d.n, d.h, d.w, d.c, d.k }, 0..) |v, i| args[slices.len + 1 + i] = toU32(v);
+        try self.launchFlat(@field(Kernel, @tagName(op)), len, args);
     }
 
     pub fn sgd(self: *Gpu, w: []f32, g: []const f32, lr: f32) Error!void {
-        try self.launch1d(.sgd, w.len, .{ dev(w), dev(g), lr, u32Of(w.len) });
+        try self.launchFlat(.sgd, w.len, .{ address(w), address(g), lr, toU32(w.len) });
     }
 
     pub fn adam(self: *Gpu, w: []f32, g: []const f32, m: []f32, v: []f32, b1: f32, b2: f32, step: f32, inv_sqrt_c2: f32, eps: f32) Error!void {
-        try self.launch1d(.adam, w.len, .{ dev(w), dev(g), dev(m), dev(v), u32Of(w.len), b1, b2, step, inv_sqrt_c2, eps });
+        try self.launchFlat(.adam, w.len, .{ address(w), address(g), address(m), address(v), toU32(w.len), b1, b2, step, inv_sqrt_c2, eps });
     }
 
     pub fn gather(self: *Gpu, images: []const f32, labels_src: []const u8, order: []const u32, batch: []f32, labels_out: []u8, start: usize, rows: usize, pixels: usize) Error!void {
-        try self.launch1d(.gather, rows * pixels, .{
-            dev(images),  dev(labels_src), dev(order),    dev(batch), dev(labels_out),
-            u32Of(start), u32Of(rows),     u32Of(pixels),
+        try self.launchFlat(.gather, rows * pixels, .{
+            address(images), address(labels_src), address(order), address(batch), address(labels_out),
+            toU32(start),    toU32(rows),         toU32(pixels),
         });
     }
 };

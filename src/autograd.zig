@@ -4,18 +4,19 @@ const ops = @import("ops.zig");
 const tensor = @import("tensor.zig");
 const kernels = @import("kernels.zig");
 const gpu_mod = @import("gpu/gpu.zig");
+const conv = @import("gpu/conv.zig");
 const Tensor = tensor.Tensor;
 
 pub const Error = gpu_mod.Error;
 
-fn pad4(comptime dims: []const usize, comptime fill: u32) [4]u32 {
+fn padTo4(comptime dims: []const usize, comptime fill: u32) [4]u32 {
     if (dims.len > 4) @compileError("gpu kernels support tensors of rank 4 or less");
     var out: [4]u32 = @splat(fill);
     for (dims, 0..) |d, i| out[4 - dims.len + i] = @intCast(d);
     return out;
 }
 
-fn rowStrides4(comptime dims: []const usize) [4]u32 {
+fn rowMajorStrides4(comptime dims: []const usize) [4]u32 {
     var out: [4]u32 = @splat(0);
     var acc: u32 = 1;
     var i: usize = dims.len;
@@ -27,9 +28,9 @@ fn rowStrides4(comptime dims: []const usize) [4]u32 {
     return out;
 }
 
-fn reducedAxes(comptime target: []const usize) u32 {
+fn reducedAxisMask(comptime target: []const usize) u32 {
     var mask: u32 = 0;
-    for (pad4(target, 1), 0..) |d, axis| {
+    for (padTo4(target, 1), 0..) |d, axis| {
         if (d == 1) mask |= @as(u32, 1) << @intCast(axis);
     }
     return mask;
@@ -37,6 +38,29 @@ fn reducedAxes(comptime target: []const usize) u32 {
 
 pub fn Var(comptime Tn: type) type {
     return struct { value: Tn, grad: Tn, needs_grad: bool };
+}
+
+pub fn reshape(x: anytype, comptime shape: []const usize) Var(Tensor(@TypeOf(x.value).Elem, shape)) {
+    const R = Tensor(@TypeOf(x.value).Elem, shape);
+    comptime std.debug.assert(R.len == @TypeOf(x.value).len);
+    return .{ .value = .{ .data = x.value.data }, .grad = .{ .data = x.grad.data }, .needs_grad = x.needs_grad };
+}
+
+fn kernelSize(comptime In: type, comptime W: type) usize {
+    if (In.rank != 4 or W.rank != 2) @compileError("conv2d expects (n, h, w, c) input and (k*k*c, out) weights");
+    const k = std.math.sqrt(W.shape[0] / In.shape[3]);
+    if (k * k * In.shape[3] != W.shape[0]) @compileError("conv2d weights must have k*k*c rows");
+    return k;
+}
+
+fn ConvOut(comptime In: type, comptime W: type) type {
+    const k = kernelSize(In, W);
+    return Tensor(f32, &.{ In.shape[0], In.shape[1] - k + 1, In.shape[2] - k + 1, W.shape[1] });
+}
+
+fn PoolOut(comptime In: type) type {
+    if (In.rank != 4) @compileError("maxPool expects (n, h, w, c) input");
+    return Tensor(f32, &.{ In.shape[0], In.shape[1] / 2, In.shape[2] / 2, In.shape[3] });
 }
 
 const Node = struct {
@@ -49,16 +73,16 @@ pub const Tape = struct {
     par: kernels.Parallel = .{},
     nodes: std.ArrayList(Node) = .empty,
 
-    fn fresh(self: *Tape, comptime Tn: type) Error!Tn {
+    fn newTensor(self: *Tape, comptime Tn: type) Error!Tn {
         if (self.par.gpu) |dev| return .{ .data = try dev.scratch(Tn.Elem, Tn.len) };
         return Tn.empty(self.gpa);
     }
 
-    fn track(self: *Tape, value: anytype, needs_grad: bool) Error!Var(@TypeOf(value)) {
+    fn makeVar(self: *Tape, value: anytype, needs_grad: bool) Error!Var(@TypeOf(value)) {
         const Tn = @TypeOf(value);
         var grad: Tn = undefined;
         if (needs_grad) {
-            grad = try self.fresh(Tn);
+            grad = try self.newTensor(Tn);
             if (self.par.gpu) |dev| try dev.fill(grad.data, 0) else @memset(grad.data, 0);
         }
         return .{ .value = value, .grad = grad, .needs_grad = needs_grad };
@@ -69,11 +93,11 @@ pub const Tape = struct {
         return v.value.data[0];
     }
 
-    fn binary(self: *Tape, comptime op: gpu_mod.BinaryOp, a: anytype, b: anytype) Error!ops.BroadcastResult(@TypeOf(a), @TypeOf(b)) {
+    fn elementwise(self: *Tape, comptime op: gpu_mod.BinaryOp, a: anytype, b: anytype) Error!ops.BroadcastResult(@TypeOf(a), @TypeOf(b)) {
         if (self.par.gpu) |dev| {
-            const out = try self.fresh(ops.BroadcastResult(@TypeOf(a), @TypeOf(b)));
+            const out = try self.newTensor(ops.BroadcastResult(@TypeOf(a), @TypeOf(b)));
             const bc = comptime ops.broadcast(@TypeOf(a).shape, @TypeOf(b).shape);
-            try dev.binary(op, a.data, b.data, out.data, pad4(&bc.dims, 1), pad4(&bc.a, 0), pad4(&bc.b, 0));
+            try dev.elementwise(op, a.data, b.data, out.data, padTo4(&bc.dims, 1), padTo4(&bc.a, 0), padTo4(&bc.b, 0));
             return out;
         }
         return switch (op) {
@@ -83,14 +107,14 @@ pub const Tape = struct {
     }
 
     pub fn leaf(self: *Tape, value: anytype) Error!Var(@TypeOf(value)) {
-        return self.track(value, true);
+        return self.makeVar(value, true);
     }
 
     pub fn constant(self: *Tape, value: anytype) Error!Var(@TypeOf(value)) {
-        return self.track(value, false);
+        return self.makeVar(value, false);
     }
 
-    fn push(self: *Tape, ctx: anytype, comptime run: fn (*Tape, *const @TypeOf(ctx)) Error!void) Error!void {
+    fn recordBackward(self: *Tape, ctx: anytype, comptime run: fn (*Tape, *const @TypeOf(ctx)) Error!void) Error!void {
         const Ctx = @TypeOf(ctx);
         const p = try self.gpa.create(Ctx);
         p.* = ctx;
@@ -104,7 +128,7 @@ pub const Tape = struct {
         });
     }
 
-    fn accumulate(self: *Tape, v: anytype, g: anytype) Error!void {
+    fn accumulateGrad(self: *Tape, v: anytype, g: anytype) Error!void {
         if (!v.needs_grad) return;
         const D = @TypeOf(v.grad);
         const G = @TypeOf(g);
@@ -112,7 +136,7 @@ pub const Tape = struct {
             if (comptime std.mem.eql(usize, D.shape, G.shape)) {
                 try dev.addInPlace(v.grad.data, g.data);
             } else {
-                try dev.sumTo(g.data, v.grad.data, pad4(G.shape, 1), rowStrides4(G.shape), comptime reducedAxes(D.shape), true);
+                try dev.sumTo(g.data, v.grad.data, padTo4(G.shape, 1), rowMajorStrides4(G.shape), comptime reducedAxisMask(D.shape), true);
             }
             return;
         }
@@ -125,35 +149,35 @@ pub const Tape = struct {
     }
 
     pub fn add(self: *Tape, a: anytype, b: anytype) Error!Var(ops.BroadcastResult(@TypeOf(a.value), @TypeOf(b.value))) {
-        const out = try self.track(try self.binary(.add, a.value, b.value), a.needs_grad or b.needs_grad);
+        const out = try self.makeVar(try self.elementwise(.add, a.value, b.value), a.needs_grad or b.needs_grad);
         const Ctx = struct { a: @TypeOf(a), b: @TypeOf(b), out: @TypeOf(out) };
-        if (out.needs_grad) try self.push(Ctx{ .a = a, .b = b, .out = out }, struct {
+        if (out.needs_grad) try self.recordBackward(Ctx{ .a = a, .b = b, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
-                try t.accumulate(c.a, c.out.grad);
-                try t.accumulate(c.b, c.out.grad);
+                try t.accumulateGrad(c.a, c.out.grad);
+                try t.accumulateGrad(c.b, c.out.grad);
             }
         }.run);
         return out;
     }
 
     pub fn mul(self: *Tape, a: anytype, b: anytype) Error!Var(ops.BroadcastResult(@TypeOf(a.value), @TypeOf(b.value))) {
-        const out = try self.track(try self.binary(.mul, a.value, b.value), a.needs_grad or b.needs_grad);
+        const out = try self.makeVar(try self.elementwise(.mul, a.value, b.value), a.needs_grad or b.needs_grad);
         const Ctx = struct { a: @TypeOf(a), b: @TypeOf(b), out: @TypeOf(out) };
-        if (out.needs_grad) try self.push(Ctx{ .a = a, .b = b, .out = out }, struct {
+        if (out.needs_grad) try self.recordBackward(Ctx{ .a = a, .b = b, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
-                if (c.a.needs_grad) try t.accumulate(c.a, try t.binary(.mul, c.out.grad, c.b.value));
-                if (c.b.needs_grad) try t.accumulate(c.b, try t.binary(.mul, c.out.grad, c.a.value));
+                if (c.a.needs_grad) try t.accumulateGrad(c.a, try t.elementwise(.mul, c.out.grad, c.b.value));
+                if (c.b.needs_grad) try t.accumulateGrad(c.b, try t.elementwise(.mul, c.out.grad, c.a.value));
             }
         }.run);
         return out;
     }
 
     pub fn matmul(self: *Tape, a: anytype, b: anytype) Error!Var(tensor.MatmulResult(@TypeOf(a.value), @TypeOf(b.value), .{})) {
-        const value = try self.fresh(tensor.MatmulResult(@TypeOf(a.value), @TypeOf(b.value), .{}));
+        const value = try self.newTensor(tensor.MatmulResult(@TypeOf(a.value), @TypeOf(b.value), .{}));
         try tensor.matmulInto(self.gpa, self.par, a.value, b.value, value, .{});
-        const out = try self.track(value, a.needs_grad or b.needs_grad);
+        const out = try self.makeVar(value, a.needs_grad or b.needs_grad);
         const Ctx = struct { a: @TypeOf(a), b: @TypeOf(b), out: @TypeOf(out) };
-        if (out.needs_grad) try self.push(Ctx{ .a = a, .b = b, .out = out }, struct {
+        if (out.needs_grad) try self.recordBackward(Ctx{ .a = a, .b = b, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
                 if (c.a.needs_grad) try tensor.matmulInto(t.gpa, t.par, c.out.grad, c.b.value, c.a.grad, .{ .trans_b = true, .accumulate = true });
                 if (c.b.needs_grad) try tensor.matmulInto(t.gpa, t.par, c.a.value, c.out.grad, c.b.grad, .{ .trans_a = true, .accumulate = true });
@@ -165,19 +189,79 @@ pub const Tape = struct {
     pub fn relu(self: *Tape, x: anytype) Error!Var(@TypeOf(x.value)) {
         var value: @TypeOf(x.value) = undefined;
         if (self.par.gpu) |dev| {
-            value = try self.fresh(@TypeOf(x.value));
+            value = try self.newTensor(@TypeOf(x.value));
             try dev.relu(x.value.data, value.data);
         } else {
             value = try ops.relu(self.gpa, x.value);
         }
-        const out = try self.track(value, x.needs_grad);
+        const out = try self.makeVar(value, x.needs_grad);
         const Ctx = struct { x: @TypeOf(x), out: @TypeOf(out) };
-        if (out.needs_grad) try self.push(Ctx{ .x = x, .out = out }, struct {
+        if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
                 if (t.par.gpu) |dev| return dev.reluBackward(c.x.value.data, c.out.grad.data, c.x.grad.data);
                 for (c.x.grad.data, c.x.value.data, c.out.grad.data) |*gx, v, g| {
                     gx.* += if (v > 0) g else 0;
                 }
+            }
+        }.run);
+        return out;
+    }
+
+    fn convKernel(self: *Tape, comptime op: conv.Op, slices: anytype, d: conv.Dims) Error!void {
+        if (self.par.gpu) |dev| return dev.convKernel(op, slices, d);
+        const f = @field(conv, @tagName(op));
+        const Ctx = struct { s: @TypeOf(slices), d: conv.Dims };
+        const body = struct {
+            fn run(c: Ctx, lo: usize, hi: usize) void {
+                for (lo..hi) |t| switch (c.s.len) {
+                    2 => f(c.s[0].ptr, c.s[1].ptr, t, c.d),
+                    else => f(c.s[0].ptr, c.s[1].ptr, c.s[2].ptr, t, c.d),
+                };
+            }
+        }.run;
+        kernels.parallelFor(self.par, conv.workItems(op, d), 1 << 12, Ctx{ .s = slices, .d = d }, body);
+    }
+
+    pub fn conv2d(self: *Tape, x: anytype, w: anytype) Error!Var(ConvOut(@TypeOf(x.value), @TypeOf(w.value))) {
+        const In = @TypeOf(x.value);
+        const Out = ConvOut(In, @TypeOf(w.value));
+        const k = comptime kernelSize(In, @TypeOf(w.value));
+        const d: conv.Dims = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = In.shape[3], .k = k };
+        const rows = Out.len / Out.shape[3];
+        const Col = Tensor(f32, &.{ rows, k * k * In.shape[3] });
+        const Flat = Tensor(f32, &.{ rows, Out.shape[3] });
+
+        const col = try self.newTensor(Col);
+        try self.convKernel(.im2col, .{ x.value.data, col.data }, d);
+        const value = try self.newTensor(Out);
+        try tensor.matmulInto(self.gpa, self.par, col, w.value, Flat{ .data = value.data }, .{});
+        const out = try self.makeVar(value, x.needs_grad or w.needs_grad);
+
+        const Ctx = struct { x: @TypeOf(x), w: @TypeOf(w), col: Col, out: @TypeOf(out) };
+        if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .w = w, .col = col, .out = out }, struct {
+            fn run(t: *Tape, c: *const Ctx) Error!void {
+                const grad: Flat = .{ .data = c.out.grad.data };
+                if (c.x.needs_grad) {
+                    const dcol = try t.newTensor(Col);
+                    try tensor.matmulInto(t.gpa, t.par, grad, c.w.value, dcol, .{ .trans_b = true });
+                    try t.convKernel(.col2im, .{ dcol.data, c.x.grad.data }, d);
+                }
+                if (c.w.needs_grad) try tensor.matmulInto(t.gpa, t.par, c.col, grad, c.w.grad, .{ .trans_a = true, .accumulate = true });
+            }
+        }.run);
+        return out;
+    }
+
+    pub fn maxPool(self: *Tape, x: anytype) Error!Var(PoolOut(@TypeOf(x.value))) {
+        const In = @TypeOf(x.value);
+        const d: conv.Dims = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = In.shape[3], .k = 2 };
+        const value = try self.newTensor(PoolOut(In));
+        try self.convKernel(.maxPool, .{ x.value.data, value.data }, d);
+        const out = try self.makeVar(value, x.needs_grad);
+        const Ctx = struct { x: @TypeOf(x), out: @TypeOf(out) };
+        if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .out = out }, struct {
+            fn run(t: *Tape, c: *const Ctx) Error!void {
+                try t.convKernel(.maxPoolBackward, .{ c.x.value.data, c.out.grad.data, c.x.grad.data }, d);
             }
         }.run);
         return out;
@@ -196,8 +280,8 @@ pub const Tape = struct {
         var logp: L = undefined;
         var value: Scalar = undefined;
         if (self.par.gpu) |dev| {
-            logp = try self.fresh(L);
-            value = try self.fresh(Scalar);
+            logp = try self.newTensor(L);
+            value = try self.newTensor(Scalar);
             try dev.crossEntropy(logits.value.data, logp.data, labels, value.data, rows, cols);
         } else {
             logp = try ops.logSoftmax(self.gpa, logits.value);
@@ -206,10 +290,10 @@ pub const Tape = struct {
             value = try Scalar.empty(self.gpa);
             value.data[0] = @floatCast(total / rows);
         }
-        const out = try self.track(value, logits.needs_grad);
+        const out = try self.makeVar(value, logits.needs_grad);
 
         const Ctx = struct { logits: @TypeOf(logits), logp: L, labels: []const u8, out: @TypeOf(out) };
-        if (out.needs_grad) try self.push(Ctx{ .logits = logits, .logp = logp, .labels = labels, .out = out }, struct {
+        if (out.needs_grad) try self.recordBackward(Ctx{ .logits = logits, .logp = logp, .labels = labels, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
                 if (t.par.gpu) |dev| return dev.crossEntropyBackward(c.logp.data, c.labels, c.logits.grad.data, c.out.grad.data, rows, cols);
                 const scale = c.out.grad.data[0] / rows;
@@ -450,5 +534,159 @@ test "gradients of a small network match finite differences" {
             const numeric = (plus - minus) / (2 * eps);
             try testing.expectApproxEqAbs(numeric, @field(run, name).grad.data[i], 3e-3);
         }
+    }
+}
+
+const CX = Tensor(f32, &.{ 2, 6, 6, 2 });
+const CW = Tensor(f32, &.{ 18, 3 });
+const CB = Tensor(f32, &.{3});
+const CV = Tensor(f32, &.{ 12, 3 });
+const CAct = Tensor(f32, &.{ 2, 4, 4, 3 });
+
+const ConvParams = struct { x: CX, w: CW, b: CB, v: CV };
+const ConvRun = struct {
+    loss: Var(Tensor(f32, &.{})),
+    act: Var(CAct),
+    x: Var(CX),
+    w: Var(CW),
+    b: Var(CB),
+    v: Var(CV),
+};
+const conv_labels = [_]u8{ 2, 0 };
+const conv_names = .{ "x", "w", "b", "v" };
+
+fn convForward(t: *Tape, p: ConvParams, labels: []const u8) !ConvRun {
+    const x = try t.leaf(p.x);
+    const w = try t.leaf(p.w);
+    const b = try t.leaf(p.b);
+    const v = try t.leaf(p.v);
+    const act = try t.add(try t.conv2d(x, w), b);
+    const flat = reshape(try t.maxPool(act), &.{ 2, 12 });
+    const loss = try t.crossEntropy(try t.matmul(flat, v), labels);
+    return .{ .loss = loss, .act = act, .x = x, .w = w, .b = b, .v = v };
+}
+
+fn convLoss(p: ConvParams) !f32 {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var t: Tape = .{ .gpa = arena.allocator() };
+    return (try convForward(&t, p, &conv_labels)).loss.value.data[0];
+}
+
+fn smallestPoolGap(act: CAct) f32 {
+    var smallest: f32 = std.math.floatMax(f32);
+    for (0..2) |n| {
+        for (0..2) |oy| {
+            for (0..2) |ox| {
+                for (0..3) |c| {
+                    var top: f32 = -std.math.floatMax(f32);
+                    var second = top;
+                    for (0..4) |q| {
+                        const y = 2 * oy + q / 2;
+                        const x = 2 * ox + q % 2;
+                        const v = act.data[((n * 4 + y) * 4 + x) * 3 + c];
+                        if (v > top) {
+                            second = top;
+                            top = v;
+                        } else if (v > second) second = v;
+                    }
+                    smallest = @min(smallest, top - second);
+                }
+            }
+        }
+    }
+    return smallest;
+}
+
+fn randomConvParams(gpa: Allocator, rng: std.Random) !ConvParams {
+    var p: ConvParams = undefined;
+    inline for (conv_names) |name| @field(p, name) = try @FieldType(ConvParams, name).empty(gpa);
+    while (true) {
+        inline for (conv_names) |name| {
+            for (@field(p, name).data) |*v| v.* = rng.float(f32) * 2 - 1;
+        }
+        var t: Tape = .{ .gpa = gpa };
+        if (smallestPoolGap((try convForward(&t, p, &conv_labels)).act.value) > 0.1) return p;
+    }
+}
+
+test "conv2d matches a direct convolution and its gradients match finite differences" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(5);
+    const p = try randomConvParams(gpa, prng.random());
+
+    var t: Tape = .{ .gpa = gpa };
+    const run = try convForward(&t, p, &conv_labels);
+    try t.backward(run.loss);
+
+    for (0..2) |n| {
+        for (0..4) |oy| {
+            for (0..4) |ox| {
+                for (0..3) |oc| {
+                    var want = p.b.data[oc];
+                    for (0..3) |ky| {
+                        for (0..3) |kx| {
+                            for (0..2) |c| {
+                                want += p.x.data[((n * 6 + oy + ky) * 6 + ox + kx) * 2 + c] * p.w.data[((ky * 3 + kx) * 2 + c) * 3 + oc];
+                            }
+                        }
+                    }
+                    try testing.expectApproxEqAbs(want, run.act.value.data[((n * 4 + oy) * 4 + ox) * 3 + oc], 1e-5);
+                }
+            }
+        }
+    }
+
+    const eps = 1e-3;
+    inline for (conv_names) |name| {
+        for (@field(p, name).data, 0..) |*v, i| {
+            const old = v.*;
+            v.* = old + eps;
+            const plus = try convLoss(p);
+            v.* = old - eps;
+            const minus = try convLoss(p);
+            v.* = old;
+            try testing.expectApproxEqAbs((plus - minus) / (2 * eps), @field(run, name).grad.data[i], 3e-3);
+        }
+    }
+}
+
+test "gpu conv2d and max maxPool reproduce the cpu loss and gradients" {
+    const gpu = gpu_mod.Gpu.init(testing.allocator, 64 << 20) catch |err| switch (err) {
+        error.DriverNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer gpu.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(8);
+    const host = try randomConvParams(gpa, prng.random());
+
+    var cpu_tape: Tape = .{ .gpa = gpa };
+    const cpu = try convForward(&cpu_tape, host, &conv_labels);
+    try cpu_tape.backward(cpu.loss);
+
+    var device: ConvParams = undefined;
+    inline for (conv_names) |name| {
+        const slice = try gpu.alloc(f32, @field(host, name).data.len);
+        try gpu.upload(slice, @field(host, name).data);
+        @field(device, name) = .{ .data = slice };
+    }
+    const labels = try gpu.alloc(u8, conv_labels.len);
+    try gpu.upload(labels, &conv_labels);
+
+    var gpu_tape: Tape = .{ .gpa = gpa, .par = .{ .gpu = gpu } };
+    const run = try convForward(&gpu_tape, device, labels);
+    try gpu_tape.backward(run.loss);
+
+    try testing.expectApproxEqAbs(cpu.loss.value.data[0], try gpu_tape.scalar(run.loss), 1e-5);
+    inline for (conv_names) |name| {
+        const want = @field(cpu, name).grad.data;
+        const got = try gpa.alloc(f32, want.len);
+        try gpu.download(got, @field(run, name).grad.data);
+        for (want, got) |w, g| try testing.expectApproxEqAbs(w, g, 1e-5);
     }
 }

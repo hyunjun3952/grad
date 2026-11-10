@@ -1,10 +1,12 @@
-const BM = 64;
-const BN = 64;
-const BK = 16;
+const cv = @import("conv.zig");
+
+const BM = 128;
+const BN = 128;
+const BK = 8;
 const BM_PAD = BM + 1;
 const BN_PAD = BN + 1;
-const TM = 4;
-const TN = 4;
+const TM = BM / 16;
+const TN = BN / 16;
 const threads = 256;
 
 const tiles = struct {
@@ -12,11 +14,15 @@ const tiles = struct {
     var b: [BK * BN_PAD]f32 addrspace(.shared) = undefined;
 };
 
+const reduction = struct {
+    var partial: [threads]f32 addrspace(.shared) = undefined;
+};
+
 inline fn barrier() void {
     asm volatile ("bar.sync 0;" ::: .{ .memory = true });
 }
 
-inline fn gid() usize {
+inline fn globalIndex() usize {
     return @as(usize, @workGroupId(0)) * @workGroupSize(0) + @workItemId(0);
 }
 
@@ -45,6 +51,7 @@ inline fn gemm(
     n: u32,
     k: u32,
     accumulate: u32,
+    chunk: u32,
 ) void {
     const tid: usize = @workItemId(0);
     const tx = tid % 16;
@@ -56,9 +63,11 @@ inline fn gemm(
     const K: usize = k;
 
     var acc: [TM][TN]f32 = @splat(@splat(0));
-    var kk: usize = 0;
-    while (kk < K) : (kk += BK) {
-        inline for (0..4) |i| {
+    const k_begin = @as(usize, @workGroupId(2)) * chunk;
+    const k_end = @min(K, k_begin + chunk);
+    var kk = k_begin;
+    while (kk < k_end) : (kk += BK) {
+        inline for (0..BK * BM / threads) |i| {
             const idx = tid + i * threads;
             const r = if (ta) idx % BM else idx / BK;
             const cc = if (ta) idx / BM else idx % BK;
@@ -67,7 +76,7 @@ inline fn gemm(
             const valid = row < M and col < K;
             tiles.a[cc * BM_PAD + r] = if (!valid) 0 else if (ta) a[col * M + row] else a[row * K + col];
         }
-        inline for (0..4) |i| {
+        inline for (0..BK * BN / threads) |i| {
             const idx = tid + i * threads;
             const r = if (tb) idx % BK else idx / BN;
             const cc = if (tb) idx / BK else idx % BN;
@@ -96,30 +105,34 @@ inline fn gemm(
             const col = col0 + tx + j * 16;
             if (row < M and col < N) {
                 const at = row * N + col;
-                c[at] = if (accumulate != 0) c[at] + acc[i][j] else acc[i][j];
+                if (chunk < K) {
+                    _ = @atomicRmw(f32, &c[at], .Add, acc[i][j], .monotonic);
+                } else {
+                    c[at] = if (accumulate != 0) c[at] + acc[i][j] else acc[i][j];
+                }
             }
         }
     }
 }
 
-export fn sgemm_nn(a: [*]const f32, b: [*]const f32, c: [*]f32, m: u32, n: u32, k: u32, accumulate: u32) callconv(.nvptx_kernel) void {
-    gemm(false, false, a, b, c, m, n, k, accumulate);
+export fn sgemmNN(a: [*]const f32, b: [*]const f32, c: [*]f32, m: u32, n: u32, k: u32, accumulate: u32, chunk: u32) callconv(.nvptx_kernel) void {
+    gemm(false, false, a, b, c, m, n, k, accumulate, chunk);
 }
 
-export fn sgemm_nt(a: [*]const f32, b: [*]const f32, c: [*]f32, m: u32, n: u32, k: u32, accumulate: u32) callconv(.nvptx_kernel) void {
-    gemm(false, true, a, b, c, m, n, k, accumulate);
+export fn sgemmNT(a: [*]const f32, b: [*]const f32, c: [*]f32, m: u32, n: u32, k: u32, accumulate: u32, chunk: u32) callconv(.nvptx_kernel) void {
+    gemm(false, true, a, b, c, m, n, k, accumulate, chunk);
 }
 
-export fn sgemm_tn(a: [*]const f32, b: [*]const f32, c: [*]f32, m: u32, n: u32, k: u32, accumulate: u32) callconv(.nvptx_kernel) void {
-    gemm(true, false, a, b, c, m, n, k, accumulate);
+export fn sgemmTN(a: [*]const f32, b: [*]const f32, c: [*]f32, m: u32, n: u32, k: u32, accumulate: u32, chunk: u32) callconv(.nvptx_kernel) void {
+    gemm(true, false, a, b, c, m, n, k, accumulate, chunk);
 }
 
-inline fn binary(
-    comptime mul: bool,
+export fn elementwise(
     a: [*]const f32,
     b: [*]const f32,
     out: [*]f32,
     n: u32,
+    multiply: u32,
     d1: u32,
     d2: u32,
     d3: u32,
@@ -131,8 +144,8 @@ inline fn binary(
     sb1: u32,
     sb2: u32,
     sb3: u32,
-) void {
-    const t = gid();
+) callconv(.nvptx_kernel) void {
+    const t = globalIndex();
     if (t >= n) return;
     var rest = t;
     const p3 = rest % d3;
@@ -143,33 +156,25 @@ inline fn binary(
     const p0 = rest / d1;
     const x = a[p0 * sa0 + p1 * sa1 + p2 * sa2 + p3 * sa3];
     const y = b[p0 * sb0 + p1 * sb1 + p2 * sb2 + p3 * sb3];
-    out[t] = if (mul) x * y else x + y;
-}
-
-export fn bin_add(a: [*]const f32, b: [*]const f32, out: [*]f32, n: u32, d1: u32, d2: u32, d3: u32, sa0: u32, sa1: u32, sa2: u32, sa3: u32, sb0: u32, sb1: u32, sb2: u32, sb3: u32) callconv(.nvptx_kernel) void {
-    binary(false, a, b, out, n, d1, d2, d3, sa0, sa1, sa2, sa3, sb0, sb1, sb2, sb3);
-}
-
-export fn bin_mul(a: [*]const f32, b: [*]const f32, out: [*]f32, n: u32, d1: u32, d2: u32, d3: u32, sa0: u32, sa1: u32, sa2: u32, sa3: u32, sb0: u32, sb1: u32, sb2: u32, sb3: u32) callconv(.nvptx_kernel) void {
-    binary(true, a, b, out, n, d1, d2, d3, sa0, sa1, sa2, sa3, sb0, sb1, sb2, sb3);
+    out[t] = if (multiply != 0) x * y else x + y;
 }
 
 export fn relu(x: [*]const f32, out: [*]f32, n: u32) callconv(.nvptx_kernel) void {
-    const t = gid();
+    const t = globalIndex();
     if (t < n) out[t] = @max(x[t], 0);
 }
 
-export fn relu_bwd(x: [*]const f32, g_out: [*]const f32, g_in: [*]f32, n: u32) callconv(.nvptx_kernel) void {
-    const t = gid();
+export fn reluBackward(x: [*]const f32, g_out: [*]const f32, g_in: [*]f32, n: u32) callconv(.nvptx_kernel) void {
+    const t = globalIndex();
     if (t < n) g_in[t] += if (x[t] > 0) g_out[t] else 0;
 }
 
-export fn add_inplace(dst: [*]f32, src: [*]const f32, n: u32) callconv(.nvptx_kernel) void {
-    const t = gid();
+export fn addInPlace(dst: [*]f32, src: [*]const f32, n: u32) callconv(.nvptx_kernel) void {
+    const t = globalIndex();
     if (t < n) dst[t] += src[t];
 }
 
-export fn sum_to(
+export fn sumTo(
     in: [*]const f32,
     out: [*]f32,
     out_len: u32,
@@ -185,8 +190,9 @@ export fn sum_to(
     s2: u32,
     s3: u32,
 ) callconv(.nvptx_kernel) void {
-    const t = gid();
-    if (t >= out_len) return;
+    _ = out_len;
+    const t: usize = @workGroupId(0);
+    const tid: usize = @workItemId(0);
     const d = [4]usize{ d0, d1, d2, d3 };
     const s = [4]usize{ s0, s1, s2, s3 };
 
@@ -201,8 +207,8 @@ export fn sum_to(
     }
 
     var total: f32 = 0;
-    var q: usize = 0;
-    while (q < reduce_count) : (q += 1) {
+    var q: usize = tid;
+    while (q < reduce_count) : (q += threads) {
         var left = q;
         var at = base;
         inline for (0..4) |step| {
@@ -214,11 +220,18 @@ export fn sum_to(
         }
         total += in[at];
     }
-    out[t] = if (accumulate != 0) out[t] + total else total;
+    reduction.partial[tid] = total;
+    barrier();
+    var half: usize = threads / 2;
+    while (half > 0) : (half /= 2) {
+        if (tid < half) reduction.partial[tid] += reduction.partial[tid + half];
+        barrier();
+    }
+    if (tid == 0) out[t] = if (accumulate != 0) out[t] + reduction.partial[0] else reduction.partial[0];
 }
 
-export fn ce_rows(x: [*]const f32, logp: [*]f32, labels: [*]const u8, row_loss: [*]f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
-    const r = gid();
+export fn crossEntropyRows(x: [*]const f32, logp: [*]f32, labels: [*]const u8, row_loss: [*]f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
+    const r = globalIndex();
     if (r >= rows) return;
     const base = r * cols;
     var mx = x[base];
@@ -233,16 +246,16 @@ export fn ce_rows(x: [*]const f32, logp: [*]f32, labels: [*]const u8, row_loss: 
     row_loss[r] = -logp[base + labels[r]];
 }
 
-export fn ce_mean(row_loss: [*]const f32, out: [*]f32, rows: u32) callconv(.nvptx_kernel) void {
-    if (gid() != 0) return;
+export fn crossEntropyMean(row_loss: [*]const f32, out: [*]f32, rows: u32) callconv(.nvptx_kernel) void {
+    if (globalIndex() != 0) return;
     var total: f32 = 0;
     var r: usize = 0;
     while (r < rows) : (r += 1) total += row_loss[r];
     out[0] = total / @as(f32, @floatFromInt(rows));
 }
 
-export fn ce_bwd(logp: [*]const f32, labels: [*]const u8, grad: [*]f32, loss_grad: [*]const f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
-    const t = gid();
+export fn crossEntropyBackward(logp: [*]const f32, labels: [*]const u8, grad: [*]f32, loss_grad: [*]const f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
+    const t = globalIndex();
     if (t >= @as(usize, rows) * cols) return;
     const r = t / cols;
     const j = t % cols;
@@ -251,8 +264,28 @@ export fn ce_bwd(logp: [*]const f32, labels: [*]const u8, grad: [*]f32, loss_gra
     grad[t] += p * (loss_grad[0] / @as(f32, @floatFromInt(rows)));
 }
 
+fn convDims(n: u32, h: u32, w: u32, c: u32, k: u32) cv.Dims {
+    return .{ .n = n, .h = h, .w = w, .c = c, .k = k };
+}
+
+export fn im2col(x: [*]const f32, col: [*]f32, len: u32, n: u32, h: u32, w: u32, c: u32, k: u32) callconv(.nvptx_kernel) void {
+    if (globalIndex() < len) cv.im2col(x, col, globalIndex(), convDims(n, h, w, c, k));
+}
+
+export fn col2im(dcol: [*]const f32, dx: [*]f32, len: u32, n: u32, h: u32, w: u32, c: u32, k: u32) callconv(.nvptx_kernel) void {
+    if (globalIndex() < len) cv.col2im(dcol, dx, globalIndex(), convDims(n, h, w, c, k));
+}
+
+export fn maxPool(x: [*]const f32, out: [*]f32, len: u32, n: u32, h: u32, w: u32, c: u32, k: u32) callconv(.nvptx_kernel) void {
+    if (globalIndex() < len) cv.maxPool(x, out, globalIndex(), convDims(n, h, w, c, k));
+}
+
+export fn maxPoolBackward(x: [*]const f32, gout: [*]const f32, gin: [*]f32, len: u32, n: u32, h: u32, w: u32, c: u32, k: u32) callconv(.nvptx_kernel) void {
+    if (globalIndex() < len) cv.maxPoolBackward(x, gout, gin, globalIndex(), convDims(n, h, w, c, k));
+}
+
 export fn sgd(w: [*]f32, g: [*]const f32, lr: f32, n: u32) callconv(.nvptx_kernel) void {
-    const t = gid();
+    const t = globalIndex();
     if (t < n) w[t] -= lr * g[t];
 }
 
@@ -268,7 +301,7 @@ export fn adam(
     inv_sqrt_c2: f32,
     eps: f32,
 ) callconv(.nvptx_kernel) void {
-    const t = gid();
+    const t = globalIndex();
     if (t >= n) return;
     const grad = g[t];
     const m_new = b1 * m[t] + (1 - b1) * grad;
@@ -288,7 +321,7 @@ export fn gather(
     rows: u32,
     pixels: u32,
 ) callconv(.nvptx_kernel) void {
-    const t = gid();
+    const t = globalIndex();
     if (t >= @as(usize, rows) * pixels) return;
     const r = t / pixels;
     const p = t % pixels;

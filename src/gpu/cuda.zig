@@ -114,7 +114,7 @@ pub const Cuda = struct {
         return module;
     }
 
-    pub fn function(self: *const Cuda, module: Handle, name: [*:0]const u8) !Handle {
+    pub fn getFunction(self: *const Cuda, module: Handle, name: [*:0]const u8) !Handle {
         var f: Handle = null;
         try self.check(self.api.cuModuleGetFunction(&f, module, name));
         return f;

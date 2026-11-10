@@ -38,6 +38,7 @@ pub fn build(b: *std.Build) void {
     const config = b.addOptions();
     config.addOption(usize, "hidden", b.option(usize, "hidden", "Hidden units of the trained MLP (default: 128)") orelse 128);
     config.addOption(usize, "batch", b.option(usize, "batch", "Training batch size (default: 64)") orelse 64);
+    config.addOption(bool, "cnn", b.option(bool, "cnn", "Train a convolutional network instead of the MLP") orelse false);
     exe.root_module.addOptions("config", config);
 
     b.installArtifact(exe);

@@ -59,6 +59,36 @@ pub fn Linear(comptime n_in: usize, comptime n_out: usize) type {
     };
 }
 
+pub fn Conv2d(comptime c_in: usize, comptime c_out: usize, comptime k: usize) type {
+    const Inner = Linear(k * k * c_in, c_out);
+
+    return struct {
+        const Self = @This();
+
+        inner: Inner,
+
+        pub fn init(gpa: Allocator, rng: std.Random) Allocator.Error!Self {
+            return .{ .inner = try Inner.init(gpa, rng) };
+        }
+
+        pub fn deinit(self: Self, gpa: Allocator) void {
+            self.inner.deinit(gpa);
+        }
+
+        pub fn toGpu(self: Self, gpu: *Gpu) autograd.Error!Self {
+            return .{ .inner = try self.inner.toGpu(gpu) };
+        }
+
+        pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(Tensor(f32, &.{ @TypeOf(x.value).shape[0], @TypeOf(x.value).shape[1] - k + 1, @TypeOf(x.value).shape[2] - k + 1, c_out })) {
+            return tape.add(try tape.conv2d(x, self.inner.w), self.inner.b);
+        }
+
+        pub fn params(self: Self) @TypeOf(self.inner.params()) {
+            return self.inner.params();
+        }
+    };
+}
+
 const testing = std.testing;
 
 test "forward is x*w + b and params exposes both parameters" {
