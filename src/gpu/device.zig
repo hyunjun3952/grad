@@ -586,7 +586,7 @@ const GemmMode = enum { dense, gather_a, gather_b };
 
 const zero_geometry: ga.ConvGeometry = .{ .n = 0, .h = 0, .w = 0, .c = 0, .k = 0, .stride = 0, .pad = 0, .out_h = 0, .out_w = 0, .positions = 0 };
 
-inline fn copyAsyncZfill(dst: u32, src: [*]const u16, valid: bool) void {
+inline fn copyAsyncZfill(dst: u32, src: anytype, valid: bool) void {
     asm volatile ("cp.async.cg.shared.global [%[dst]], [%[src]], 16, %[size];"
         :
         : [dst] "r" (dst),
@@ -810,4 +810,274 @@ export fn addKrscGradient(src: [*]const f32, dst: [*]f32, args: ga.LayoutArgs) c
     const ky = t / args.c / args.r % args.r;
     const o = t / args.c / args.r / args.r;
     dst[((ky * args.r + kx) * args.c + ci) * args.k + o] += src[t];
+}
+
+const tf32_core = struct {
+    const rows = 128;
+    const cols = 64;
+    const depth = 16;
+    const stages = 3;
+    const a_pitch = depth + 4;
+    const b_pitch = cols + 8;
+    const a_elems = rows * a_pitch;
+    const b_elems = depth * b_pitch;
+    const stage_elems = a_elems + b_elems;
+
+    var smem: [stages * stage_elems]f32 align(128) addrspace(.shared) = undefined;
+
+    inline fn sharedAddress(index: usize) u32 {
+        return @truncate(@intFromPtr(&smem[index]));
+    }
+
+    inline fn rounded(x: f32) u32 {
+        return asm ("cvt.rna.tf32.f32 %[out], %[in];"
+            : [out] "=r" (-> u32),
+            : [in] "f" (x),
+        );
+    }
+
+    inline fn mma(acc: *[4]f32, a: [4]u32, b: [2]u32) void {
+        var d0 = acc[0];
+        var d1 = acc[1];
+        var d2 = acc[2];
+        var d3 = acc[3];
+        asm volatile ("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%[d0], %[d1], %[d2], %[d3]}, {%[a0], %[a1], %[a2], %[a3]}, {%[b0], %[b1]}, {%[d0], %[d1], %[d2], %[d3]};"
+            : [d0] "+f" (d0),
+              [d1] "+f" (d1),
+              [d2] "+f" (d2),
+              [d3] "+f" (d3),
+            : [a0] "r" (a[0]),
+              [a1] "r" (a[1]),
+              [a2] "r" (a[2]),
+              [a3] "r" (a[3]),
+              [b0] "r" (b[0]),
+              [b1] "r" (b[1]),
+        );
+        acc.* = .{ d0, d1, d2, d3 };
+    }
+};
+
+inline fn tf32Gemm(comptime mode: GemmMode, a: [*]const f32, b: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) void {
+    const tc = tf32_core;
+    const tid: usize = @workItemId(0);
+    const lane = tid % 32;
+    const warp = tid / 32;
+    const warp_row = warp / 2;
+    const warp_col = warp % 2;
+    const row0 = @as(usize, @workGroupId(1)) * tc.rows;
+    const col0 = @as(usize, @workGroupId(0)) * tc.cols;
+    const M: usize = shape.m;
+    const N: usize = shape.n;
+    const K: usize = shape.k_padded;
+    const NP: usize = shape.n_padded;
+    const k_begin = @as(usize, @workGroupId(2)) * shape.chunk;
+    const k_end = @min(K, k_begin + shape.chunk);
+    const tiles = (k_end -| k_begin) / tc.depth;
+
+    const Loader = struct {
+        a: [*]const f32,
+        b: [*]const f32,
+        geo: ga.ConvGeometry,
+        rows_a: [2]usize,
+        chunk_a: usize,
+        dst_a: [2]usize,
+        dst_b: usize,
+        k_b: usize,
+        chunk_b: usize,
+        first_col: usize,
+        depth_k: usize,
+        stride_n: usize,
+        row_base: usize,
+        rows_total: usize,
+        origin_n: [2]u32,
+        origin_y: [2]i32,
+        origin_x: [2]i32,
+        origin_valid: [2]bool,
+        cursor_ky: i32,
+        cursor_kx: i32,
+        cursor_channel: usize,
+
+        inline fn issue(self: *@This(), stage: usize, kk: usize) void {
+            const base = stage * tc.stage_elems;
+            const geometry = self.geo;
+            if (mode == .gather_a) {
+                inline for (0..2) |i| {
+                    const y = self.origin_y[i] + self.cursor_ky;
+                    const x = self.origin_x[i] + self.cursor_kx;
+                    const valid = self.origin_valid[i] and y >= 0 and y < @as(i32, @intCast(geometry.h)) and x >= 0 and x < @as(i32, @intCast(geometry.w));
+                    const at = if (valid) ((@as(usize, self.origin_n[i]) * geometry.h + @as(usize, @intCast(y))) * geometry.w + @as(usize, @intCast(x))) * geometry.c + self.cursor_channel + self.chunk_a * 4 else 0;
+                    copyAsyncZfill(tc.sharedAddress(base + self.dst_a[i]), self.a + at, valid);
+                }
+                self.cursor_channel += tc.depth;
+                if (self.cursor_channel >= geometry.c) {
+                    self.cursor_channel -= geometry.c;
+                    self.cursor_kx += 1;
+                    if (self.cursor_kx == @as(i32, @intCast(geometry.k))) {
+                        self.cursor_kx = 0;
+                        self.cursor_ky += 1;
+                    }
+                }
+            } else {
+                inline for (0..2) |i| {
+                    const valid = self.row_base + self.rows_a[i] < self.rows_total;
+                    const at = if (valid) (self.row_base + self.rows_a[i]) * self.depth_k + self.chunk_a * 4 + kk else 0;
+                    copyAsyncZfill(tc.sharedAddress(base + self.dst_a[i]), self.a + at, valid);
+                }
+            }
+            if (mode == .gather_b) {
+                const tap: u32 = @intCast(self.first_col / geometry.c);
+                const channel: usize = self.first_col % geometry.c + self.chunk_b * 4;
+                const ky: i32 = @intCast(tap / geometry.k);
+                const kx: i32 = @intCast(tap % geometry.k);
+                const p: u32 = @intCast(kk + self.k_b);
+                const y = @as(i32, @intCast(p / geometry.out_w % geometry.out_h * geometry.stride)) + ky - @as(i32, @intCast(geometry.pad));
+                const x = @as(i32, @intCast(p % geometry.out_w * geometry.stride)) + kx - @as(i32, @intCast(geometry.pad));
+                const valid = p < geometry.positions and y >= 0 and y < @as(i32, @intCast(geometry.h)) and x >= 0 and x < @as(i32, @intCast(geometry.w));
+                const at = if (valid) ((@as(usize, p / (geometry.out_h * geometry.out_w)) * geometry.h + @as(usize, @intCast(y))) * geometry.w + @as(usize, @intCast(x))) * geometry.c + channel else 0;
+                copyAsyncZfill(tc.sharedAddress(base + self.dst_b), self.b + at, valid);
+            } else {
+                const valid = self.first_col + self.chunk_b * 4 < self.stride_n;
+                const at = if (valid) (kk + self.k_b) * self.stride_n + self.first_col + self.chunk_b * 4 else 0;
+                copyAsyncZfill(tc.sharedAddress(base + self.dst_b), self.b + at, valid);
+            }
+        }
+    };
+
+    const a_rows = [2]usize{ tid / 4, tid / 4 + 64 };
+    const a_chunk = tid % 4;
+    const b_k = tid / 16;
+    const b_chunk = tid % 16;
+    var loader: Loader = .{
+        .a = a,
+        .b = b,
+        .geo = geo,
+        .rows_a = a_rows,
+        .chunk_a = a_chunk,
+        .dst_a = .{ a_rows[0] * tc.a_pitch + a_chunk * 4, a_rows[1] * tc.a_pitch + a_chunk * 4 },
+        .dst_b = tc.a_elems + b_k * tc.b_pitch + b_chunk * 4,
+        .k_b = b_k,
+        .chunk_b = b_chunk,
+        .first_col = col0,
+        .depth_k = K,
+        .stride_n = NP,
+        .row_base = row0,
+        .rows_total = M,
+        .origin_n = undefined,
+        .origin_y = undefined,
+        .origin_x = undefined,
+        .origin_valid = undefined,
+        .cursor_ky = 0,
+        .cursor_kx = 0,
+        .cursor_channel = 0,
+    };
+    if (mode == .gather_a) {
+        inline for (0..2) |i| {
+            const row: u32 = @intCast(row0 + a_rows[i]);
+            loader.origin_valid[i] = row < shape.m;
+            loader.origin_n[i] = row / (geo.out_h * geo.out_w);
+            loader.origin_y[i] = @as(i32, @intCast(row / geo.out_w % geo.out_h * geo.stride)) - @as(i32, @intCast(geo.pad));
+            loader.origin_x[i] = @as(i32, @intCast(row % geo.out_w * geo.stride)) - @as(i32, @intCast(geo.pad));
+        }
+        const tap: u32 = @intCast(k_begin / geo.c);
+        loader.cursor_ky = @intCast(tap / geo.k);
+        loader.cursor_kx = @intCast(tap % geo.k);
+        loader.cursor_channel = k_begin % geo.c;
+    }
+
+    inline for (0..tc.stages - 1) |stage| {
+        if (stage < tiles) loader.issue(stage, k_begin + stage * tc.depth);
+        tf32Commit();
+    }
+
+    var acc: [2][4][4]f32 = @splat(@splat(@splat(0)));
+    var tile: usize = 0;
+    while (tile < tiles) : (tile += 1) {
+        tensor_core.waitForOlderGroups();
+        barrier();
+
+        const ahead = tile + tc.stages - 1;
+        if (ahead < tiles) loader.issue(ahead % tc.stages, k_begin + ahead * tc.depth);
+        tf32Commit();
+
+        const base = (tile % tc.stages) * tc.stage_elems;
+        inline for (0..tc.depth / 8) |step| {
+            const k0 = step * 8 + lane % 4;
+            var a_frag: [2][4]u32 = undefined;
+            inline for (0..2) |mi| {
+                const r = warp_row * 32 + mi * 16 + lane / 4;
+                a_frag[mi] = .{
+                    tc.rounded(tc.smem[base + r * tc.a_pitch + k0]),
+                    tc.rounded(tc.smem[base + (r + 8) * tc.a_pitch + k0]),
+                    tc.rounded(tc.smem[base + r * tc.a_pitch + k0 + 4]),
+                    tc.rounded(tc.smem[base + (r + 8) * tc.a_pitch + k0 + 4]),
+                };
+            }
+            inline for (0..4) |ni| {
+                const n = warp_col * 32 + ni * 8 + lane / 4;
+                const b_frag: [2]u32 = .{
+                    tc.rounded(tc.smem[base + tc.a_elems + k0 * tc.b_pitch + n]),
+                    tc.rounded(tc.smem[base + tc.a_elems + (k0 + 4) * tc.b_pitch + n]),
+                };
+                inline for (0..2) |mi| tc.mma(&acc[mi][ni], a_frag[mi], b_frag);
+            }
+        }
+    }
+
+    inline for (0..2) |mi| {
+        inline for (0..4) |ni| {
+            inline for (0..4) |q| {
+                const r = row0 + warp_row * 32 + mi * 16 + lane / 4 + (q / 2) * 8;
+                const col = col0 + warp_col * 32 + ni * 8 + (lane % 4) * 2 + q % 2;
+                if (r < M and col < N) {
+                    const at = if (shape.transpose_out != 0) col * M + r else r * N + col;
+                    if (shape.chunk < K) {
+                        _ = @atomicRmw(f32, &c[at], .Add, acc[mi][ni][q], .monotonic);
+                    } else {
+                        c[at] = if (shape.accumulate != 0) c[at] + acc[mi][ni][q] else acc[mi][ni][q];
+                    }
+                }
+            }
+        }
+    }
+}
+
+inline fn tf32Commit() void {
+    tensor_core.commit();
+}
+
+export fn convTf32Forward(x: [*]const f32, w: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
+    tf32Gemm(.gather_a, x, w, c, shape, geo);
+}
+
+export fn convTf32WeightGrad(dy_t: [*]const f32, x: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
+    tf32Gemm(.gather_b, dy_t, x, c, shape, geo);
+}
+
+export fn rotateWeightsF32(src: [*]const f32, dst: [*]f32, args: ga.RotateArgs) callconv(.nvptx_kernel) void {
+    const t = globalIndex();
+    if (t >= @as(usize, args.rows_padded) * args.cols_padded) return;
+    const i: u32 = @intCast(t / args.cols_padded);
+    const j: u32 = @intCast(t % args.cols_padded);
+    const tap = i / args.c_out;
+    const co = i % args.c_out;
+    const source_tap = (args.k - 1 - tap / args.k) * args.k + (args.k - 1 - tap % args.k);
+    dst[t] = if (j < args.c_in) src[(source_tap * args.c_in + j) * args.c_out + co] else 0;
+}
+
+export fn transposeF32(src: [*]const f32, dst: [*]f32, args: ga.PackArgs) callconv(.nvptx_kernel) void {
+    const tid: usize = @workItemId(0);
+    const lane = tid % 32;
+    const group = tid / 32;
+    const row_base = @as(usize, @workGroupId(1)) * 32;
+    const col_base = @as(usize, @workGroupId(0)) * 32;
+    inline for (0..4) |step| {
+        const j = col_base + group + 8 * step;
+        const i = row_base + lane;
+        transpose_tile.values[(group + 8 * step) * 33 + lane] = if (i < args.rows and j < args.cols) src[j * args.src_stride + i] else 0;
+    }
+    barrier();
+    inline for (0..4) |step| {
+        const i = row_base + group + 8 * step;
+        dst[i * args.cols_padded + col_base + lane] = transpose_tile.values[lane * 33 + group + 8 * step];
+    }
 }

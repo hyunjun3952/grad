@@ -353,13 +353,17 @@ pub const Tape = struct {
         const cudnn_geometry: gpu_mod.cudnn.Geometry = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = In.shape[3], .k = channels_out, .r = k, .pad = opts.pad, .stride = opts.stride };
         const packed_path = if (dev) |g| g.tensorWorthwhile(rows, channels_out, kc) and !use_cudnn else false;
         const implicit_shape = opts.stride == 1 and In.shape[3] % 64 == 0 and channels_out % 32 == 0;
+        const tf32_shape = opts.stride == 1 and In.shape[3] % 64 == 0 and channels_out % 16 == 0;
+        const tf32_path = tf32_shape and !use_cudnn and !packed_path and (if (dev) |g| g.tf32Worthwhile(rows, channels_out, kc) else false);
         const implicit_path = implicit_shape and packed_path;
         const geometry: ga.ConvGeometry = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = In.shape[3], .k = k, .stride = opts.stride, .pad = opts.pad, .out_h = Out.shape[1], .out_w = Out.shape[2], .positions = rows };
         const value = try self.newTensor(Out);
         var col: Col = undefined;
         var col_half: ?gpu_mod.Gpu.Packed = null;
         var x_half: []const u16 = &.{};
-        if (use_cudnn) {
+        if (tf32_path) {
+            try dev.?.convTf32Forward(x.value.data, w.value.data, channels_out, value.data, geometry, channels_out, false);
+        } else if (use_cudnn) {
             const g = dev.?;
             const mark = g.step_used;
             defer g.step_used = mark;
@@ -382,10 +386,26 @@ pub const Tape = struct {
         }
         const out = try self.makeVar(value, x.needs_grad or w.needs_grad);
 
-        const Ctx = struct { x: @TypeOf(x), w: @TypeOf(w), col: Col, col_half: ?gpu_mod.Gpu.Packed, x_half: []const u16, use_cudnn: bool, out: @TypeOf(out) };
-        if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .w = w, .col = col, .col_half = col_half, .x_half = x_half, .use_cudnn = use_cudnn, .out = out }, struct {
+        const Ctx = struct { x: @TypeOf(x), w: @TypeOf(w), col: Col, col_half: ?gpu_mod.Gpu.Packed, x_half: []const u16, use_cudnn: bool, use_tf32: bool, out: @TypeOf(out) };
+        if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .w = w, .col = col, .col_half = col_half, .x_half = x_half, .use_cudnn = use_cudnn, .use_tf32 = tf32_path, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
                 const grad: Flat = .{ .data = c.out.grad.data };
+                if (c.use_tf32) {
+                    const g = t.par.gpu.?;
+                    const mark = g.step_used;
+                    defer g.step_used = mark;
+                    if (c.x.needs_grad) {
+                        const rotated = try g.rotateWeightsF32(c.w.value.data, k, In.shape[3], channels_out);
+                        const reverse: ga.ConvGeometry = .{ .n = In.shape[0], .h = Out.shape[1], .w = Out.shape[2], .c = channels_out, .k = k, .stride = 1, .pad = k - 1 - opts.pad, .out_h = In.shape[1], .out_w = In.shape[2], .positions = In.len / In.shape[3] };
+                        try g.convTf32Forward(grad.data, rotated, std.mem.alignForward(usize, In.shape[3], 64), c.x.grad.data, reverse, In.shape[3], true);
+                    }
+                    if (c.w.needs_grad) {
+                        const positions_padded = std.mem.alignForward(usize, rows, 32);
+                        const grad_t = try g.transposeF32(grad.data, channels_out, rows, std.mem.alignForward(usize, channels_out, 32), positions_padded);
+                        try g.convTf32WeightGrad(grad_t, positions_padded, c.x.value.data, c.w.grad.data, geometry, channels_out, kc);
+                    }
+                    return;
+                }
                 if (c.use_cudnn) {
                     const g = t.par.gpu.?;
                     const mark = g.step_used;
@@ -1063,6 +1083,7 @@ test "implicit-GEMM convolutions on tensor cores match a direct convolution and 
         try gradcheck.expectGpuMatchesCpu(Case, 33, 1e-4);
         try gradcheck.expectTensorCoresClose(Case, 33, 0.15);
         try gradcheck.expectCudnnClose(Case, 33, 0.15);
+        try gradcheck.expectTf32Close(Case, 33, 0.1);
     }
 }
 test "batch norm gradients match finite differences, and the gpu matches the cpu including running statistics" {

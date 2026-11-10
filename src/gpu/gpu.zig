@@ -40,6 +40,10 @@ const Kernel = enum {
     im2colHalf,
     sgemmTensor,
     weightsToKrsc,
+    convTf32Forward,
+    convTf32WeightGrad,
+    rotateWeightsF32,
+    transposeF32,
     addKrscGradient,
     convGemmForward,
     convGemmWeightGrad,
@@ -132,6 +136,7 @@ const Profile = struct { io: Io, ns: [slot_count]i96 = @splat(0), calls: [slot_c
 pub const Gpu = struct {
     profile: ?Profile = null,
     tensor_cores: bool = false,
+    tf32: bool = false,
     tensor_core_min_work: usize = 1 << 22,
     gpa: Allocator,
     cu: cuda.Cuda,
@@ -156,6 +161,7 @@ pub const Gpu = struct {
         self.gpa = gpa;
         self.profile = null;
         self.tensor_cores = false;
+        self.tf32 = false;
         self.tensor_core_min_work = 1 << 22;
         self.owned = .empty;
         self.cudnn_lib = null;
@@ -400,6 +406,40 @@ pub const Gpu = struct {
         const dst = try self.scratch(u16, rows_padded * cols_padded);
         try self.launch(.im2colHalf, .{ toU32(rows_padded), 1, 1 }, .{ x, dst, d, cols_padded });
         return .{ .data = dst, .rows_padded = rows_padded, .cols_padded = cols_padded };
+    }
+
+    pub fn tf32Worthwhile(self: *Gpu, m: usize, n: usize, k: usize) bool {
+        return self.tf32 and m * n * k >= self.tensor_core_min_work;
+    }
+
+    pub fn rotateWeightsF32(self: *Gpu, w: []const f32, k: usize, c_in: usize, c_out: usize) Error![]f32 {
+        const rows = k * k * c_out;
+        const cols_padded = std.mem.alignForward(usize, c_in, 64);
+        const dst = try self.scratch(f32, rows * cols_padded);
+        try self.launchFlat(.rotateWeightsF32, dst.len, .{ w, dst, pack(ga.RotateArgs, .{ .k = k, .c_in = c_in, .c_out = c_out, .rows_padded = rows, .cols_padded = cols_padded }) });
+        return dst;
+    }
+
+    pub fn transposeF32(self: *Gpu, src: []const f32, rows: usize, cols: usize, rows_padded: usize, cols_padded: usize) Error![]f32 {
+        const dst = try self.scratch(f32, rows_padded * cols_padded);
+        const args = pack(ga.PackArgs, .{ .rows = rows, .cols = cols, .rows_padded = rows_padded, .cols_padded = cols_padded, .src_stride = rows, .transpose = true });
+        try self.launch(.transposeF32, .{ toU32(cols_padded / 32), toU32(rows_padded / 32), 1 }, .{ src, dst, args });
+        return dst;
+    }
+
+    pub fn convTf32Forward(self: *Gpu, x: []const f32, w: []const f32, w_pitch: usize, out: []f32, geo: ga.ConvGeometry, c_out: usize, accumulate: bool) Error!void {
+        const m = @as(usize, geo.n) * geo.out_h * geo.out_w;
+        const k_total = @as(usize, geo.k) * geo.k * geo.c;
+        const kernel_shape = pack(ga.TensorShape, .{ .m = m, .n = c_out, .k_padded = k_total, .n_padded = w_pitch, .accumulate = accumulate, .chunk = k_total, .transpose_out = false, .output_half = false });
+        try self.launch(.convTf32Forward, .{ ceilDiv(c_out, 64), ceilDiv(m, 128), 1 }, .{ x, w, out, kernel_shape, geo });
+    }
+
+    pub fn convTf32WeightGrad(self: *Gpu, dy_t: []const f32, positions_padded: usize, x: []const f32, out: []f32, geo: ga.ConvGeometry, c_out: usize, taps: usize) Error!void {
+        const blocks = @as(usize, ceilDiv(c_out, 128)) * ceilDiv(taps, 64);
+        const splits = @max(1, @min(positions_padded / 256, (128 + blocks - 1) / blocks));
+        const chunk = std.mem.alignForward(usize, (positions_padded + splits - 1) / splits, 16);
+        const kernel_shape = pack(ga.TensorShape, .{ .m = c_out, .n = taps, .k_padded = positions_padded, .n_padded = taps, .accumulate = true, .chunk = chunk, .transpose_out = true, .output_half = false });
+        try self.launch(.convTf32WeightGrad, .{ ceilDiv(taps, 64), ceilDiv(c_out, 128), ceilDiv(positions_padded, chunk) }, .{ dy_t, x, out, kernel_shape, geo });
     }
 
     pub fn packRotatedWeights(self: *Gpu, w: []const f32, k: usize, c_in: usize, c_out: usize) Error!Packed {

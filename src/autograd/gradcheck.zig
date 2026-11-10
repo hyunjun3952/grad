@@ -50,7 +50,7 @@ pub fn expectFiniteDifferences(comptime Case: type, seed: u64, eps: f32, toleran
     }
 }
 
-const Backend = enum { builtin, tensor_cores, cudnn };
+const Backend = enum { builtin, tensor_cores, tf32, cudnn };
 
 pub fn expectGpuMatchesCpu(comptime Case: type, seed: u64, tolerance: f32) !void {
     return compareWithGpu(Case, seed, tolerance, .builtin);
@@ -58,6 +58,10 @@ pub fn expectGpuMatchesCpu(comptime Case: type, seed: u64, tolerance: f32) !void
 
 pub fn expectTensorCoresClose(comptime Case: type, seed: u64, tolerance: f32) !void {
     return compareWithGpu(Case, seed, tolerance, .tensor_cores);
+}
+
+pub fn expectTf32Close(comptime Case: type, seed: u64, tolerance: f32) !void {
+    return compareWithGpu(Case, seed, tolerance, .tf32);
 }
 
 pub fn expectCudnnClose(comptime Case: type, seed: u64, tolerance: f32) !void {
@@ -71,6 +75,7 @@ fn compareWithGpu(comptime Case: type, seed: u64, tolerance: f32, backend: Backe
     };
     defer gpu.deinit();
     gpu.tensor_cores = backend == .tensor_cores;
+    gpu.tf32 = backend == .tf32;
     gpu.tensor_core_min_work = 0;
     if (backend == .cudnn) gpu.enableCudnn("data/cudnn") catch |err| switch (err) {
         error.CudnnNotFound => return error.SkipZigTest,

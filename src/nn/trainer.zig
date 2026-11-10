@@ -78,6 +78,7 @@ fn Runner(comptime Spec: type) type {
             var use_gpu = false;
             var profile = false;
             var tensor_cores = false;
+            var tf32 = false;
             var cudnn_dir: ?[:0]const u8 = null;
             var force_progress = false;
             var smoothing: f32 = 0;
@@ -101,6 +102,8 @@ fn Runner(comptime Spec: type) type {
                     cudnn_dir = "data/cudnn";
                 } else if (std.mem.startsWith(u8, arg, "--cudnn=")) {
                     cudnn_dir = arg["--cudnn=".len..];
+                } else if (std.mem.eql(u8, arg, "--tf32")) {
+                    tf32 = true;
                 } else if (std.mem.eql(u8, arg, "--tensor-cores")) {
                     tensor_cores = true;
                 } else if (std.mem.eql(u8, arg, "--flip")) {
@@ -134,6 +137,7 @@ fn Runner(comptime Spec: type) type {
             if (gpu) |dev| {
                 if (profile) dev.startProfile(io);
                 dev.tensor_cores = tensor_cores;
+                dev.tf32 = tf32;
                 if (cudnn_dir) |dir| dev.enableCudnn(dir) catch |err| try out.print("cuDNN unavailable ({s}), using the built-in kernels\n", .{@errorName(err)});
             }
             const threads = std.Thread.getCpuCount() catch 1;

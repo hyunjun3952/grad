@@ -375,7 +375,7 @@ fn implicitGemm(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
         .{ .name = "stage 2: 64x16x16, 128->128", .n = 64, .side = 16, .c_in = 128, .c_out = 128 },
         .{ .name = "stage 3: 64x8x8, 256->256", .n = 64, .side = 8, .c_in = 256, .c_out = 256 },
     };
-    try out.print("implicit-GEMM 3x3 convolution kernels (bf16 in, f32 out), kernel only, best of 20\n{s:<30}{s:>14}{s:>14}\n", .{ "case", "forward TFLOPS", "dW TFLOPS" });
+    try out.print("implicit-GEMM 3x3 convolution kernels (bf16 in, f32 out), kernel only, best of 20\n{s:<30}{s:>14}{s:>14}{s:>14}{s:>14}\n", .{ "case", "bf16 forward", "bf16 dW", "tf32 forward", "tf32 dW" });
     for (cases) |case| {
         const rows: usize = case.n * case.side * case.side;
         const kc: usize = 9 * case.c_in;
@@ -408,7 +408,21 @@ fn implicitGemm(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
             const ns: f64 = @floatFromInt(Io.Clock.awake.now(io).nanoseconds - t0.nanoseconds);
             tflops[variant] = flops * 20 / ns / 1000;
         }
-        try out.print("{s:<30}{d:>14.2}{d:>14.2}\n", .{ case.name, tflops[0], tflops[1] });
+        const positions_padded = std.mem.alignForward(usize, rows, 32);
+        const dy_t32 = try dev.transposeF32(y, case.c_out, rows, std.mem.alignForward(usize, case.c_out, 32), positions_padded);
+        var tf32_rates: [2]f64 = undefined;
+        for (0..2) |variant| {
+            if (variant == 0) try dev.convTf32Forward(x, w, case.c_out, y, geo, case.c_out, false) else try dev.convTf32WeightGrad(dy_t32, positions_padded, x, dw, geo, case.c_out, kc);
+            try dev.cu.sync();
+            const t0 = Io.Clock.awake.now(io);
+            for (0..20) |_| {
+                if (variant == 0) try dev.convTf32Forward(x, w, case.c_out, y, geo, case.c_out, false) else try dev.convTf32WeightGrad(dy_t32, positions_padded, x, dw, geo, case.c_out, kc);
+            }
+            try dev.cu.sync();
+            const ns: f64 = @floatFromInt(Io.Clock.awake.now(io).nanoseconds - t0.nanoseconds);
+            tf32_rates[variant] = flops * 20 / ns / 1000;
+        }
+        try out.print("{s:<30}{d:>14.2}{d:>14.2}{d:>14.2}{d:>14.2}\n", .{ case.name, tflops[0], tflops[1], tf32_rates[0], tf32_rates[1] });
     }
     try out.writeAll("\n");
 }
