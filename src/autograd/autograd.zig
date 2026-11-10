@@ -311,14 +311,28 @@ pub const Tape = struct {
         const Col = Tensor(f32, &.{ rows, k * k * In.shape[3] });
         const Flat = Tensor(f32, &.{ rows, Out.shape[3] });
 
-        const col = try self.newTensor(Col);
-        try self.convKernel(.im2col, .{ x.value.data, col.data }, d);
+        const channels_out = Out.shape[3];
+        const kc = k * k * In.shape[3];
+        const dev = self.par.gpu;
+        const packed_path = if (dev) |g| g.tensorWorthwhile(rows, channels_out, kc) else false;
         const value = try self.newTensor(Out);
-        try tensor.matmulInto(self.gpa, self.par, col, w.value, Flat{ .data = value.data }, .{});
+        var col: Col = undefined;
+        var col_half: ?gpu_mod.Gpu.Packed = null;
+        if (packed_path) {
+            const g = dev.?;
+            const half = try g.im2colPacked(x.value.data, d);
+            const w_half = try g.packMatrix(w.value.data, kc, channels_out, half.cols_padded, std.mem.alignForward(usize, channels_out, 64), false);
+            try g.matmulPacked(half, w_half, value.data, .{ .m = rows, .n = channels_out, .k = kc }, false, false);
+            col_half = half;
+        } else {
+            col = try self.newTensor(Col);
+            try self.convKernel(.im2col, .{ x.value.data, col.data }, d);
+            try tensor.matmulInto(self.gpa, self.par, col, w.value, Flat{ .data = value.data }, .{});
+        }
         const out = try self.makeVar(value, x.needs_grad or w.needs_grad);
 
-        const Ctx = struct { x: @TypeOf(x), w: @TypeOf(w), col: Col, out: @TypeOf(out) };
-        if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .w = w, .col = col, .out = out }, struct {
+        const Ctx = struct { x: @TypeOf(x), w: @TypeOf(w), col: Col, col_half: ?gpu_mod.Gpu.Packed, out: @TypeOf(out) };
+        if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .w = w, .col = col, .col_half = col_half, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
                 const grad: Flat = .{ .data = c.out.grad.data };
                 if (c.x.needs_grad) {
@@ -326,12 +340,20 @@ pub const Tape = struct {
                     try tensor.matmulInto(t.gpa, t.par, grad, c.w.value, dcol, .{ .trans_b = true });
                     try t.convKernel(.col2im, .{ dcol.data, c.x.grad.data }, d);
                 }
-                if (c.w.needs_grad) try tensor.matmulInto(t.gpa, t.par, c.col, grad, c.w.grad, .{ .trans_a = true, .accumulate = true });
+                if (!c.w.needs_grad) return;
+                if (c.col_half) |half| {
+                    const g = t.par.gpu.?;
+                    const mark = g.step_used;
+                    defer g.step_used = mark;
+                    const grad_t = try g.packMatrix(grad.data, channels_out, rows, std.mem.alignForward(usize, channels_out, 128), half.rows_padded, true);
+                    try g.matmulPacked(grad_t, half, c.w.grad.data, .{ .m = channels_out, .n = kc, .k = rows }, true, true);
+                } else {
+                    try tensor.matmulInto(t.gpa, t.par, c.col, grad, c.w.grad, .{ .trans_a = true, .accumulate = true });
+                }
             }
         }.run);
         return out;
     }
-
     pub fn maxPool(self: *Tape, x: anytype) Error!Var(PoolOut(@TypeOf(x.value))) {
         const In = @TypeOf(x.value);
         const d: conv.Dims = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = In.shape[3], .k = 2 };
@@ -733,6 +755,7 @@ const BnCase = struct {
 
 test "gpu and cpu agree on a small network" {
     try gradcheck.expectGpuMatchesCpu(SmallNet, 21, 1e-5);
+    try gradcheck.expectTensorCoresClose(SmallNet, 21, 3e-2);
 }
 
 test "gradients of a small network match finite differences" {
@@ -742,6 +765,7 @@ test "gradients of a small network match finite differences" {
 test "gradients of a convolution, pooling and linear network match finite differences and the gpu" {
     try gradcheck.expectFiniteDifferences(ConvPoolNet, 5, 1e-3, 3e-3);
     try gradcheck.expectGpuMatchesCpu(ConvPoolNet, 8, 1e-5);
+    try gradcheck.expectTensorCoresClose(ConvPoolNet, 8, 3e-2);
 }
 
 test "conv2d with padding and stride matches a direct convolution, finite differences and the gpu" {
@@ -749,6 +773,7 @@ test "conv2d with padding and stride matches a direct convolution, finite differ
         try ConvCase(opts).expectDirectConvolution();
         try gradcheck.expectFiniteDifferences(ConvCase(opts), 31, 1e-3, 3e-3);
         try gradcheck.expectGpuMatchesCpu(ConvCase(opts), 32, 1e-5);
+        try gradcheck.expectTensorCoresClose(ConvCase(opts), 32, 3e-2);
     }
 }
 

@@ -430,6 +430,19 @@ const tensor_core = struct {
         return p.*;
     }
 
+    inline fn swizzled(n: usize, k: usize) usize {
+        return (n * (stride / 2) + ((k / 2) ^ ((n / 8) % 8))) * 2 + k % 2;
+    }
+
+    inline fn fetch(a_src: [*]const u16, b_src: [*]const u16, a_regs: *[2][4]u32, b_regs: *[4]u32) void {
+        inline for (0..2) |chunk| {
+            const p: [*]const u32 = @ptrCast(@alignCast(a_src + 8 * chunk));
+            inline for (0..4) |i| a_regs[chunk][i] = p[i];
+        }
+        const q: [*]const u32 = @ptrCast(@alignCast(b_src));
+        inline for (0..4) |i| b_regs[i] = q[i];
+    }
+
     inline fn mma(acc: *[4]f32, a: [4]u32, b: [2]u32) void {
         var d0 = acc[0];
         var d1 = acc[1];
@@ -465,6 +478,16 @@ const transpose_tile = struct {
     var values: [32 * 33]f32 addrspace(.shared) = undefined;
 };
 
+export fn im2colHalf(x: [*]const f32, dst: [*]u16, d: cv.Dims, cols_padded: u32) callconv(.nvptx_kernel) void {
+    const row: u32 = @workGroupId(0);
+    const real = row < d.n * cv.outHeight(d) * cv.outWidth(d);
+    const patch = cv.patchOf(row, d);
+    const kc = d.k * d.k * d.c;
+    var cc: u32 = @workItemId(0);
+    while (cc < cols_padded) : (cc += threads) {
+        dst[@as(usize, row) * cols_padded + cc] = if (real and cc < kc) bf16.encode(cv.patchValue(x, patch, cc, d)) else 0;
+    }
+}
 export fn packHalfTransposed(src: [*]const f32, dst: [*]u16, args: ga.PackArgs) callconv(.nvptx_kernel) void {
     const tid: usize = @workItemId(0);
     const lane = tid % 32;
@@ -500,25 +523,25 @@ export fn sgemmTensor(a: [*]const u16, b: [*]const u16, c: [*]f32, shape: ga.Ten
     const k_end = @min(K, k_begin + shape.chunk);
 
     var acc: [2][4][4]f32 = @splat(@splat(@splat(0)));
+    const a_row = tid / 2;
+    const a_col = (tid % 2) * 16;
+    const b_k = tid / 8;
+    const b_n = (tid % 8) * 8;
+    var a_regs: [2][4]u32 = undefined;
+    var b_regs: [4]u32 = undefined;
+    if (k_begin < k_end) tc.fetch(a + (row0 + a_row) * K + k_begin + a_col, b + (k_begin + b_k) * NP + col0 + b_n, &a_regs, &b_regs);
     var kk = k_begin;
     while (kk < k_end) : (kk += tc.depth) {
-        const a_row = tid / 2;
-        const a_col = (tid % 2) * 16;
         inline for (0..2) |chunk| {
-            const src: [*]const u32 = @ptrCast(@alignCast(a + (row0 + a_row) * K + kk + a_col + 8 * chunk));
             const dst: [*]addrspace(.shared) u32 = @ptrCast(@alignCast(&tc.tile_a[a_row * tc.stride + a_col + 8 * chunk]));
-            inline for (0..4) |i| dst[i] = src[i];
+            inline for (0..4) |i| dst[i] = a_regs[chunk][i];
         }
-
-        const b_k = tid / 8;
-        const b_n = (tid % 8) * 8;
-        const b_src: [*]const u32 = @ptrCast(@alignCast(b + (kk + b_k) * NP + col0 + b_n));
         inline for (0..4) |i| {
-            tc.tile_b[(b_n + 2 * i) * tc.stride + b_k] = @truncate(b_src[i]);
-            tc.tile_b[(b_n + 2 * i + 1) * tc.stride + b_k] = @truncate(b_src[i] >> 16);
+            tc.tile_b[tc.swizzled(b_n + 2 * i, b_k)] = @truncate(b_regs[i]);
+            tc.tile_b[tc.swizzled(b_n + 2 * i + 1, b_k)] = @truncate(b_regs[i] >> 16);
         }
         barrier();
-
+        if (kk + tc.depth < k_end) tc.fetch(a + (row0 + a_row) * K + kk + tc.depth + a_col, b + (kk + tc.depth + b_k) * NP + col0 + b_n, &a_regs, &b_regs);
         inline for (0..tc.depth / 16) |step| {
             var a_frag: [2][4]u32 = undefined;
             inline for (0..2) |mi| {
@@ -526,8 +549,9 @@ export fn sgemmTensor(a: [*]const u16, b: [*]const u16, c: [*]f32, shape: ga.Ten
                 a_frag[mi] = .{ tc.word(&tc.tile_a, base), tc.word(&tc.tile_a, base + 8 * tc.stride), tc.word(&tc.tile_a, base + 8), tc.word(&tc.tile_a, base + 8 * tc.stride + 8) };
             }
             inline for (0..4) |ni| {
-                const base = (warp_col * 32 + ni * 8 + lane / 4) * tc.stride + step * 16 + (lane % 4) * 2;
-                const b_frag: [2]u32 = .{ tc.word(&tc.tile_b, base), tc.word(&tc.tile_b, base + 8) };
+                const n = warp_col * 32 + ni * 8 + lane / 4;
+                const k = step * 16 + (lane % 4) * 2;
+                const b_frag: [2]u32 = .{ tc.word(&tc.tile_b, tc.swizzled(n, k)), tc.word(&tc.tile_b, tc.swizzled(n, k + 8)) };
                 inline for (0..2) |mi| tc.mma(&acc[mi][ni], a_frag[mi], b_frag);
             }
         }
@@ -540,10 +564,11 @@ export fn sgemmTensor(a: [*]const u16, b: [*]const u16, c: [*]f32, shape: ga.Ten
                 const r = row0 + warp_row * 32 + mi * 16 + lane / 4 + (q / 2) * 8;
                 const col = col0 + warp_col * 32 + ni * 8 + (lane % 4) * 2 + q % 2;
                 if (r < M and col < N) {
+                    const at = if (shape.transpose_out != 0) col * M + r else r * N + col;
                     if (shape.chunk < K) {
-                        _ = @atomicRmw(f32, &c[r * N + col], .Add, acc[mi][ni][q], .monotonic);
+                        _ = @atomicRmw(f32, &c[at], .Add, acc[mi][ni][q], .monotonic);
                     } else {
-                        c[r * N + col] = if (shape.accumulate != 0) c[r * N + col] + acc[mi][ni][q] else acc[mi][ni][q];
+                        c[at] = if (shape.accumulate != 0) c[at] + acc[mi][ni][q] else acc[mi][ni][q];
                     }
                 }
             }

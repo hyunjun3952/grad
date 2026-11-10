@@ -199,15 +199,15 @@ pub fn ConvBn(comptime c_in: usize, comptime c_out: usize, comptime k: usize, co
         }
 
         pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(Tensor(f32, &.{ @TypeOf(x.value).shape[0], (@TypeOf(x.value).shape[1] + 2 * opts.pad - k) / opts.stride + 1, (@TypeOf(x.value).shape[2] + 2 * opts.pad - k) / opts.stride + 1, c_out })) {
-            return self.norm.forward(tape, try self.conv.forward(tape, x));
+            return self.norm.forward(tape, try tape.conv2d(x, self.conv.inner.w, opts));
         }
 
-        pub fn params(self: Self) @TypeOf(self.conv.params() ++ self.norm.params()) {
-            return self.conv.params() ++ self.norm.params();
+        pub fn params(self: Self) @TypeOf(.{self.conv.inner.w} ++ self.norm.params()) {
+            return .{self.conv.inner.w} ++ self.norm.params();
         }
 
-        pub fn state(self: Self) @TypeOf(self.conv.state() ++ self.norm.state()) {
-            return self.conv.state() ++ self.norm.state();
+        pub fn state(self: Self) @TypeOf(.{self.conv.inner.w.value.data} ++ self.norm.state()) {
+            return .{self.conv.inner.w.value.data} ++ self.norm.state();
         }
     };
 }
@@ -271,13 +271,13 @@ test "layer tuples initialise, concatenate parameters and state in order, and fr
     defer deinitAll(layers, testing.allocator);
 
     const all_params = params(layers);
-    try testing.expectEqual(@as(usize, 10), all_params.len);
+    try testing.expectEqual(@as(usize, 9), all_params.len);
     try testing.expectEqual(layers[0].w.value.data.ptr, all_params[0].value.data.ptr);
     try testing.expectEqual(layers[1].gamma.value.data.ptr, all_params[2].value.data.ptr);
     try testing.expectEqual(layers[2].inner.b.value.data.ptr, all_params[5].value.data.ptr);
 
     const all_state = state(layers);
-    try testing.expectEqual(@as(usize, 14), all_state.len);
+    try testing.expectEqual(@as(usize, 13), all_state.len);
     try testing.expectEqual(layers[1].variance.data.ptr, all_state[5].ptr);
     try testing.expectEqual(@as(usize, 2 * 3), all_state[0].len);
 }

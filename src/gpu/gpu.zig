@@ -33,6 +33,7 @@ const Kernel = enum {
     sgemmSmallTN,
     packHalf,
     packHalfTransposed,
+    im2colHalf,
     sgemmTensor,
     elementwise,
     relu,
@@ -281,7 +282,7 @@ pub const Gpu = struct {
 
     pub fn matmul(self: *Gpu, a: []const f32, b: []const f32, out: []f32, shape: MatmulShape, opts: MatmulOpts) Error!void {
         std.debug.assert(!(opts.trans_a and opts.trans_b));
-        if (self.tensor_cores and shape.m * shape.n * shape.k >= self.tensor_core_min_work) return self.matmulTensor(a, b, out, shape, opts);
+        if (self.tensorWorthwhile(shape.m, shape.n, shape.k)) return self.matmulTensor(a, b, out, shape, opts);
         const tile: usize = if (shape.n <= 32 and shape.m <= 64) 2 else if (shape.n <= 32) 1 else 0;
         const transpose: usize = if (opts.trans_a) 2 else if (opts.trans_b) 1 else 0;
         const kernel: Kernel = @fromBackingInt(@backingInt(Kernel.sgemmNN) + @as(u5, @intCast(tile * 3 + transpose)));
@@ -295,28 +296,49 @@ pub const Gpu = struct {
         try self.launch(kernel, .{ ceilDiv(shape.n, tile_n), ceilDiv(shape.m, tile_m), ceilDiv(shape.k, chunk) }, .{ a, b, out, kernel_shape });
     }
 
-    fn packOperand(self: *Gpu, src: []const f32, dst: []u16, rows: usize, cols: usize, rows_padded: usize, cols_padded: usize, transpose: bool) Error!void {
+    pub const Packed = struct { data: []u16, rows_padded: usize, cols_padded: usize };
+
+    pub fn tensorWorthwhile(self: *Gpu, m: usize, n: usize, k: usize) bool {
+        return self.tensor_cores and m * n * k >= self.tensor_core_min_work;
+    }
+
+    pub fn packMatrix(self: *Gpu, src: []const f32, rows: usize, cols: usize, rows_padded: usize, cols_padded: usize, transpose: bool) Error!Packed {
+        const dst = try self.scratch(u16, rows_padded * cols_padded);
         const args = pack(ga.PackArgs, .{ .rows = rows, .cols = cols, .rows_padded = rows_padded, .cols_padded = cols_padded, .src_stride = if (transpose) rows else cols, .transpose = transpose });
-        if (transpose) return self.launch(.packHalfTransposed, .{ toU32(cols_padded / 32), toU32(rows_padded / 32), 1 }, .{ src, dst, args });
-        try self.launchFlat(.packHalf, rows_padded * cols_padded, .{ src, dst, args });
+        if (transpose) {
+            try self.launch(.packHalfTransposed, .{ toU32(cols_padded / 32), toU32(rows_padded / 32), 1 }, .{ src, dst, args });
+        } else {
+            try self.launchFlat(.packHalf, rows_padded * cols_padded, .{ src, dst, args });
+        }
+        return .{ .data = dst, .rows_padded = rows_padded, .cols_padded = cols_padded };
+    }
+
+    pub fn im2colPacked(self: *Gpu, x: []const f32, d: conv.Dims) Error!Packed {
+        const rows = conv.workItems(.im2col, d) / (d.k * d.k * d.c);
+        const rows_padded = std.mem.alignForward(usize, rows, 128);
+        const cols_padded = std.mem.alignForward(usize, d.k * d.k * d.c, 64);
+        const dst = try self.scratch(u16, rows_padded * cols_padded);
+        try self.launch(.im2colHalf, .{ toU32(rows_padded), 1, 1 }, .{ x, dst, d, cols_padded });
+        return .{ .data = dst, .rows_padded = rows_padded, .cols_padded = cols_padded };
+    }
+
+    pub fn matmulPacked(self: *Gpu, a: Packed, b: Packed, out: []f32, shape: MatmulShape, accumulate: bool, transpose_out: bool) Error!void {
+        std.debug.assert(a.cols_padded == b.rows_padded and a.rows_padded % 128 == 0 and b.cols_padded % 64 == 0 and a.cols_padded % 32 == 0);
+        const blocks = (a.rows_padded / 128) * (b.cols_padded / 64);
+        const splits = @max(1, @min(a.cols_padded / 256, (128 + blocks - 1) / blocks));
+        const chunk = std.mem.alignForward(usize, (a.cols_padded + splits - 1) / splits, 32);
+        if (chunk < a.cols_padded and !accumulate) try self.fill(out, 0);
+        const kernel_shape = pack(ga.TensorShape, .{ .m = shape.m, .n = shape.n, .k_padded = a.cols_padded, .n_padded = b.cols_padded, .accumulate = accumulate, .chunk = chunk, .transpose_out = transpose_out });
+        try self.launch(.sgemmTensor, .{ toU32(b.cols_padded / 64), toU32(a.rows_padded / 128), ceilDiv(a.cols_padded, chunk) }, .{ a.data, b.data, out, kernel_shape });
     }
 
     fn matmulTensor(self: *Gpu, a: []const f32, b: []const f32, out: []f32, shape: MatmulShape, opts: MatmulOpts) Error!void {
-        const m_padded = std.mem.alignForward(usize, shape.m, 128);
-        const k_padded = std.mem.alignForward(usize, shape.k, 32);
-        const n_padded = std.mem.alignForward(usize, shape.n, 64);
         const mark = self.step_used;
         defer self.step_used = mark;
-        const a_half = try self.scratch(u16, m_padded * k_padded);
-        const b_half = try self.scratch(u16, k_padded * n_padded);
-        try self.packOperand(a, a_half, shape.m, shape.k, m_padded, k_padded, opts.trans_a);
-        try self.packOperand(b, b_half, shape.k, shape.n, k_padded, n_padded, opts.trans_b);
-        const blocks = (m_padded / 128) * (n_padded / 64);
-        const splits = @max(1, @min(k_padded / 256, (128 + blocks - 1) / blocks));
-        const chunk = std.mem.alignForward(usize, (k_padded + splits - 1) / splits, 32);
-        if (chunk < k_padded and !opts.accumulate) try self.fill(out, 0);
-        const kernel_shape = pack(ga.TensorShape, .{ .m = shape.m, .n = shape.n, .k_padded = k_padded, .n_padded = n_padded, .accumulate = opts.accumulate, .chunk = chunk });
-        try self.launch(.sgemmTensor, .{ toU32(n_padded / 64), toU32(m_padded / 128), ceilDiv(k_padded, chunk) }, .{ a_half, b_half, out, kernel_shape });
+        const k_padded = std.mem.alignForward(usize, shape.k, 32);
+        const a_packed = try self.packMatrix(a, shape.m, shape.k, std.mem.alignForward(usize, shape.m, 128), k_padded, opts.trans_a);
+        const b_packed = try self.packMatrix(b, shape.k, shape.n, k_padded, std.mem.alignForward(usize, shape.n, 64), opts.trans_b);
+        try self.matmulPacked(a_packed, b_packed, out, shape, opts.accumulate, false);
     }
     pub fn elementwise(self: *Gpu, op: BinaryOp, a: []const f32, b: []const f32, out: []f32, plan: BroadcastPlan) Error!void {
         const args = pack(ga.ElementwiseArgs, .{ .len = out.len, .multiply = op == .mul, .dims = plan.dims, .a_strides = plan.a_strides, .b_strides = plan.b_strides });

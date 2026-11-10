@@ -22,24 +22,29 @@ pub fn workItems(op: Op, d: Dims) usize {
     };
 }
 
-pub inline fn im2col(t: Index, x: [*]const f32, col: [*]f32, d: Dims) void {
-    const kc = d.k * d.k * d.c;
+pub const Patch = struct { n: Index, top: Index, left: Index };
+
+pub inline fn patchOf(row: Index, d: Dims) Patch {
     const ow = outWidth(d);
     const oh = outHeight(d);
-    const row = t / kc;
-    const cc = t % kc;
-    const ch = cc % d.c;
-    const kx = (cc / d.c) % d.k;
-    const ky = cc / d.c / d.k;
-    const ox = row % ow;
-    const oy = row / ow % oh;
-    const n = row / ow / oh;
-    const py = oy * d.stride + ky;
-    const px = ox * d.stride + kx;
-    const inside = py >= d.pad and px >= d.pad and py - d.pad < d.h and px - d.pad < d.w;
-    col[t] = if (inside) x[((n * d.h + py - d.pad) * d.w + px - d.pad) * d.c + ch] else 0;
+    return .{ .n = row / ow / oh, .top = row / ow % oh * d.stride, .left = row % ow * d.stride };
 }
 
+pub inline fn patchValue(x: [*]const f32, patch: Patch, cc: Index, d: Dims) f32 {
+    const tap = cc / d.c;
+    const py = patch.top + tap / d.k;
+    const px = patch.left + tap % d.k;
+    const inside = py >= d.pad and px >= d.pad and py - d.pad < d.h and px - d.pad < d.w;
+    return if (inside) x[((patch.n * d.h + py - d.pad) * d.w + px - d.pad) * d.c + cc % d.c] else 0;
+}
+
+pub inline fn im2colValue(x: [*]const f32, row: Index, cc: Index, d: Dims) f32 {
+    return patchValue(x, patchOf(row, d), cc, d);
+}
+pub inline fn im2col(t: Index, x: [*]const f32, col: [*]f32, d: Dims) void {
+    const kc = d.k * d.k * d.c;
+    col[t] = im2colValue(x, t / kc, t % kc, d);
+}
 pub inline fn col2im(t: Index, dcol: [*]const f32, dx: [*]f32, d: Dims) void {
     const kc = d.k * d.k * d.c;
     const ow = outWidth(d);
@@ -51,11 +56,15 @@ pub inline fn col2im(t: Index, dcol: [*]const f32, dx: [*]f32, d: Dims) void {
     var total: f32 = 0;
     var ky: Index = 0;
     while (ky < d.k) : (ky += 1) {
-        if (y < ky or (y - ky) % d.stride != 0 or (y - ky) / d.stride >= oh) continue;
+        if (y < ky or (d.stride != 1 and (y - ky) % d.stride != 0)) continue;
+        const oy = if (d.stride == 1) y - ky else (y - ky) / d.stride;
+        if (oy >= oh) continue;
         var kx: Index = 0;
         while (kx < d.k) : (kx += 1) {
-            if (x < kx or (x - kx) % d.stride != 0 or (x - kx) / d.stride >= ow) continue;
-            const row = (n * oh + (y - ky) / d.stride) * ow + (x - kx) / d.stride;
+            if (x < kx or (d.stride != 1 and (x - kx) % d.stride != 0)) continue;
+            const ox = if (d.stride == 1) x - kx else (x - kx) / d.stride;
+            if (ox >= ow) continue;
+            const row = (n * oh + oy) * ow + ox;
             total += dcol[row * kc + (ky * d.k + kx) * d.c + ch];
         }
     }
