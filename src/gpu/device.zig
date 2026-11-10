@@ -241,8 +241,9 @@ export fn columnReduce(
             const v = a[r * c + ch];
             if (kind == 0) {
                 first += v;
-            } else if (kind == 1) {
-                first += (v - m) * (v - m);
+            } else if (kind == 2) {
+                first += v - m;
+                second += (v - m) * (v - m);
             } else {
                 first += v;
                 second += v * ((b[r * c + ch] - m) * s);
@@ -260,11 +261,11 @@ export fn columnReduce(
             total_second += column.second[lane + 32 * g];
         }
         _ = @atomicRmw(f32, &out[ch], .Add, total_first, .monotonic);
-        if (kind == 2) _ = @atomicRmw(f32, &out[c + ch], .Add, total_second, .monotonic);
+        if (kind != 0) _ = @atomicRmw(f32, &out[c + ch], .Add, total_second, .monotonic);
     }
 }
 
-export fn batchNormFinish(sums: [*]const f32, mean: [*]f32, inv_std: [*]f32, running_mean: [*]f32, running_var: [*]f32, rows: u32, c: u32, training: u32) callconv(.nvptx_kernel) void {
+export fn batchNormFinish(sums: [*]const f32, shift: [*]const f32, mean: [*]f32, inv_std: [*]f32, running_mean: [*]f32, running_var: [*]f32, rows: u32, c: u32, training: u32) callconv(.nvptx_kernel) void {
     const ch = globalIndex();
     if (ch >= c) return;
     if (training == 0) {
@@ -273,8 +274,9 @@ export fn batchNormFinish(sums: [*]const f32, mean: [*]f32, inv_std: [*]f32, run
         return;
     }
     const n: f32 = @floatFromInt(rows);
-    const mu = sums[ch] / n;
-    const variance = sums[c + ch] / n;
+    const offset = sums[ch] / n;
+    const mu = shift[ch] + offset;
+    const variance = @max(sums[c + ch] / n - offset * offset, 0);
     mean[ch] = mu;
     inv_std[ch] = 1 / @sqrt(variance + nm.eps);
     running_mean[ch] += nm.momentum * (mu - running_mean[ch]);
@@ -339,6 +341,10 @@ export fn im2col(x: [*]const f32, col: [*]f32, len: u32, d: cv.Dims) callconv(.n
 
 export fn col2im(dcol: [*]const f32, dx: [*]f32, len: u32, d: cv.Dims) callconv(.nvptx_kernel) void {
     if (globalIndex() < len) cv.col2im(@intCast(globalIndex()), dcol, dx, d);
+}
+
+export fn col2imHalf(dcol: [*]const u16, dx: [*]f32, len: u32, d: cv.Dims) callconv(.nvptx_kernel) void {
+    if (globalIndex() < len) cv.col2imHalf(@intCast(globalIndex()), dcol, dx, d);
 }
 
 export fn maxPool(x: [*]const f32, out: [*]f32, len: u32, d: cv.Dims) callconv(.nvptx_kernel) void {
@@ -528,9 +534,19 @@ export fn im2colHalf(x: [*]const f32, dst: [*]u16, d: cv.Dims, cols_padded: u32)
     const real = row < d.n * cv.outHeight(d) * cv.outWidth(d);
     const patch = cv.patchOf(row, d);
     const kc = d.k * d.k * d.c;
-    var cc: u32 = @workItemId(0);
-    while (cc < cols_padded) : (cc += threads) {
-        dst[@as(usize, row) * cols_padded + cc] = if (real and cc < kc) bf16.encode(cv.patchValue(x, patch, cc, d)) else 0;
+    const line = dst + @as(usize, row) * cols_padded;
+    if (d.c % 4 == 0) {
+        var cc: u32 = @workItemId(0) * 4;
+        while (cc < cols_padded) : (cc += threads * 4) {
+            const values: @Vector(4, f32) = if (real and cc < kc) cv.patchValues(x, patch, cc, d) else @splat(0);
+            const packed_pair: *align(8) u64 = @ptrCast(@alignCast(line + cc));
+            packed_pair.* = @as(u64, bf16.encode(values[0])) | @as(u64, bf16.encode(values[1])) << 16 | @as(u64, bf16.encode(values[2])) << 32 | @as(u64, bf16.encode(values[3])) << 48;
+        }
+    } else {
+        var cc: u32 = @workItemId(0);
+        while (cc < cols_padded) : (cc += threads) {
+            line[cc] = if (real and cc < kc) bf16.encode(cv.patchValue(x, patch, cc, d)) else 0;
+        }
     }
 }
 export fn packHalfTransposed(src: [*]const f32, dst: [*]u16, args: ga.PackArgs) callconv(.nvptx_kernel) void {
@@ -631,7 +647,10 @@ export fn sgemmTensor(a: [*]const u16, b: [*]const u16, c: [*]f32, shape: ga.Ten
                 const col = col0 + warp_col * 32 + ni * 8 + (lane % 4) * 2 + q % 2;
                 if (r < M and col < N) {
                     const at = if (shape.transpose_out != 0) col * M + r else r * N + col;
-                    if (shape.chunk < K) {
+                    if (shape.output_half != 0) {
+                        const half_out: [*]u16 = @ptrCast(@alignCast(c));
+                        half_out[at] = bf16.encode(acc[mi][ni][q]);
+                    } else if (shape.chunk < K) {
                         _ = @atomicRmw(f32, &c[at], .Add, acc[mi][ni][q], .monotonic);
                     } else {
                         c[at] = if (shape.accumulate != 0) c[at] + acc[mi][ni][q] else acc[mi][ni][q];

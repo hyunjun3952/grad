@@ -336,7 +336,16 @@ pub const Tape = struct {
         if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .w = w, .col = col, .col_half = col_half, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
                 const grad: Flat = .{ .data = c.out.grad.data };
-                if (c.x.needs_grad) {
+                if (c.x.needs_grad and c.col_half != null) {
+                    const g = t.par.gpu.?;
+                    const mark = g.step_used;
+                    defer g.step_used = mark;
+                    const grad_packed = try g.packMatrix(grad.data, rows, channels_out, std.mem.alignForward(usize, rows, 128), std.mem.alignForward(usize, channels_out, 32), false);
+                    const weight_packed = try g.packMatrix(c.w.value.data, channels_out, kc, std.mem.alignForward(usize, channels_out, 32), std.mem.alignForward(usize, kc, 64), true);
+                    const dcol_half = try g.scratch(u16, rows * kc);
+                    try g.matmulPacked(grad_packed, weight_packed, dcol_half, .{ .m = rows, .n = kc, .k = channels_out }, false, false);
+                    try t.convKernel(.col2imHalf, .{ dcol_half, c.x.grad.data }, d);
+                } else if (c.x.needs_grad) {
                     const dcol = try t.newTensor(Col);
                     try tensor.matmulInto(t.gpa, t.par, grad, c.w.value, dcol, .{ .trans_b = true });
                     try t.convKernel(.col2im, .{ dcol.data, c.x.grad.data }, d);
@@ -696,10 +705,10 @@ const ConvPoolNet = struct {
     }
 };
 
-fn ConvCase(comptime opts: ConvOpts) type {
+fn ConvCase(comptime opts: ConvOpts, comptime c_in: usize, comptime c_out: usize) type {
     return struct {
-        const In = Tensor(f32, &.{ 2, 5, 5, 2 });
-        const Wt = Tensor(f32, &.{ 18, 3 });
+        const In = Tensor(f32, &.{ 2, 5, 5, c_in });
+        const Wt = Tensor(f32, &.{ 9 * c_in, c_out });
         const Out = ConvOut(In, Wt, opts);
 
         pub const Inputs = struct { x: In, w: Wt };
@@ -727,19 +736,19 @@ fn ConvCase(comptime opts: ConvOpts) type {
             for (0..2) |n| {
                 for (0..oh) |oy| {
                     for (0..ow) |ox| {
-                        for (0..3) |oc| {
+                        for (0..c_out) |oc| {
                             var want: f32 = 0;
                             for (0..3) |ky| {
                                 for (0..3) |kx| {
                                     const py = oy * opts.stride + ky;
                                     const px = ox * opts.stride + kx;
                                     if (py < opts.pad or px < opts.pad or py - opts.pad >= 5 or px - opts.pad >= 5) continue;
-                                    for (0..2) |c| {
-                                        want += p.x.data[((n * 5 + py - opts.pad) * 5 + px - opts.pad) * 2 + c] * p.w.data[((ky * 3 + kx) * 2 + c) * 3 + oc];
+                                    for (0..c_in) |c| {
+                                        want += p.x.data[((n * 5 + py - opts.pad) * 5 + px - opts.pad) * c_in + c] * p.w.data[((ky * 3 + kx) * c_in + c) * c_out + oc];
                                     }
                                 }
                             }
-                            try testing.expectApproxEqAbs(want, run.y.value.data[((n * oh + oy) * ow + ox) * 3 + oc], 1e-5);
+                            try testing.expectApproxEqAbs(want, run.y.value.data[((n * oh + oy) * ow + ox) * c_out + oc], 1e-5);
                         }
                     }
                 }
@@ -807,13 +816,15 @@ test "gradients of a convolution, pooling and linear network match finite differ
 
 test "conv2d with padding and stride matches a direct convolution, finite differences and the gpu" {
     inline for (.{ ConvOpts{}, ConvOpts{ .stride = 1, .pad = 1 }, ConvOpts{ .stride = 2, .pad = 1 }, ConvOpts{ .stride = 2, .pad = 0 } }) |opts| {
-        try ConvCase(opts).expectDirectConvolution();
-        try gradcheck.expectFiniteDifferences(ConvCase(opts), 31, 1e-3, 3e-3);
-        try gradcheck.expectGpuMatchesCpu(ConvCase(opts), 32, 1e-5);
-        try gradcheck.expectTensorCoresClose(ConvCase(opts), 32, 3e-2);
+        inline for (.{ .{ 2, 3 }, .{ 4, 8 }, .{ 8, 4 } }) |channels| {
+            const Case = ConvCase(opts, channels[0], channels[1]);
+            try Case.expectDirectConvolution();
+            try gradcheck.expectFiniteDifferences(Case, 31, 1e-3, 3e-3);
+            try gradcheck.expectGpuMatchesCpu(Case, 32, 1e-5);
+            try gradcheck.expectTensorCoresClose(Case, 32, 3e-2);
+        }
     }
 }
-
 test "batch norm gradients match finite differences, and the gpu matches the cpu including running statistics" {
     try gradcheck.expectFiniteDifferences(BnCase, 41, 1e-3, 3e-3);
     try gradcheck.expectGpuMatchesCpu(BnCase, 43, 1e-5);

@@ -14,6 +14,18 @@ const Tensor = @import("../tensor/tensor.zig").Tensor;
 
 const Tape = autograd.Tape;
 
+fn printProgress(out: *Io.Writer, epoch: usize, epochs: usize, done: usize, steps: usize, loss: f64, elapsed_ns: i96, epochs_left: usize) !void {
+    const width = 24;
+    const filled = done * width / steps;
+    var bar: [width]u8 = undefined;
+    for (&bar, 0..) |*c, i| c.* = if (i < filled) '#' else '-';
+    const seconds: f64 = @as(f64, @floatFromInt(elapsed_ns)) / 1e9;
+    const per_step = seconds / @as(f64, @floatFromInt(done));
+    const remaining: u64 = @intFromFloat(per_step * @as(f64, @floatFromInt((steps - done) + epochs_left * steps)));
+    try out.print("\r\x1b[2Kepoch {d}/{d} [{s}] {d:>3}%  loss {d:.4}  {d:.1}s  eta {d}m{d:0>2}s", .{ epoch + 1, epochs, bar[0..], done * 100 / steps, loss, seconds, remaining / 60, remaining % 60 });
+    try out.flush();
+}
+
 fn Runner(comptime Spec: type) type {
     const pixels = Spec.side * Spec.side * Spec.channels;
 
@@ -66,6 +78,7 @@ fn Runner(comptime Spec: type) type {
             var use_gpu = false;
             var profile = false;
             var tensor_cores = false;
+            var force_progress = false;
             var smoothing: f32 = 0;
             var augment_config: augment_math.Config = .{ .channels = Spec.channels };
             var save_path: ?[]const u8 = null;
@@ -79,6 +92,8 @@ fn Runner(comptime Spec: type) type {
                     use_gpu = true;
                 } else if (std.mem.eql(u8, arg, "--profile")) {
                     profile = true;
+                } else if (std.mem.eql(u8, arg, "--progress")) {
+                    force_progress = true;
                 } else if (std.mem.startsWith(u8, arg, "--smoothing=")) {
                     smoothing = try std.fmt.parseFloat(f32, arg["--smoothing=".len..]);
                 } else if (std.mem.eql(u8, arg, "--tensor-cores")) {
@@ -159,6 +174,9 @@ fn Runner(comptime Spec: type) type {
 
             const steps = train.count() / Spec.batch;
             const stop_epoch = @min(until orelse epochs, epochs);
+            const progress = force_progress or try Io.File.stdout().isTty(io);
+            if (progress) Io.File.stdout().enableAnsiEscapeCodes(io) catch {};
+            const progress_every = @max(1, steps / 100);
             for (start_epoch..@max(start_epoch, stop_epoch)) |epoch| {
                 const started = Io.Clock.awake.now(io);
                 for (order, 0..) |*o, i| o.* = @intCast(i);
@@ -197,17 +215,22 @@ fn Runner(comptime Spec: type) type {
                     try tape.backward(loss);
                     try adam.step(par, params);
                     if (gpu) |dev| try dev.addInPlace(loss_total, loss.value.data) else loss_sum += loss.value.data[0];
+                    if (progress and ((step + 1) % progress_every == 0 or step + 1 == steps)) {
+                        const so_far = if (gpu) |dev| try dev.scalar(loss_total) else loss_sum;
+                        try printProgress(out, epoch, epochs, step + 1, steps, so_far / @as(f64, @floatFromInt(step + 1)), Io.Clock.awake.now(io).nanoseconds - started.nanoseconds, stop_epoch - epoch - 1);
+                    }
                 }
                 if (gpu) |dev| loss_sum = try dev.scalar(loss_total);
 
                 const seconds = @as(f64, @floatFromInt(Io.Clock.awake.now(io).nanoseconds - started.nanoseconds)) / 1e9;
                 const acc = try accuracy(gpa, par, model, test_data);
+                if (progress) try out.writeAll("\r\x1b[2K");
                 try out.print("epoch {d}/{d}  train loss {d:.4}  test accuracy {d:.2}%  ({d:.2} s)\n", .{ epoch + 1, epochs, loss_sum / @as(f64, @floatFromInt(steps)), acc, seconds });
                 try out.flush();
             }
             if (save_path) |path| {
-                const progress = [_]u32{ @intCast(@max(stop_epoch, start_epoch)), adam.t };
-                try checkpoint.save(gpa, io, path, gpu, nn.state(model) ++ adam.state(), &progress);
+                const counters = [_]u32{ @intCast(@max(stop_epoch, start_epoch)), adam.t };
+                try checkpoint.save(gpa, io, path, gpu, nn.state(model) ++ adam.state(), &counters);
                 try out.print("saved {s}\n", .{path});
             }
             if (gpu) |dev| try dev.printProfile(out);

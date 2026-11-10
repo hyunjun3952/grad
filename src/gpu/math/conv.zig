@@ -1,6 +1,7 @@
 const std = @import("std");
+const bf16 = @import("bf16.zig");
 
-pub const Op = enum { im2col, col2im, maxPool, maxPoolBackward, avgPool, avgPoolBackward };
+pub const Op = enum { im2col, col2im, col2imHalf, maxPool, maxPoolBackward, avgPool, avgPoolBackward };
 
 const Index = u32;
 
@@ -17,7 +18,7 @@ pub fn outWidth(d: Dims) Index {
 pub fn workItems(op: Op, d: Dims) usize {
     return switch (op) {
         .im2col => @as(usize, d.n) * outHeight(d) * outWidth(d) * d.k * d.k * d.c,
-        .col2im => @as(usize, d.n) * d.h * d.w * d.c,
+        .col2im, .col2imHalf => @as(usize, d.n) * d.h * d.w * d.c,
         .maxPool, .maxPoolBackward, .avgPool, .avgPoolBackward => @as(usize, d.n) * (d.h / 2) * (d.w / 2) * d.c,
     };
 }
@@ -38,6 +39,17 @@ pub inline fn patchValue(x: [*]const f32, patch: Patch, cc: Index, d: Dims) f32 
     return if (inside) x[((patch.n * d.h + py - d.pad) * d.w + px - d.pad) * d.c + cc % d.c] else 0;
 }
 
+pub inline fn patchValues(x: [*]const f32, patch: Patch, cc: Index, d: Dims) @Vector(4, f32) {
+    const tap = cc / d.c;
+    const py = patch.top + tap / d.k;
+    const px = patch.left + tap % d.k;
+    const inside = py >= d.pad and px >= d.pad and py - d.pad < d.h and px - d.pad < d.w;
+    if (!inside) return @splat(0);
+    const at = ((patch.n * d.h + py - d.pad) * d.w + px - d.pad) * d.c + cc % d.c;
+    const source: *align(16) const [4]f32 = @ptrCast(@alignCast(x + at));
+    return source.*;
+}
+
 pub inline fn im2colValue(x: [*]const f32, row: Index, cc: Index, d: Dims) f32 {
     return patchValue(x, patchOf(row, d), cc, d);
 }
@@ -45,7 +57,7 @@ pub inline fn im2col(t: Index, x: [*]const f32, col: [*]f32, d: Dims) void {
     const kc = d.k * d.k * d.c;
     col[t] = im2colValue(x, t / kc, t % kc, d);
 }
-pub inline fn col2im(t: Index, dcol: [*]const f32, dx: [*]f32, d: Dims) void {
+inline fn col2imSum(comptime T: type, t: Index, dcol: [*]const T, d: Dims) f32 {
     const kc = d.k * d.k * d.c;
     const ow = outWidth(d);
     const oh = outHeight(d);
@@ -65,12 +77,20 @@ pub inline fn col2im(t: Index, dcol: [*]const f32, dx: [*]f32, d: Dims) void {
             const ox = if (d.stride == 1) x - kx else (x - kx) / d.stride;
             if (ox >= ow) continue;
             const row = (n * oh + oy) * ow + ox;
-            total += dcol[row * kc + (ky * d.k + kx) * d.c + ch];
+            const value = dcol[row * kc + (ky * d.k + kx) * d.c + ch];
+            total += if (T == u16) bf16.decode(value) else value;
         }
     }
-    dx[t] += total;
+    return total;
 }
 
+pub inline fn col2im(t: Index, dcol: [*]const f32, dx: [*]f32, d: Dims) void {
+    dx[t] += col2imSum(f32, t, dcol, d);
+}
+
+pub inline fn col2imHalf(t: Index, dcol: [*]const u16, dx: [*]f32, d: Dims) void {
+    dx[t] += col2imSum(u16, t, dcol, d);
+}
 inline fn windowOffsets(d: Dims) [4]Index {
     return .{ 0, d.c, d.w * d.c, d.w * d.c + d.c };
 }

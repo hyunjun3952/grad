@@ -27,4 +27,4 @@ pub const GatherArgs = extern struct { start: u32, rows: u32, pixels: u32, max_s
 
 pub const PackArgs = extern struct { rows: u32, cols: u32, rows_padded: u32, cols_padded: u32, src_stride: u32, transpose: u32 };
 
-pub const TensorShape = extern struct { m: u32, n: u32, k_padded: u32, n_padded: u32, accumulate: u32, chunk: u32, transpose_out: u32 };
+pub const TensorShape = extern struct { m: u32, n: u32, k_padded: u32, n_padded: u32, accumulate: u32, chunk: u32, transpose_out: u32, output_half: u32 };

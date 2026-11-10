@@ -49,6 +49,7 @@ const Kernel = enum {
     gather,
     im2col,
     col2im,
+    col2imHalf,
     maxPool,
     maxPoolBackward,
     avgPool,
@@ -322,13 +323,15 @@ pub const Gpu = struct {
         return .{ .data = dst, .rows_padded = rows_padded, .cols_padded = cols_padded };
     }
 
-    pub fn matmulPacked(self: *Gpu, a: Packed, b: Packed, out: []f32, shape: MatmulShape, accumulate: bool, transpose_out: bool) Error!void {
+    pub fn matmulPacked(self: *Gpu, a: Packed, b: Packed, out: anytype, shape: MatmulShape, accumulate: bool, transpose_out: bool) Error!void {
+        const half_out = @typeInfo(@TypeOf(out)).pointer.child == u16;
         std.debug.assert(a.cols_padded == b.rows_padded and a.rows_padded % 128 == 0 and b.cols_padded % 64 == 0 and a.cols_padded % 32 == 0);
         const blocks = (a.rows_padded / 128) * (b.cols_padded / 64);
         const splits = @max(1, @min(a.cols_padded / 256, (128 + blocks - 1) / blocks));
         const chunk = std.mem.alignForward(usize, (a.cols_padded + splits - 1) / splits, 32);
-        if (chunk < a.cols_padded and !accumulate) try self.fill(out, 0);
-        const kernel_shape = pack(ga.TensorShape, .{ .m = shape.m, .n = shape.n, .k_padded = a.cols_padded, .n_padded = b.cols_padded, .accumulate = accumulate, .chunk = chunk, .transpose_out = transpose_out });
+        std.debug.assert(!half_out or (chunk >= a.cols_padded and !accumulate and !transpose_out));
+        if (!half_out and chunk < a.cols_padded and !accumulate) try self.fill(out, 0);
+        const kernel_shape = pack(ga.TensorShape, .{ .m = shape.m, .n = shape.n, .k_padded = a.cols_padded, .n_padded = b.cols_padded, .accumulate = accumulate, .chunk = chunk, .transpose_out = transpose_out, .output_half = half_out });
         try self.launch(.sgemmTensor, .{ toU32(b.cols_padded / 64), toU32(a.rows_padded / 128), ceilDiv(a.cols_padded, chunk) }, .{ a.data, b.data, out, kernel_shape });
     }
 
@@ -383,7 +386,7 @@ pub const Gpu = struct {
         try self.launchFlat(@field(Kernel, @tagName(op)), len, slices ++ .{ len, d });
     }
 
-    const ColumnKind = enum(u32) { sum, squared_deviation, gradient_sums };
+    const ColumnKind = enum(u32) { sum, gradient_sums, shifted_moments };
 
     fn columnReduce(self: *Gpu, a: []const f32, b: []const f32, mean: []const f32, inv_std: []const f32, out: []f32, kind: ColumnKind, scale: f32, channels: usize) Error!void {
         const rows = a.len / channels;
@@ -398,11 +401,8 @@ pub const Gpu = struct {
     pub fn batchNormStats(self: *Gpu, x: []const f32, mean: []f32, inv_std: []f32, running_mean: []f32, running_var: []f32, training: bool) Error!void {
         const c = mean.len;
         const sums = try self.scratchZeroed(f32, 2 * c);
-        if (training) {
-            try self.columnReduce(x, x, sums[0..c], sums[0..c], sums[0..c], .sum, 1, c);
-            try self.columnReduce(x, x, sums[0..c], sums[0..c], sums[c..], .squared_deviation, 1 / @as(f32, @floatFromInt(x.len / c)), c);
-        }
-        try self.launchFlat(.batchNormFinish, c, .{ sums, mean, inv_std, running_mean, running_var, x.len / c, c, training });
+        if (training) try self.columnReduce(x, x, x[0..c], x[0..c], sums, .shifted_moments, 1, c);
+        try self.launchFlat(.batchNormFinish, c, .{ sums, x[0..c], mean, inv_std, running_mean, running_var, x.len / c, c, training });
     }
 
     pub fn batchNormApply(self: *Gpu, x: []const f32, y: []f32, mean: []const f32, inv_std: []const f32, gamma: []const f32, beta: []const f32) Error!void {
