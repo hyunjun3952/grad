@@ -23,35 +23,31 @@ pub fn build(b: *std.Build) void {
     });
     mod.addAnonymousImport("kernels_ptx", .{ .root_source_file = gpu_kernels.getEmittedAsm() });
 
-    const exe = b.addExecutable(.{
-        .name = "grad",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "grad", .module = mod },
-            },
-        }),
-    });
-
     const config = b.addOptions();
-    config.addOption(usize, "hidden", b.option(usize, "hidden", "Hidden units of the trained MLP (default: 128)") orelse 128);
-    config.addOption(usize, "batch", b.option(usize, "batch", "Training batch size (default: 64)") orelse 64);
-    config.addOption(bool, "cnn", b.option(bool, "cnn", "Train a convolutional network instead of the MLP") orelse false);
-    exe.root_module.addOptions("config", config);
+    config.addOption(usize, "hidden", b.option(usize, "hidden", "mnist example: hidden units of the MLP (default: 128)") orelse 128);
+    config.addOption(usize, "batch", b.option(usize, "batch", "mnist example: training batch size (default: 64)") orelse 64);
+    config.addOption(bool, "cnn", b.option(bool, "cnn", "mnist example: train the convolutional network instead of the MLP") orelse false);
 
-    b.installArtifact(exe);
+    inline for (.{ "mnist", "cifar" }) |name| {
+        const exe = b.addExecutable(.{
+            .name = name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("examples/" ++ name ++ "/main.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "grad", .module = mod },
+                },
+            }),
+        });
+        if (std.mem.eql(u8, name, "mnist")) exe.root_module.addOptions("config", config);
+        b.installArtifact(exe);
 
-    const run_step = b.step("run", "Run the app");
-
-    const run_cmd = b.addRunArtifact(exe);
-    run_step.dependOn(&run_cmd.step);
-
-    run_cmd.step.dependOn(b.getInstallStep());
-
-    run_cmd.addPassthruArgs();
-
+        const run_cmd = b.addRunArtifact(exe);
+        run_cmd.step.dependOn(b.getInstallStep());
+        run_cmd.addPassthruArgs();
+        b.step(name, "Train the " ++ name ++ " example (zig build " ++ name ++ " -- [epochs] [--gpu] ...)").dependOn(&run_cmd.step);
+    }
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });

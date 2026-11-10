@@ -294,6 +294,66 @@ fn gpuMatmul(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
     try out.writeAll("\n");
 }
 
+fn gpuTensorCore(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
+    const dev = grad.gpu.Gpu.init(gpa, 1 << 30) catch |err| switch (err) {
+        error.DriverNotFound => return out.writeAll("no NVIDIA driver\n"),
+        else => return err,
+    };
+    defer dev.deinit();
+    dev.tensor_core_min_work = 0;
+    const cases = [_]struct { name: []const u8, m: usize, n: usize, k: usize, opts: grad.gpu.MatmulOpts }{
+        .{ .name = "square 1024", .m = 1024, .n = 1024, .k = 1024, .opts = .{} },
+        .{ .name = "square 4096", .m = 4096, .n = 4096, .k = 4096, .opts = .{} },
+        .{ .name = "conv fwd 65536x64x576", .m = 65536, .n = 64, .k = 576, .opts = .{} },
+        .{ .name = "conv dW  576x64x65536", .m = 576, .n = 64, .k = 65536, .opts = .{ .trans_a = true } },
+        .{ .name = "conv dX  65536x576x64", .m = 65536, .n = 576, .k = 64, .opts = .{ .trans_b = true } },
+        .{ .name = "mlp fwd  512x4096x784", .m = 512, .n = 4096, .k = 784, .opts = .{} },
+    };
+    try out.print("matmul including operand packing, f32 vs bf16 tensor cores (best of 20)\n{s:<24}{s:>12}{s:>12}{s:>10}{s:>14}\n", .{ "case", "f32 TFLOPS", "bf16 TFLOPS", "speedup", "rms rel err" });
+    for (cases) |case| {
+        const a = try dev.alloc(T, @max(case.m * case.k, case.k * case.n));
+        const b = try dev.alloc(T, @max(case.m * case.k, case.k * case.n));
+        const c32 = try dev.alloc(T, case.m * case.n);
+        const c16 = try dev.alloc(T, case.m * case.n);
+        const host = try gpa.alloc(T, a.len);
+        defer gpa.free(host);
+        var prng = std.Random.DefaultPrng.init(case.m + case.n);
+        for (host) |*x| x.* = prng.random().float(T) * 2 - 1;
+        try dev.upload(a, host);
+        for (host) |*x| x.* = prng.random().float(T) * 2 - 1;
+        try dev.upload(b, host);
+
+        const flops = 2.0 * @as(f64, @floatFromInt(case.m)) * @as(f64, @floatFromInt(case.n)) * @as(f64, @floatFromInt(case.k));
+        var tflops: [2]f64 = undefined;
+        for (0..2) |variant| {
+            dev.tensor_cores = variant == 1;
+            const target = if (variant == 0) c32 else c16;
+            try dev.matmul(a, b, target, .{ .m = case.m, .n = case.n, .k = case.k }, case.opts);
+            try dev.cu.sync();
+            const t0 = Io.Clock.awake.now(io);
+            for (0..20) |_| try dev.matmul(a, b, target, .{ .m = case.m, .n = case.n, .k = case.k }, case.opts);
+            try dev.cu.sync();
+            const ns: f64 = @floatFromInt(Io.Clock.awake.now(io).nanoseconds - t0.nanoseconds);
+            tflops[variant] = flops * 20 / ns / 1000;
+        }
+
+        const full = try gpa.alloc(T, case.m * case.n);
+        defer gpa.free(full);
+        const half = try gpa.alloc(T, case.m * case.n);
+        defer gpa.free(half);
+        try dev.download(full, c32);
+        try dev.download(half, c16);
+        var error_sum: f64 = 0;
+        var value_sum: f64 = 0;
+        for (full, half) |f, h| {
+            error_sum += (f - h) * (f - h);
+            value_sum += f * f;
+        }
+        const worst: f64 = @sqrt(error_sum / value_sum);
+        try out.print("{s:<24}{d:>12.2}{d:>12.2}{d:>9.1}x{e:>14.2}\n", .{ case.name, tflops[0], tflops[1], tflops[1] / tflops[0], worst });
+    }
+    try out.writeAll("\n");
+}
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
@@ -306,6 +366,11 @@ pub fn main(init: std.process.Init) !void {
     const rng = prng.random();
 
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len > 1 and std.mem.eql(u8, args[1], "tc")) {
+        try gpuTensorCore(io, gpa, out);
+        try out.flush();
+        return;
+    }
     if (args.len > 1 and std.mem.eql(u8, args[1], "gpu")) {
         try gpuMatmul(io, gpa, out);
         try out.flush();

@@ -76,6 +76,10 @@ pub const Adam = struct {
         return .{ .gpa = gpa, .on_gpu = false, .m = m, .v = v, .lr = lr };
     }
 
+    pub fn state(self: Adam) struct { []f32, []f32 } {
+        return .{ self.m, self.v };
+    }
+
     pub fn deinit(self: Adam) void {
         if (self.on_gpu) return;
         self.gpa.free(self.m);

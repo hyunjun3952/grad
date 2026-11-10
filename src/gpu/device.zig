@@ -1,4 +1,5 @@
 const aug = @import("math/augment.zig");
+const bf16 = @import("math/bf16.zig");
 const ga = @import("args.zig");
 const cv = @import("math/conv.zig");
 const drop = @import("math/dropout.zig");
@@ -409,7 +410,143 @@ export fn gather(images: [*]const f32, labels_src: [*]const u8, order: [*]const 
     const r = t / args.pixels;
     const p = t % args.pixels;
     const idx: usize = order[args.start + r];
-    const shift = aug.shiftOf(args.seed, args.start + r, args.max_shift);
-    batch[t] = aug.pixel(images + idx * args.pixels, p, aug.side(args.pixels), shift);
+    const config: aug.Config = .{ .max_shift = args.max_shift, .max_angle = args.max_angle, .max_scale = args.max_scale, .flip = args.flip != 0, .channels = args.channels, .seed = args.seed };
+    const source = images + idx * args.pixels;
+    batch[t] = if (config.active()) aug.pixel(source, p, aug.side(args.pixels, args.channels), args.channels, aug.transformOf(args.start + r, config)) else source[p];
     if (p == 0) labels_out[r] = labels_src[idx];
+}
+
+const tensor_core = struct {
+    const rows = 128;
+    const cols = 64;
+    const depth = 32;
+    const stride = depth + 8;
+
+    var tile_a: [rows * stride]u16 align(16) addrspace(.shared) = undefined;
+    var tile_b: [cols * stride]u16 align(16) addrspace(.shared) = undefined;
+
+    inline fn word(tile: anytype, at: usize) u32 {
+        const p: *addrspace(.shared) const u32 = @ptrCast(@alignCast(&tile[at]));
+        return p.*;
+    }
+
+    inline fn mma(acc: *[4]f32, a: [4]u32, b: [2]u32) void {
+        var d0 = acc[0];
+        var d1 = acc[1];
+        var d2 = acc[2];
+        var d3 = acc[3];
+        asm volatile ("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%[d0], %[d1], %[d2], %[d3]}, {%[a0], %[a1], %[a2], %[a3]}, {%[b0], %[b1]}, {%[d0], %[d1], %[d2], %[d3]};"
+            : [d0] "+f" (d0),
+              [d1] "+f" (d1),
+              [d2] "+f" (d2),
+              [d3] "+f" (d3),
+            : [a0] "r" (a[0]),
+              [a1] "r" (a[1]),
+              [a2] "r" (a[2]),
+              [a3] "r" (a[3]),
+              [b0] "r" (b[0]),
+              [b1] "r" (b[1]),
+        );
+        acc.* = .{ d0, d1, d2, d3 };
+    }
+};
+
+export fn packHalf(src: [*]const f32, dst: [*]u16, args: ga.PackArgs) callconv(.nvptx_kernel) void {
+    const t = globalIndex();
+    if (t >= @as(usize, args.rows_padded) * args.cols_padded) return;
+    const i = t / args.cols_padded;
+    const j = t % args.cols_padded;
+    const inside = i < args.rows and j < args.cols;
+    const source = if (args.transpose != 0) j * args.src_stride + i else i * args.src_stride + j;
+    dst[t] = if (inside) bf16.encode(src[source]) else 0;
+}
+
+const transpose_tile = struct {
+    var values: [32 * 33]f32 addrspace(.shared) = undefined;
+};
+
+export fn packHalfTransposed(src: [*]const f32, dst: [*]u16, args: ga.PackArgs) callconv(.nvptx_kernel) void {
+    const tid: usize = @workItemId(0);
+    const lane = tid % 32;
+    const group = tid / 32;
+    const row_base = @as(usize, @workGroupId(1)) * 32;
+    const col_base = @as(usize, @workGroupId(0)) * 32;
+    inline for (0..4) |step| {
+        const j = col_base + group + 8 * step;
+        const i = row_base + lane;
+        transpose_tile.values[(group + 8 * step) * 33 + lane] = if (i < args.rows and j < args.cols) src[j * args.src_stride + i] else 0;
+    }
+    barrier();
+    inline for (0..4) |step| {
+        const i = row_base + group + 8 * step;
+        dst[i * args.cols_padded + col_base + lane] = bf16.encode(transpose_tile.values[lane * 33 + group + 8 * step]);
+    }
+}
+
+export fn sgemmTensor(a: [*]const u16, b: [*]const u16, c: [*]f32, shape: ga.TensorShape) callconv(.nvptx_kernel) void {
+    const tc = tensor_core;
+    const tid: usize = @workItemId(0);
+    const lane = tid % 32;
+    const warp = tid / 32;
+    const warp_row = warp / 2;
+    const warp_col = warp % 2;
+    const row0 = @as(usize, @workGroupId(1)) * tc.rows;
+    const col0 = @as(usize, @workGroupId(0)) * tc.cols;
+    const M: usize = shape.m;
+    const N: usize = shape.n;
+    const K: usize = shape.k_padded;
+    const NP: usize = shape.n_padded;
+    const k_begin = @as(usize, @workGroupId(2)) * shape.chunk;
+    const k_end = @min(K, k_begin + shape.chunk);
+
+    var acc: [2][4][4]f32 = @splat(@splat(@splat(0)));
+    var kk = k_begin;
+    while (kk < k_end) : (kk += tc.depth) {
+        const a_row = tid / 2;
+        const a_col = (tid % 2) * 16;
+        inline for (0..2) |chunk| {
+            const src: [*]const u32 = @ptrCast(@alignCast(a + (row0 + a_row) * K + kk + a_col + 8 * chunk));
+            const dst: [*]addrspace(.shared) u32 = @ptrCast(@alignCast(&tc.tile_a[a_row * tc.stride + a_col + 8 * chunk]));
+            inline for (0..4) |i| dst[i] = src[i];
+        }
+
+        const b_k = tid / 8;
+        const b_n = (tid % 8) * 8;
+        const b_src: [*]const u32 = @ptrCast(@alignCast(b + (kk + b_k) * NP + col0 + b_n));
+        inline for (0..4) |i| {
+            tc.tile_b[(b_n + 2 * i) * tc.stride + b_k] = @truncate(b_src[i]);
+            tc.tile_b[(b_n + 2 * i + 1) * tc.stride + b_k] = @truncate(b_src[i] >> 16);
+        }
+        barrier();
+
+        inline for (0..tc.depth / 16) |step| {
+            var a_frag: [2][4]u32 = undefined;
+            inline for (0..2) |mi| {
+                const base = (warp_row * 32 + mi * 16 + lane / 4) * tc.stride + step * 16 + (lane % 4) * 2;
+                a_frag[mi] = .{ tc.word(&tc.tile_a, base), tc.word(&tc.tile_a, base + 8 * tc.stride), tc.word(&tc.tile_a, base + 8), tc.word(&tc.tile_a, base + 8 * tc.stride + 8) };
+            }
+            inline for (0..4) |ni| {
+                const base = (warp_col * 32 + ni * 8 + lane / 4) * tc.stride + step * 16 + (lane % 4) * 2;
+                const b_frag: [2]u32 = .{ tc.word(&tc.tile_b, base), tc.word(&tc.tile_b, base + 8) };
+                inline for (0..2) |mi| tc.mma(&acc[mi][ni], a_frag[mi], b_frag);
+            }
+        }
+        barrier();
+    }
+
+    inline for (0..2) |mi| {
+        inline for (0..4) |ni| {
+            inline for (0..4) |q| {
+                const r = row0 + warp_row * 32 + mi * 16 + lane / 4 + (q / 2) * 8;
+                const col = col0 + warp_col * 32 + ni * 8 + (lane % 4) * 2 + q % 2;
+                if (r < M and col < N) {
+                    if (shape.chunk < K) {
+                        _ = @atomicRmw(f32, &c[r * N + col], .Add, acc[mi][ni][q], .monotonic);
+                    } else {
+                        c[r * N + col] = if (shape.accumulate != 0) c[r * N + col] + acc[mi][ni][q] else acc[mi][ni][q];
+                    }
+                }
+            }
+        }
+    }
 }

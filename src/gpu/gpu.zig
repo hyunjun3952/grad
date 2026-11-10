@@ -11,7 +11,7 @@ pub const Error = Allocator.Error || error{ DriverNotFound, MissingSymbol, CudaF
 
 pub const BinaryOp = enum { add, mul };
 
-pub const Augment = struct { max_shift: u32 = 0, seed: u64 = 0 };
+pub const Augment = @import("math/augment.zig").Config;
 
 pub const MatmulOpts = struct { trans_a: bool = false, trans_b: bool = false, accumulate: bool = false };
 
@@ -31,6 +31,9 @@ const Kernel = enum {
     sgemmSmallNN,
     sgemmSmallNT,
     sgemmSmallTN,
+    packHalf,
+    packHalfTransposed,
+    sgemmTensor,
     elementwise,
     relu,
     reluBackward,
@@ -113,6 +116,8 @@ const Profile = struct { io: Io, ns: [slot_count]i96 = @splat(0), calls: [slot_c
 
 pub const Gpu = struct {
     profile: ?Profile = null,
+    tensor_cores: bool = false,
+    tensor_core_min_work: usize = 1 << 22,
     gpa: Allocator,
     cu: cuda.Cuda,
     fns: [kernel_count]cuda.Handle,
@@ -129,6 +134,8 @@ pub const Gpu = struct {
         errdefer gpa.destroy(self);
         self.gpa = gpa;
         self.profile = null;
+        self.tensor_cores = false;
+        self.tensor_core_min_work = 1 << 22;
         self.owned = .empty;
         self.cu = try cuda.Cuda.open();
         errdefer self.cu.close();
@@ -274,6 +281,7 @@ pub const Gpu = struct {
 
     pub fn matmul(self: *Gpu, a: []const f32, b: []const f32, out: []f32, shape: MatmulShape, opts: MatmulOpts) Error!void {
         std.debug.assert(!(opts.trans_a and opts.trans_b));
+        if (self.tensor_cores and shape.m * shape.n * shape.k >= self.tensor_core_min_work) return self.matmulTensor(a, b, out, shape, opts);
         const tile: usize = if (shape.n <= 32 and shape.m <= 64) 2 else if (shape.n <= 32) 1 else 0;
         const transpose: usize = if (opts.trans_a) 2 else if (opts.trans_b) 1 else 0;
         const kernel: Kernel = @fromBackingInt(@backingInt(Kernel.sgemmNN) + @as(u5, @intCast(tile * 3 + transpose)));
@@ -287,6 +295,29 @@ pub const Gpu = struct {
         try self.launch(kernel, .{ ceilDiv(shape.n, tile_n), ceilDiv(shape.m, tile_m), ceilDiv(shape.k, chunk) }, .{ a, b, out, kernel_shape });
     }
 
+    fn packOperand(self: *Gpu, src: []const f32, dst: []u16, rows: usize, cols: usize, rows_padded: usize, cols_padded: usize, transpose: bool) Error!void {
+        const args = pack(ga.PackArgs, .{ .rows = rows, .cols = cols, .rows_padded = rows_padded, .cols_padded = cols_padded, .src_stride = if (transpose) rows else cols, .transpose = transpose });
+        if (transpose) return self.launch(.packHalfTransposed, .{ toU32(cols_padded / 32), toU32(rows_padded / 32), 1 }, .{ src, dst, args });
+        try self.launchFlat(.packHalf, rows_padded * cols_padded, .{ src, dst, args });
+    }
+
+    fn matmulTensor(self: *Gpu, a: []const f32, b: []const f32, out: []f32, shape: MatmulShape, opts: MatmulOpts) Error!void {
+        const m_padded = std.mem.alignForward(usize, shape.m, 128);
+        const k_padded = std.mem.alignForward(usize, shape.k, 32);
+        const n_padded = std.mem.alignForward(usize, shape.n, 64);
+        const mark = self.step_used;
+        defer self.step_used = mark;
+        const a_half = try self.scratch(u16, m_padded * k_padded);
+        const b_half = try self.scratch(u16, k_padded * n_padded);
+        try self.packOperand(a, a_half, shape.m, shape.k, m_padded, k_padded, opts.trans_a);
+        try self.packOperand(b, b_half, shape.k, shape.n, k_padded, n_padded, opts.trans_b);
+        const blocks = (m_padded / 128) * (n_padded / 64);
+        const splits = @max(1, @min(k_padded / 256, (128 + blocks - 1) / blocks));
+        const chunk = std.mem.alignForward(usize, (k_padded + splits - 1) / splits, 32);
+        if (chunk < k_padded and !opts.accumulate) try self.fill(out, 0);
+        const kernel_shape = pack(ga.TensorShape, .{ .m = shape.m, .n = shape.n, .k_padded = k_padded, .n_padded = n_padded, .accumulate = opts.accumulate, .chunk = chunk });
+        try self.launch(.sgemmTensor, .{ toU32(n_padded / 64), toU32(m_padded / 128), ceilDiv(k_padded, chunk) }, .{ a_half, b_half, out, kernel_shape });
+    }
     pub fn elementwise(self: *Gpu, op: BinaryOp, a: []const f32, b: []const f32, out: []f32, plan: BroadcastPlan) Error!void {
         const args = pack(ga.ElementwiseArgs, .{ .len = out.len, .multiply = op == .mul, .dims = plan.dims, .a_strides = plan.a_strides, .b_strides = plan.b_strides });
         try self.launchFlat(.elementwise, out.len, .{ a, b, out, args });
@@ -390,7 +421,7 @@ pub const Gpu = struct {
     pub fn gather(self: *Gpu, images: []const f32, labels_src: []const u8, order: []const u32, batch: []f32, labels_out: []u8, start: usize, augment: Augment) Error!void {
         const rows = labels_out.len;
         const pixels = batch.len / rows;
-        const args = pack(ga.GatherArgs, .{ .start = start, .rows = rows, .pixels = pixels, .max_shift = augment.max_shift, .seed = augment.seed });
+        const args = pack(ga.GatherArgs, .{ .start = start, .rows = rows, .pixels = pixels, .max_shift = augment.max_shift, .max_angle = augment.max_angle, .max_scale = augment.max_scale, .channels = augment.channels, .flip = augment.flip, .seed = augment.seed });
         try self.launchFlat(.gather, rows * pixels, .{ images, labels_src, order, batch, labels_out, args });
     }
 };

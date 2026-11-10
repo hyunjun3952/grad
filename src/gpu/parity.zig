@@ -4,6 +4,7 @@ const testing = std.testing;
 const gpu_mod = @import("gpu.zig");
 const Gpu = gpu_mod.Gpu;
 const kernels = @import("../cpu/kernels.zig");
+const bf16 = @import("math/bf16.zig");
 
 fn initForTest() !*Gpu {
     return Gpu.init(testing.allocator, 64 << 20) catch |err| switch (err) {
@@ -22,7 +23,7 @@ fn expectClose(want: []const f32, got: []const f32, tolerance: f32) !void {
     }
 }
 
-fn checkMatmul(gpu: *Gpu, m: usize, n: usize, k: usize, ta: bool, tb: bool, accumulate: bool) !void {
+fn checkMatmul(gpu: *Gpu, m: usize, n: usize, k: usize, ta: bool, tb: bool, accumulate: bool, tensor: bool) !void {
     const gpa = testing.allocator;
     var prng = std.Random.DefaultPrng.init(m * 1000003 + n * 1009 + k);
     const rng = prng.random();
@@ -37,6 +38,12 @@ fn checkMatmul(gpu: *Gpu, m: usize, n: usize, k: usize, ta: bool, tb: bool, accu
     defer gpa.free(got);
     for (a) |*x| x.* = rng.float(f32) - 0.5;
     for (b) |*x| x.* = rng.float(f32) - 0.5;
+    gpu.tensor_cores = tensor;
+    gpu.tensor_core_min_work = 0;
+    if (tensor) {
+        for (a) |*x| x.* = bf16.decode(bf16.encode(x.*));
+        for (b) |*x| x.* = bf16.decode(bf16.encode(x.*));
+    }
 
     const la = try gpa.alloc(f32, m * k);
     defer gpa.free(la);
@@ -66,18 +73,21 @@ fn checkMatmul(gpu: *Gpu, m: usize, n: usize, k: usize, ta: bool, tb: bool, accu
     try expectClose(want, got, 2e-4);
 }
 
-test "gpu matmul matches the cpu reference for every transpose, shape and accumulate flag" {
+test "gpu matmul, f32 and bf16 tensor cores, matches the cpu reference for every transpose, shape and accumulate flag" {
     const gpu = try initForTest();
     defer gpu.deinit();
 
     const shapes = [_][3]usize{
-        .{ 1, 1, 1 },      .{ 5, 7, 3 },       .{ 64, 64, 16 },  .{ 65, 70, 17 },
-        .{ 130, 33, 200 }, .{ 784, 128, 64 },  .{ 64, 10, 128 }, .{ 200, 300, 784 },
-        .{ 25, 16, 4000 }, .{ 400, 32, 4099 },
+        .{ 1, 1, 1 },      .{ 5, 7, 3 },       .{ 64, 64, 16 },   .{ 65, 70, 17 },
+        .{ 130, 33, 200 }, .{ 784, 128, 64 },  .{ 64, 10, 128 },  .{ 200, 300, 784 },
+        .{ 25, 16, 4000 }, .{ 400, 32, 4099 }, .{ 512, 64, 576 }, .{ 300, 130, 96 },
     };
     for (shapes) |s| {
         for ([_][2]bool{ .{ false, false }, .{ true, false }, .{ false, true } }) |t| {
-            for ([_]bool{ false, true }) |acc| try checkMatmul(gpu, s[0], s[1], s[2], t[0], t[1], acc);
+            for ([_]bool{ false, true }) |acc| {
+                try checkMatmul(gpu, s[0], s[1], s[2], t[0], t[1], acc, false);
+                try checkMatmul(gpu, s[0], s[1], s[2], t[0], t[1], acc, true);
+            }
         }
     }
 }
