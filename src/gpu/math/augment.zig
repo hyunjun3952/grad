@@ -25,7 +25,7 @@ pub fn side(pixels: usize) usize {
 }
 
 const std = @import("std");
-const Gpu = @import("gpu.zig").Gpu;
+const Gpu = @import("../gpu.zig").Gpu;
 
 test "pixel shifts the image and pads with zeros" {
     const image = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };

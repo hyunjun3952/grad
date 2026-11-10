@@ -1,6 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const kernels = @import("kernels.zig");
+const kernels = @import("../cpu/kernels.zig");
 
 pub fn Tensor(comptime T: type, comptime dims: []const usize) type {
     comptime {
@@ -56,7 +56,7 @@ pub fn Tensor(comptime T: type, comptime dims: []const usize) type {
     };
 }
 
-pub const MatmulOpts = @import("gpu/gpu.zig").MatmulOpts;
+pub const MatmulOpts = @import("../gpu/gpu.zig").MatmulOpts;
 
 pub fn MatmulResult(comptime A: type, comptime B: type, comptime opts: MatmulOpts) type {
     if (A.rank != 2 or B.rank != 2) {

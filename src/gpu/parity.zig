@@ -3,7 +3,7 @@ const testing = std.testing;
 
 const gpu_mod = @import("gpu.zig");
 const Gpu = gpu_mod.Gpu;
-const kernels = @import("../kernels.zig");
+const kernels = @import("../cpu/kernels.zig");
 
 fn initForTest() !*Gpu {
     return Gpu.init(testing.allocator, 64 << 20) catch |err| switch (err) {

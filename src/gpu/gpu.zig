@@ -2,7 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const cuda = @import("cuda.zig");
-const conv = @import("conv.zig");
+const conv = @import("math/conv.zig");
 const ga = @import("args.zig");
 
 const ptx = @embedFile("kernels_ptx");

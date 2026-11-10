@@ -1,12 +1,12 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const ops = @import("ops.zig");
-const tensor = @import("tensor.zig");
-const kernels = @import("kernels.zig");
-const gpu_mod = @import("gpu/gpu.zig");
-const conv = @import("gpu/conv.zig");
-const drop = @import("gpu/dropout.zig");
-const norm = @import("gpu/norm.zig");
+const ops = @import("../tensor/ops.zig");
+const tensor = @import("../tensor/tensor.zig");
+const kernels = @import("../cpu/kernels.zig");
+const gpu_mod = @import("../gpu/gpu.zig");
+const conv = @import("../gpu/math/conv.zig");
+const drop = @import("../gpu/math/dropout.zig");
+const norm = @import("../gpu/math/norm.zig");
 const Tensor = tensor.Tensor;
 
 pub const Error = gpu_mod.Error;

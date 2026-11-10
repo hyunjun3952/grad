@@ -1,6 +1,6 @@
 const std = @import("std");
-const kernels = @import("kernels.zig");
-const ga = @import("gpu/args.zig");
+const kernels = @import("../cpu/kernels.zig");
+const ga = @import("../gpu/args.zig");
 
 fn tensorTable(params: anytype) ga.TensorTable {
     comptime std.debug.assert(params.len <= ga.max_tensors);
@@ -156,9 +156,9 @@ pub const Adam = struct {
 };
 
 const testing = std.testing;
-const Tensor = @import("tensor.zig").Tensor;
-const Gpu = @import("gpu/gpu.zig").Gpu;
-const Var = @import("autograd.zig").Var;
+const Tensor = @import("../tensor/tensor.zig").Tensor;
+const Gpu = @import("../gpu/gpu.zig").Gpu;
+const Var = @import("../autograd/autograd.zig").Var;
 
 test "adam: first step moves by lr, converges on a quadratic" {
     const gpa = testing.allocator;

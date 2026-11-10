@@ -1,6 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
-const Gpu = @import("gpu/gpu.zig").Gpu;
+const Gpu = @import("../gpu/gpu.zig").Gpu;
 
 pub fn matmulNaive(comptime T: type, m: usize, k: usize, n: usize, a: []const T, b: []const T, out: []T) void {
     std.debug.assert(a.len >= m * k and b.len >= k * n and out.len >= m * n);

@@ -1,7 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Tape = @import("autograd.zig").Tape;
-const Gpu = @import("gpu/gpu.zig").Gpu;
+const Gpu = @import("../gpu/gpu.zig").Gpu;
 
 const testing = std.testing;
 

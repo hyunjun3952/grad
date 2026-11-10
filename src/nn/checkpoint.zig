@@ -1,7 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
-const Gpu = @import("gpu/gpu.zig").Gpu;
+const Gpu = @import("../gpu/gpu.zig").Gpu;
 
 const magic: u32 = 0x47524144;
 const header_bytes = 8;

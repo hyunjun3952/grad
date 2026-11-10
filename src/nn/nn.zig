@@ -1,9 +1,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Tensor = @import("tensor.zig").Tensor;
-const autograd = @import("autograd.zig");
+const Tensor = @import("../tensor/tensor.zig").Tensor;
+const autograd = @import("../autograd/autograd.zig");
 const optim = @import("optim.zig");
-const Gpu = @import("gpu/gpu.zig").Gpu;
+const Gpu = @import("../gpu/gpu.zig").Gpu;
 const Var = autograd.Var;
 const Tape = autograd.Tape;
 

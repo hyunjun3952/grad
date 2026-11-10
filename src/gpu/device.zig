@@ -1,8 +1,8 @@
-const aug = @import("augment.zig");
+const aug = @import("math/augment.zig");
 const ga = @import("args.zig");
-const cv = @import("conv.zig");
-const drop = @import("dropout.zig");
-const nm = @import("norm.zig");
+const cv = @import("math/conv.zig");
+const drop = @import("math/dropout.zig");
+const nm = @import("math/norm.zig");
 
 const BK = 8;
 const threads = 256;

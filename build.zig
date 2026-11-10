@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
     const gpu_kernels = b.addObject(.{
         .name = "gpu_kernels",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/gpu/kernels.zig"),
+            .root_source_file = b.path("src/gpu/device.zig"),
             .target = b.resolveTargetQuery(.{
                 .cpu_arch = .nvptx64,
                 .os_tag = .cuda,
