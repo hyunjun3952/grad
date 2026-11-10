@@ -424,27 +424,69 @@ const tensor_core = struct {
     const rows = 128;
     const cols = 64;
     const depth = 32;
-    const stride = depth + 8;
+    const stages = 3;
+    const a_elems = rows * depth;
+    const b_elems = depth * cols;
+    const stage_elems = a_elems + b_elems;
 
-    var tile_a: [rows * stride]u16 align(16) addrspace(.shared) = undefined;
-    var tile_b: [cols * stride]u16 align(16) addrspace(.shared) = undefined;
+    var smem: [stages * stage_elems]u16 align(128) addrspace(.shared) = undefined;
 
-    inline fn word(tile: anytype, at: usize) u32 {
-        const p: *addrspace(.shared) const u32 = @ptrCast(@alignCast(&tile[at]));
-        return p.*;
+    inline fn aSlot(row: usize, chunk: usize) usize {
+        return row * depth + ((chunk ^ ((row / 2) % 4)) * 8);
     }
 
-    inline fn swizzled(n: usize, k: usize) usize {
-        return (n * (stride / 2) + ((k / 2) ^ ((n / 8) % 8))) * 2 + k % 2;
+    inline fn bSlot(k: usize, chunk: usize) usize {
+        return k * cols + ((chunk ^ (k % 8)) * 8);
     }
 
-    inline fn fetch(a_src: [*]const u16, b_src: [*]const u16, a_regs: *[2][4]u32, b_regs: *[4]u32) void {
-        inline for (0..2) |chunk| {
-            const p: [*]const u32 = @ptrCast(@alignCast(a_src + 8 * chunk));
-            inline for (0..4) |i| a_regs[chunk][i] = p[i];
-        }
-        const q: [*]const u32 = @ptrCast(@alignCast(b_src));
-        inline for (0..4) |i| b_regs[i] = q[i];
+    inline fn sharedAddress(index: usize) u32 {
+        return @truncate(@intFromPtr(&smem[index]));
+    }
+
+    inline fn copyAsync(dst: u32, src: [*]const u16) void {
+        asm volatile ("cp.async.cg.shared.global [%[dst]], [%[src]], 16;"
+            :
+            : [dst] "r" (dst),
+              [src] "l" (@intFromPtr(src)),
+            : .{ .memory = true });
+    }
+
+    inline fn commit() void {
+        asm volatile ("cp.async.commit_group;" ::: .{ .memory = true });
+    }
+
+    inline fn waitForOlderGroups() void {
+        asm volatile ("cp.async.wait_group 1;" ::: .{ .memory = true });
+    }
+
+    inline fn ldmatrix(address: u32) [4]u32 {
+        var r0: u32 = undefined;
+        var r1: u32 = undefined;
+        var r2: u32 = undefined;
+        var r3: u32 = undefined;
+        asm volatile ("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%[r0], %[r1], %[r2], %[r3]}, [%[address]];"
+            : [r0] "=r" (r0),
+              [r1] "=r" (r1),
+              [r2] "=r" (r2),
+              [r3] "=r" (r3),
+            : [address] "r" (address),
+        );
+        return .{ r0, r1, r2, r3 };
+    }
+
+    inline fn ldmatrixTransposed(address: u32) [4]u32 {
+        var r0: u32 = undefined;
+        var r1: u32 = undefined;
+        var r2: u32 = undefined;
+        var r3: u32 = undefined;
+        asm volatile ("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%[r0], %[r1], %[r2], %[r3]}, [%[address]];"
+            : [r0] "=r" (r0),
+              [r1] "=r" (r1),
+              [r2] "=r" (r2),
+              [r3] "=r" (r3),
+            : [address] "r" (address),
+        );
+        return .{ r0, r1, r2, r3 };
     }
 
     inline fn mma(acc: *[4]f32, a: [4]u32, b: [2]u32) void {
@@ -467,7 +509,6 @@ const tensor_core = struct {
         acc.* = .{ d0, d1, d2, d3 };
     }
 };
-
 export fn packHalf(src: [*]const f32, dst: [*]u16, args: ga.PackArgs) callconv(.nvptx_kernel) void {
     const t = globalIndex();
     if (t >= @as(usize, args.rows_padded) * args.cols_padded) return;
@@ -525,41 +566,62 @@ export fn sgemmTensor(a: [*]const u16, b: [*]const u16, c: [*]f32, shape: ga.Ten
     const NP: usize = shape.n_padded;
     const k_begin = @as(usize, @workGroupId(2)) * shape.chunk;
     const k_end = @min(K, k_begin + shape.chunk);
+    const tiles = (k_end -| k_begin) / tc.depth;
+
+    const a_row0 = tid / 4;
+    const a_row1 = a_row0 + 64;
+    const a_chunk = tid % 4;
+    const a_src0 = a + (row0 + a_row0) * K + a_chunk * 8;
+    const a_src1 = a + (row0 + a_row1) * K + a_chunk * 8;
+    const a_dst0 = tc.aSlot(a_row0, a_chunk);
+    const a_dst1 = tc.aSlot(a_row1, a_chunk);
+    const b_k = tid / 8;
+    const b_chunk = tid % 8;
+    const b_src = b + b_k * NP + col0 + b_chunk * 8;
+    const b_dst = tc.a_elems + tc.bSlot(b_k, b_chunk);
+
+    inline for (0..tc.stages - 1) |stage| {
+        if (stage < tiles) {
+            const kk = k_begin + stage * tc.depth;
+            tc.copyAsync(tc.sharedAddress(stage * tc.stage_elems + a_dst0), a_src0 + kk);
+            tc.copyAsync(tc.sharedAddress(stage * tc.stage_elems + a_dst1), a_src1 + kk);
+            tc.copyAsync(tc.sharedAddress(stage * tc.stage_elems + b_dst), b_src + kk * NP);
+        }
+        tc.commit();
+    }
 
     var acc: [2][4][4]f32 = @splat(@splat(@splat(0)));
-    const a_row = tid / 2;
-    const a_col = (tid % 2) * 16;
-    const b_k = tid / 8;
-    const b_n = (tid % 8) * 8;
-    var a_regs: [2][4]u32 = undefined;
-    var b_regs: [4]u32 = undefined;
-    if (k_begin < k_end) tc.fetch(a + (row0 + a_row) * K + k_begin + a_col, b + (k_begin + b_k) * NP + col0 + b_n, &a_regs, &b_regs);
-    var kk = k_begin;
-    while (kk < k_end) : (kk += tc.depth) {
-        inline for (0..2) |chunk| {
-            const dst: [*]addrspace(.shared) u32 = @ptrCast(@alignCast(&tc.tile_a[a_row * tc.stride + a_col + 8 * chunk]));
-            inline for (0..4) |i| dst[i] = a_regs[chunk][i];
-        }
-        inline for (0..4) |i| {
-            tc.tile_b[tc.swizzled(b_n + 2 * i, b_k)] = @truncate(b_regs[i]);
-            tc.tile_b[tc.swizzled(b_n + 2 * i + 1, b_k)] = @truncate(b_regs[i] >> 16);
-        }
+    var tile: usize = 0;
+    while (tile < tiles) : (tile += 1) {
+        tc.waitForOlderGroups();
         barrier();
-        if (kk + tc.depth < k_end) tc.fetch(a + (row0 + a_row) * K + kk + tc.depth + a_col, b + (kk + tc.depth + b_k) * NP + col0 + b_n, &a_regs, &b_regs);
+
+        const ahead = tile + tc.stages - 1;
+        if (ahead < tiles) {
+            const stage = ahead % tc.stages;
+            const kk = k_begin + ahead * tc.depth;
+            tc.copyAsync(tc.sharedAddress(stage * tc.stage_elems + a_dst0), a_src0 + kk);
+            tc.copyAsync(tc.sharedAddress(stage * tc.stage_elems + a_dst1), a_src1 + kk);
+            tc.copyAsync(tc.sharedAddress(stage * tc.stage_elems + b_dst), b_src + kk * NP);
+        }
+        tc.commit();
+
+        const base = (tile % tc.stages) * tc.stage_elems;
         inline for (0..tc.depth / 16) |step| {
             var a_frag: [2][4]u32 = undefined;
             inline for (0..2) |mi| {
-                const base = (warp_row * 32 + mi * 16 + lane / 4) * tc.stride + step * 16 + (lane % 4) * 2;
-                a_frag[mi] = .{ tc.word(&tc.tile_a, base), tc.word(&tc.tile_a, base + 8 * tc.stride), tc.word(&tc.tile_a, base + 8), tc.word(&tc.tile_a, base + 8 * tc.stride + 8) };
+                const row = warp_row * 32 + mi * 16 + lane % 8 + 8 * ((lane / 8) % 2);
+                a_frag[mi] = tc.ldmatrix(tc.sharedAddress(base + tc.aSlot(row, step * 2 + lane / 16)));
             }
-            inline for (0..4) |ni| {
-                const n = warp_col * 32 + ni * 8 + lane / 4;
-                const k = step * 16 + (lane % 4) * 2;
-                const b_frag: [2]u32 = .{ tc.word(&tc.tile_b, tc.swizzled(n, k)), tc.word(&tc.tile_b, tc.swizzled(n, k + 8)) };
-                inline for (0..2) |mi| tc.mma(&acc[mi][ni], a_frag[mi], b_frag);
+            inline for (0..2) |pair| {
+                const k = step * 16 + lane % 8 + 8 * ((lane / 8) % 2);
+                const frag = tc.ldmatrixTransposed(tc.sharedAddress(base + tc.a_elems + tc.bSlot(k, warp_col * 4 + pair * 2 + lane / 16)));
+                inline for (0..2) |mi| {
+                    tc.mma(&acc[mi][pair * 2], a_frag[mi], .{ frag[0], frag[1] });
+                    tc.mma(&acc[mi][pair * 2 + 1], a_frag[mi], .{ frag[2], frag[3] });
+                }
             }
         }
-        barrier();
     }
 
     inline for (0..2) |mi| {

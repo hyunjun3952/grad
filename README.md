@@ -8,7 +8,7 @@ The goal is an engine that sits between "C with pointers" and "PyTorch": plain s
 | --- | --- | --- | --- |
 | MNIST | MLP 784-128-10 | 98.1% (10 epochs) | 0.19 s GPU, 0.26 s CPU (6 threads) |
 | MNIST | CNN conv5x16-conv5x32 + BatchNorm | 99.5% (30 epochs, light augmentation) | 0.9 s GPU, 19.5 s CPU |
-| CIFAR-10 | ResNet-14, widths 64-128-256 | 93.6% (50 epochs, flip + shift + label smoothing) | 31.7 s GPU (bf16 tensor cores) |
+| CIFAR-10 | ResNet-14, widths 64-128-256 | 93.6% (50 epochs, flip + shift + label smoothing) | 27.9 s GPU (bf16 tensor cores) |
 
 Measured on an i5-8500 (6 cores) and an RTX 3060 12 GB. About 5,200 lines including 66 tests, with no comments except for explained magic numbers.
 
@@ -17,7 +17,7 @@ Measured on an i5-8500 (6 cores) and an RTX 3060 12 GB. About 5,200 lines includ
 - **Compile-time shapes.** `Tensor(f32, &.{ 64, 784 })` carries its shape in the type, so a wrong `matmul`, `add` or `reshape` is a compile error. Data lives on the heap.
 - **Small autograd.** A type-erased `Tape` records closures; `Var{ value, grad, needs_grad }` is a plain struct. Ops: `add`, `mul`, `matmul`, `relu`, `conv2d`, `maxPool`, `avgPool`, `batchNorm`, `dropout`, `crossEntropy`, `reshape`.
 - **One code path for CPU and GPU.** Pass `kernels.Parallel{ .io, .threads, .gpu }` and everything (tape, optimizers, matmul) dispatches to the CPU worker pool or to the device. Per-element math such as `im2col`, dropout, batch-norm and augmentation is written once and shared by both backends.
-- **GPU without a toolkit.** `src/gpu/device.zig` is compiled for `nvptx64-cuda` / `sm_86`, embedded as PTX and loaded with `cuModuleLoadData`. It contains tiled FP32 GEMM (about 5 TFLOPS), a bf16 tensor-core GEMM using `mma.sync` (about 13.7 TFLOPS at 4096), reductions, fused multi-tensor Adam, and so on. On the CIFAR ResNet the bf16 path made an epoch 1.8x faster than FP32 with the same accuracy.
+- **GPU without a toolkit.** `src/gpu/device.zig` is compiled for `nvptx64-cuda` / `sm_86`, embedded as PTX and loaded with `cuModuleLoadData`. It contains tiled FP32 GEMM (about 5 TFLOPS), a bf16 tensor-core GEMM using `cp.async`, `ldmatrix` and `mma.sync` with a three-stage pipeline (about 21.6 TFLOPS at 4096, 23.4 without operand packing), reductions, fused multi-tensor Adam, and so on. On the CIFAR ResNet the bf16 path made an epoch 1.8x faster than FP32 with the same accuracy.
 - **Tested against references.** Every GPU op is compared with the CPU, gradients with finite differences, convolutions with a direct implementation, and bf16 GEMM with a CPU reference built from the same rounded inputs. Resuming from a checkpoint reproduces uninterrupted training bit for bit.
 
 ## Requirements
@@ -64,7 +64,7 @@ zig build bench -- gpu          # FP32 GEMM on the device
 zig build bench -- tc           # FP32 vs bf16 tensor-core GEMM, packing included
 ```
 
-On this machine: the CPU GEMM reaches about 108 GFLOPS per thread (packed B, 6x2 register tile); the GPU FP32 GEMM about 5 TFLOPS; the bf16 tensor-core kernel 9 to 13.7 TFLOPS depending on shape, with a relative RMS error of about 2e-3 against FP32.
+On this machine: the CPU GEMM reaches about 108 GFLOPS per thread (packed B, 6x2 register tile); the GPU FP32 GEMM about 5 TFLOPS; the bf16 tensor-core kernel 12.8 to 21.6 TFLOPS on square and MLP shapes (end to end, packing included), with a relative RMS error of about 2e-3 against FP32.
 
 ## Layout
 

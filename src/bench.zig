@@ -309,7 +309,7 @@ fn gpuTensorCore(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
         .{ .name = "conv dX  65536x576x64", .m = 65536, .n = 576, .k = 64, .opts = .{ .trans_b = true } },
         .{ .name = "mlp fwd  512x4096x784", .m = 512, .n = 4096, .k = 784, .opts = .{} },
     };
-    try out.print("matmul including operand packing, f32 vs bf16 tensor cores (best of 20)\n{s:<24}{s:>12}{s:>12}{s:>10}{s:>14}\n", .{ "case", "f32 TFLOPS", "bf16 TFLOPS", "speedup", "rms rel err" });
+    try out.print("matmul including operand packing, f32 vs bf16 tensor cores (best of 20)\n{s:<24}{s:>12}{s:>12}{s:>10}{s:>14}{s:>14}\n", .{ "case", "f32 TFLOPS", "bf16 TFLOPS", "speedup", "kernel only", "rms rel err" });
     for (cases) |case| {
         const a = try dev.alloc(T, @max(case.m * case.k, case.k * case.n));
         const b = try dev.alloc(T, @max(case.m * case.k, case.k * case.n));
@@ -337,6 +337,18 @@ fn gpuTensorCore(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
             tflops[variant] = flops * 20 / ns / 1000;
         }
 
+        const mark = dev.step_used;
+        const a_packed = try dev.packMatrix(a, case.m, case.k, std.mem.alignForward(usize, case.m, 128), std.mem.alignForward(usize, case.k, 32), case.opts.trans_a);
+        const b_packed = try dev.packMatrix(b, case.k, case.n, std.mem.alignForward(usize, case.k, 32), std.mem.alignForward(usize, case.n, 64), case.opts.trans_b);
+        try dev.matmulPacked(a_packed, b_packed, c16, .{ .m = case.m, .n = case.n, .k = case.k }, false, false);
+        try dev.cu.sync();
+        const kernel_start = Io.Clock.awake.now(io);
+        for (0..20) |_| try dev.matmulPacked(a_packed, b_packed, c16, .{ .m = case.m, .n = case.n, .k = case.k }, false, false);
+        try dev.cu.sync();
+        const kernel_ns: f64 = @floatFromInt(Io.Clock.awake.now(io).nanoseconds - kernel_start.nanoseconds);
+        const kernel_tflops = flops * 20 / kernel_ns / 1000;
+        dev.step_used = mark;
+
         const full = try gpa.alloc(T, case.m * case.n);
         defer gpa.free(full);
         const half = try gpa.alloc(T, case.m * case.n);
@@ -350,7 +362,7 @@ fn gpuTensorCore(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
             value_sum += f * f;
         }
         const worst: f64 = @sqrt(error_sum / value_sum);
-        try out.print("{s:<24}{d:>12.2}{d:>12.2}{d:>9.1}x{e:>14.2}\n", .{ case.name, tflops[0], tflops[1], tflops[1] / tflops[0], worst });
+        try out.print("{s:<24}{d:>12.2}{d:>12.2}{d:>9.1}x{d:>14.2}{e:>14.2}\n", .{ case.name, tflops[0], tflops[1], tflops[1] / tflops[0], kernel_tflops, worst });
     }
     try out.writeAll("\n");
 }
