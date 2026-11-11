@@ -15,6 +15,8 @@ const Tensor = @import("../tensor/tensor.zig").Tensor;
 
 const Tape = autograd.Tape;
 
+// ***** command line *****
+
 const Progress = struct { epoch: usize, epochs: usize, done: usize, steps: usize, loss: f64, elapsed_ns: i96, epochs_left: usize };
 
 fn printProgress(out: *Io.Writer, p: Progress) !void {
@@ -32,6 +34,8 @@ fn printProgress(out: *Io.Writer, p: Progress) !void {
 
 const Mix = struct { box: augment_math.Box = .{}, kept: f32 = 1 };
 
+// Draws a CutMix box covering a random share of the image, or an empty box with probability 1 - probability.
+// Returns the share of the original image that stays visible, which weights the two labels in the loss.
 fn drawMix(side: u32, probability: f32, seed: u64) Mix {
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
@@ -48,6 +52,7 @@ fn valueOf(arg: [:0]const u8, comptime name: []const u8) ?[:0]const u8 {
     return if (std.mem.startsWith(u8, arg, name ++ "=")) arg[name.len + 1 ..] else null;
 }
 
+// Everything the command line can set. The first number is the epoch count and a second plain argument is the data directory.
 const Options = struct {
     gpu: bool = false,
     profile: bool = false,
@@ -134,6 +139,8 @@ const Options = struct {
         return o;
     }
 };
+// ***** training loop *****
+
 fn Runner(comptime Spec: type, comptime batch_size: usize) type {
     const pixels = Spec.side * Spec.side * Spec.channels;
 
@@ -458,6 +465,8 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
     };
 }
 
+/// Runs a whole program for a model description: parses the flags, loads data, trains, evaluates and writes the optional outputs.
+/// Spec supplies the layers, the forward pass, the data loader and the batch sizes it was built for; --batch picks one of them.
 pub fn run(comptime Spec: type, init: std.process.Init) !void {
     const allowed = if (@hasDecl(Spec, "batches")) Spec.batches else [_]usize{Spec.batch};
     var wanted: usize = Spec.batch;

@@ -7,6 +7,13 @@ const Gpu = @import("../gpu/gpu.zig").Gpu;
 const Var = autograd.Var;
 const Tape = autograd.Tape;
 
+// ***** layers *****
+//
+// A layer is a struct with init, deinit, toGpu, forward, params and state. params lists the
+// trainable variables for the optimizer; state lists every float slice a checkpoint must store.
+
+/// A fully connected layer, y = x * w + b, with He-normal weights and zero bias.
+/// x has shape (rows, n_in) and the result has shape (rows, n_out).
 pub fn Linear(comptime n_in: usize, comptime n_out: usize) type {
     const W = Tensor(f32, &.{ n_in, n_out });
     const B = Tensor(f32, &.{n_out});
@@ -68,6 +75,8 @@ pub fn Linear(comptime n_in: usize, comptime n_out: usize) type {
     };
 }
 
+/// Batch normalization over the last axis of c channels, with running statistics for evaluation.
+/// forwardRelu fuses the following ReLU into the same kernel.
 pub fn BatchNorm(comptime c: usize) type {
     const V = Tensor(f32, &.{c});
 
@@ -143,6 +152,7 @@ pub fn BatchNorm(comptime c: usize) type {
     };
 }
 
+/// A bias-free convolution of an NHWC input with a k x k kernel; opts sets stride, padding, dilation and groups.
 pub fn Conv2d(comptime c_in: usize, comptime c_out: usize, comptime k: usize, comptime opts: autograd.ConvOpts) type {
     const Inner = Linear(k * k * c_in / opts.groups, c_out);
 
@@ -177,6 +187,7 @@ pub fn Conv2d(comptime c_in: usize, comptime c_out: usize, comptime k: usize, co
     };
 }
 
+/// A convolution followed by batch normalization, the usual building block of the residual networks.
 pub fn ConvBn(comptime c_in: usize, comptime c_out: usize, comptime k: usize, comptime opts: autograd.ConvOpts) type {
     const Conv = Conv2d(c_in, c_out, k, opts);
     const Norm = BatchNorm(c_out);
@@ -220,6 +231,7 @@ pub fn ConvBn(comptime c_in: usize, comptime c_out: usize, comptime k: usize, co
     };
 }
 
+/// A gated recurrent unit. forward takes the input and the previous hidden state and returns the next hidden state.
 pub fn Gru(comptime n_in: usize, comptime hidden: usize) type {
     const Input = Linear(n_in, hidden);
     const Recurrent = Linear(hidden, hidden);
@@ -276,6 +288,9 @@ pub fn Gru(comptime n_in: usize, comptime hidden: usize) type {
     };
 }
 
+// ***** transformer *****
+
+/// Layer normalization over the last axis of c features, with learned scale (starts at one) and shift (starts at zero).
 pub fn LayerNorm(comptime c: usize) type {
     const V = Tensor(f32, &.{c});
 
@@ -332,6 +347,7 @@ pub fn LayerNorm(comptime c: usize) type {
     };
 }
 
+/// A lookup table of vocab rows with width features each; forward gathers the rows named by ids.
 pub fn Embedding(comptime vocab: usize, comptime width: usize) type {
     const W = Tensor(f32, &.{ vocab, width });
 
@@ -374,6 +390,8 @@ pub fn Embedding(comptime vocab: usize, comptime width: usize) type {
     };
 }
 
+// One causal attention head. Queries, keys and values are projected to depth features, the scores
+// are softmaxed per sequence of steps rows, and the mixed values are projected back to width.
 fn Head(comptime width: usize, comptime depth: usize, comptime steps: usize) type {
     const Layers = struct { Linear(width, depth), Linear(width, depth), Linear(width, depth), Linear(depth, width) };
 
@@ -417,6 +435,8 @@ fn Head(comptime width: usize, comptime depth: usize, comptime steps: usize) typ
     };
 }
 
+/// Causal multi-head self-attention over sequences of steps rows; the heads are separate layers whose outputs are summed.
+/// x has shape (batch * steps, width) and heads must divide width.
 pub fn Attention(comptime width: usize, comptime heads: usize, comptime steps: usize) type {
     const One = Head(width, width / heads, steps);
     const Group = blk: {
@@ -458,6 +478,7 @@ pub fn Attention(comptime width: usize, comptime heads: usize, comptime steps: u
     };
 }
 
+/// A pre-norm Transformer block: attention and a GELU feed-forward network (4 * width hidden), each with a residual connection.
 pub fn TransformerBlock(comptime width: usize, comptime heads: usize, comptime steps: usize) type {
     const Layers = struct { LayerNorm(width), Attention(width, heads, steps), LayerNorm(width), Linear(width, 4 * width), Linear(4 * width, width) };
 
@@ -494,6 +515,11 @@ pub fn TransformerBlock(comptime width: usize, comptime heads: usize, comptime s
         }
     };
 }
+// ***** layer lists *****
+//
+// A model is a tuple of layers. The functions below walk the tuple at compile time and
+// concatenate what each layer reports.
+
 fn Gathered(comptime Layers: type, comptime method: []const u8) type {
     comptime var types: []const type = &.{};
     inline for (@typeInfo(Layers).@"struct".field_types) |Layer| {
@@ -515,6 +541,7 @@ fn gather(layers: anytype, comptime method: []const u8) Gathered(@TypeOf(layers)
     return out;
 }
 
+/// Builds every layer of a tuple type; layers already built are released if a later one fails.
 pub fn initAll(comptime Layers: type, gpa: Allocator, rng: std.Random) Allocator.Error!Layers {
     var layers: Layers = undefined;
     inline for (@typeInfo(Layers).@"struct".field_types, 0..) |Layer, i| {
@@ -526,22 +553,26 @@ pub fn initAll(comptime Layers: type, gpa: Allocator, rng: std.Random) Allocator
     return layers;
 }
 
+/// Releases every layer of a tuple.
 pub fn deinitAll(layers: anytype, gpa: Allocator) void {
     inline for (layers) |layer| layer.deinit(gpa);
 }
 
+/// Copies every layer of a tuple to the device and returns the device copy.
 pub fn toGpuAll(layers: anytype, gpu: *Gpu) autograd.Error!@TypeOf(layers) {
     var out: @TypeOf(layers) = undefined;
     inline for (layers, 0..) |layer, i| out[i] = try layer.toGpu(gpu);
     return out;
 }
 
+/// Returns the trainable variables of all layers as one flat tuple.
 pub fn params(layers: anytype) Gathered(@TypeOf(layers), "params") {
     return gather(layers, "params");
 }
 
 const params_ = params;
 
+/// Returns every float slice that a checkpoint must store (weights and batch norm statistics) as one flat tuple.
 pub fn state(layers: anytype) Gathered(@TypeOf(layers), "state") {
     return gather(layers, "state");
 }
@@ -739,4 +770,75 @@ test "a linear layer learns a separable problem" {
         last = loss.value.data[0];
     }
     try testing.expect(last < first / 4);
+}
+
+test "a transformer block is causal, its input gradient matches finite differences, and the gpu agrees with the cpu" {
+    const gpa = testing.allocator;
+    const Block = TransformerBlock(8, 2, 4);
+    const X = Tensor(f32, &.{ 8, 8 });
+    var prng = std.Random.DefaultPrng.init(21);
+    const block = try Block.init(gpa, prng.random());
+    defer block.deinit(gpa);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var input: [64]f32 = undefined;
+    for (&input) |*v| v.* = prng.random().floatNorm(f32);
+    var targets: [64]f32 = undefined;
+    for (&targets, 0..) |*v, i| v.* = 0.1 * @as(f32, @floatFromInt(i % 7)) - 0.3;
+
+    const forwardOf = struct {
+        fn run(alloc: Allocator, layer: Block, values: []const f32) ![]const f32 {
+            var tape: Tape = .{ .gpa = alloc };
+            const x = try tape.constant(try X.fromSlice(alloc, values));
+            return (try layer.forward(&tape, x)).value.data;
+        }
+    }.run;
+    const lossOf = struct {
+        fn run(alloc: Allocator, layer: Block, values: []const f32, wanted: []const f32) !f32 {
+            var tape: Tape = .{ .gpa = alloc };
+            const x = try tape.constant(try X.fromSlice(alloc, values));
+            const target = try tape.constant(try X.fromSlice(alloc, wanted));
+            return (try tape.mse(try layer.forward(&tape, x), target)).value.data[0];
+        }
+    }.run;
+
+    // Rows 0 to 3 are one sequence and rows 4 to 7 another; changing row 2 may only affect rows 2 and 3.
+    // NOTE: the change must differ between features, because layer norm removes a shift that is the same for all of them.
+    const base = try forwardOf(a, block, &input);
+    var changed = input;
+    for (changed[2 * 8 ..][0..8], 0..) |*v, j| v.* += @as(f32, @floatFromInt(j)) - 3;
+    const moved = try forwardOf(a, block, &changed);
+    for (base[0 .. 2 * 8], moved[0 .. 2 * 8]) |want, got| try testing.expectApproxEqAbs(want, got, 1e-6);
+    for (base[4 * 8 ..], moved[4 * 8 ..]) |want, got| try testing.expectApproxEqAbs(want, got, 1e-6);
+    var largest: f32 = 0;
+    for (base[2 * 8 .. 4 * 8], moved[2 * 8 .. 4 * 8]) |want, got| largest = @max(largest, @abs(want - got));
+    try testing.expect(largest > 1e-3);
+
+    var tape: Tape = .{ .gpa = a };
+    const x = try tape.leaf(try X.fromSlice(a, &input));
+    const target = try tape.constant(try X.fromSlice(a, &targets));
+    try tape.backward(try tape.mse(try block.forward(&tape, x), target));
+    for ([_]usize{ 0, 10, 27, 40, 63 }) |i| {
+        var plus = input;
+        var minus = input;
+        plus[i] += 1e-2;
+        minus[i] -= 1e-2;
+        const numeric = (try lossOf(a, block, &plus, &targets) - try lossOf(a, block, &minus, &targets)) / 2e-2;
+        try testing.expectApproxEqAbs(numeric, x.grad.data[i], 3e-3);
+    }
+
+    const gpu = try Gpu.forTest(1 << 24);
+    defer gpu.deinit();
+    const on_gpu = try block.toGpu(gpu);
+    var gpu_tape: Tape = .{ .gpa = a, .par = .{ .gpu = gpu } };
+    const gpu_x = try gpu_tape.leaf(X{ .data = try gpu.alloc(f32, input.len) });
+    try gpu.upload(gpu_x.value.data, &input);
+    const gpu_target = try gpu_tape.constant(X{ .data = try gpu.alloc(f32, targets.len) });
+    try gpu.upload(gpu_target.value.data, &targets);
+    try gpu_tape.backward(try gpu_tape.mse(try on_gpu.forward(&gpu_tape, gpu_x), gpu_target));
+    var back: [64]f32 = undefined;
+    try gpu.download(&back, gpu_x.grad.data);
+    for (back, x.grad.data) |got, want| try testing.expectApproxEqAbs(want, got, 1e-4);
 }

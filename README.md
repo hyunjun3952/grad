@@ -11,7 +11,7 @@ The goal is an engine that sits between "C with pointers" and "PyTorch": plain s
 | CIFAR-10 | ResNet-14, widths 64-128-256 | 94.1% (50 epochs) to 94.9% (100 epochs); flip + shift + CutMix + label smoothing + EMA, +0.4 with `--tta` | 17.2 s GPU (bf16 tensor cores), 25.0 s (TF32), 53.7 s (strict f32) |
 | CIFAR-10 | ResNet-14, widths 64-192-384 (`-Dwide=true`) | 94.8% / 95.3% with `--tta` (50 epochs), 95.4% / **96.2%** with `--tta` (100 epochs); same recipe | 24.7 s GPU (bf16 tensor cores) |
 
-Measured on an i5-8500 (6 cores) and an RTX 3060 12 GB. About 7,600 lines including 81 tests, with no comments except for explained magic numbers.
+Measured on an i5-8500 (6 cores) and an RTX 3060 12 GB. About 11,000 lines of code including 105 tests.
 
 ## Highlights
 
@@ -35,6 +35,7 @@ powershell -File scripts/fetch-data.ps1            # MNIST, Fashion-MNIST, CIFAR
 
 zig build regression                                # fit a curve with a small MLP (library API without the trainer)
 zig build charlm -- 1500 --gpu                      # character-level GRU on Tiny Shakespeare, then sample text
+zig build transformer -- 1500 --gpu                 # character-level Transformer (2 causal blocks, width 64), then sample text
 zig build mnist -- 5                                # MLP on the CPU
 zig build mnist -- 5 --gpu                          # MLP on the GPU
 zig build mnist -Dcnn=true -- 30 --gpu --shift=1 --rotate=8 --zoom=0.05
@@ -87,7 +88,7 @@ The script runs the model in the ONNX reference evaluator and compares it with t
 
 ## bf16 activations
 
-`Tensor(T, shape)` is generic over its element type, and on the GPU the activations of a network can be kept in bf16 (stored as `u16`) between layers while parameters, parameter gradients, optimizer state and the loss stay in f32. `Tape.cast(x, u16)` and `Tape.cast(x, f32)` convert in both directions and pass gradients through; batch norm (also fused with ReLU), `addRelu`, max and average pooling and stride-1 convolutions accept bf16 tensors directly. A bf16 convolution gathers its input straight from the bf16 activations and writes bf16, so the pack and unpack passes of the f32 path disappear, and the element-wise kernels move half the bytes. `zig build cifar -Dbf16=true -- 50 --gpu --tensor-cores ...` casts after the stem and back before the classifier; the CIFAR epoch goes from 18.3 s to 15.4 s in the same session. Limits: GPU only, convolutions need a multiple of 64 input and 32 output channels (checked at compile time), and `matmul`, `relu`, `add`, `mul`, `dropout`, the losses and the ONNX exporter are still f32 only.
+`Tensor(T, shape)` is generic over its element type, and on the GPU the activations of a network can be kept in bf16 (stored as `u16`) between layers while parameters, parameter gradients, optimizer state and the loss stay in f32. `Tape.cast(x, u16)` and `Tape.cast(x, f32)` convert in both directions and pass gradients through; batch norm (also fused with ReLU), `addRelu`, `add` and `mul` (with broadcasting), `relu`, `activate`, `dropout`, `layerNorm`, `softmax` (also causal), max and average pooling and stride-1 convolutions accept bf16 tensors directly; layer norm keeps its scale, shift and statistics in f32, and sums in every op run in f32. A bf16 convolution gathers its input straight from the bf16 activations and writes bf16, so the pack and unpack passes of the f32 path disappear, and the element-wise kernels move half the bytes. `zig build cifar -Dbf16=true -- 50 --gpu --tensor-cores ...` casts after the stem and back before the classifier; the CIFAR epoch goes from 18.3 s to 15.4 s in the same session. Limits: GPU only, convolutions need a multiple of 64 input and 32 output channels (checked at compile time), and `matmul`, `batchedMatmul`, `embedding`, the losses and the ONNX exporter are still f32 only, so a Transformer casts around its matrix products.
 
 ## Optional cuDNN backend
 
@@ -121,6 +122,7 @@ zig build bench -- cudnn        # cuDNN convolutions on the CIFAR shapes (needs 
 | CIFAR-100 ResNet-14 (`-Dcifar100=true`) | GPU, bf16 | 17.3 s |
 | CIFAR-10 ResNet-14 64-192-384 (`-Dwide=true`) | GPU, bf16 | 25.3 s |
 | Character GRU, 256 units, 32 x 64 steps | GPU | about 70 ms per step (whole run, including start-up and the 600-character sample) |
+| Character Transformer, 2 blocks, width 64, 16 x 64 characters | GPU | 1500 steps in 22 s including the build and the sample; loss 1.95 nats/char (single run, not tuned) |
 
 The MNIST CNN on the CPU went from 24.6 s to 13.2 s with the row-wise im2col/col2im, the stored max-pool winners and the vectorised batch-norm statistics (see `zig build bench -- cpu`); the bf16 CIFAR epoch has been 31.7, 25.0, 17.6 and now 17.2 s over the last rounds (fused ops, implicit GEMM, 64x128 and 128x128 tiles).
 
@@ -176,6 +178,7 @@ examples/
   mnist/  cifar/         image-classification programs built on the trainer
   regression/            a hand-written training loop: MLP, mse, Adam
   charlm/                a character-level GRU unrolled over 64 steps, with text generation
+  transformer/           a character-level Transformer with learned positions, 16 x 64 characters per step
 scripts/fetch-data.ps1   dataset download with checksum verification
 scripts/check-onnx.py    compare an exported ONNX file with the engine (needs numpy and onnx)
 ```

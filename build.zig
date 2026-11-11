@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) void {
     config.addOption(bool, "bf16", b.option(bool, "bf16", "cifar example: keep the activations in bf16 between the stem and the classifier (needs --gpu)") orelse false);
     config.addOption(bool, "cifar100", b.option(bool, "cifar100", "cifar example: train on CIFAR-100 (data/cifar100) instead of CIFAR-10") orelse false);
 
-    inline for (.{ "mnist", "cifar", "regression", "charlm", "onnx" }) |name| {
+    inline for (.{ "mnist", "cifar", "regression", "charlm", "transformer", "onnx" }) |name| {
         const exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{

@@ -14,7 +14,7 @@ The shell is PowerShell on Windows. Commands that matter:
 zig build test                                   # all tests; GPU tests skip themselves when no driver is found
 zig build test -Dtest-filter="softmax"           # only tests whose name contains the text (repeatable)
 zig fmt --check src examples build.zig           # formatting gate; run `zig fmt src examples build.zig` to fix
-zig build mnist -- 5 --gpu                       # example programs: mnist, cifar, regression, charlm, onnx
+zig build mnist -- 5 --gpu                       # example programs: mnist, cifar, regression, charlm, transformer, onnx
 zig build cifar -Dbf16=true -- 50 --gpu --tensor-cores --flip --shift=4 --cutmix=0.5 --ema=0.999
 zig build bench -- tc                            # bench modes: (none) cpu matmul, cpu, step, gpu, tc, cudnn
 zig build -Dtarget=x86_64-linux-gnu --prefix zig-out-linux   # Linux compile check only, never run
@@ -30,7 +30,7 @@ zig build -Dtarget=x86_64-linux-gnu --prefix zig-out-linux   # Linux compile che
 
 **Compile-time shapes.** `Tensor(T, shape)` (`src/tensor/`) carries its shape in the type; `T` is generic (f32, and `u16` standing for bf16 activations). Batch sizes are compile-time too: a program lists the sizes it is built for in `Spec.batches` and `--batch=N` picks one (`src/nn/trainer.zig`, `run`). Anything that must work at run time with unknown shapes lives in the separate ONNX runtime (`src/onnx/runtime.zig`), not in the tape.
 
-**Tape and ops** (`src/autograd/autograd.zig`). A type-erased `Tape` records backward closures; `Var(Tn)` is `{value, grad, needs_grad}`. Every op has a CPU branch and a `par.gpu` branch, and a backward closure that `+=` into input gradients, so gradient buffers must start at zero (GPU: the zero arena, `Gpu.scratchZeroed`, reset in `resetStep`). `conv2d` picks one of several paths (`ConvPath`: direct im2col, packed bf16 im2col, implicit GEMM, TF32, cuDNN, grouped) once per call; bf16 activations (`Elem == u16`) go through `convHalf`, and batch norm, `addRelu`, pooling and `cast` are generic over the element type. `Tape.trace` records ops by data pointer for the ONNX exporter (`src/onnx/onnx.zig`); a tensor viewed with another shape through `reshape` is the same pointer, and the exporter inserts the Reshape itself.
+**Tape and ops** (`src/autograd/autograd.zig`). A type-erased `Tape` records backward closures; `Var(Tn)` is `{value, grad, needs_grad}`. Every op has a CPU branch and a `par.gpu` branch, and a backward closure that `+=` into input gradients, so gradient buffers must start at zero (GPU: the zero arena, `Gpu.scratchZeroed`, reset in `resetStep`). `conv2d` picks one of several paths (`ConvPath`: direct im2col, packed bf16 im2col, implicit GEMM, TF32, cuDNN, grouped) once per call; bf16 activations (`Elem == u16`) go through `convHalf`, and every other op except `matmul`, `batchedMatmul`, `embedding`, the losses and the exporter is generic over the element type (the device kernel has a `...Half` twin; the CPU branch returns `error.NoDevice` for bf16). `Tape.trace` records ops by data pointer for the ONNX exporter (`src/onnx/onnx.zig`); a tensor viewed with another shape through `reshape` is the same pointer, and the exporter inserts the Reshape itself.
 
 **One math, two backends.** Per-element math shared by CPU and device is in `src/gpu/math/*.zig` (must stay under `src/gpu` because the device module root is `src/gpu/device.zig`). Device exports are in `device.zig`; the host side in `src/gpu/gpu.zig` launches them by name through the `Kernel` enum (a missing enum entry or a name mismatch is a compile error, not a runtime one). Kernel arguments are bundled in extern structs in `src/gpu/args.zig`; `Gpu.launch` converts slices to device addresses, so device tensors are ordinary slices that hold device addresses (never index them on the host).
 
@@ -42,10 +42,26 @@ zig build -Dtarget=x86_64-linux-gnu --prefix zig-out-linux   # Linux compile che
 
 ## Conventions specific to this repo
 
-- No code comments, with the exception of a few short English comments on magic numbers (there are about five). Do not add `//` or `///`.
+- Always answer the user in Korean only. Code, identifiers and commit messages stay in English.
+
+- A public item gets a `///` doc comment: a one-line summary in the third person, at most two or three more sentences, parameters described inline rather than in a list, and a short fenced example only where it clarifies the call. Never use backticks inside comments; write names and expressions as plain text. Bodies get `//` comments that say why (a constraint, a device quirk, a numerical reason), tagged `NOTE:` or `TODO:`, never what the next line does. Large files are divided with `// ***** name *****` banners. Private helpers are commented only where the logic is not obvious. Keep a comment true when the code changes.
 - Prefer one function with an options struct over sibling functions; bundle long argument lists into structs; keep the codebase small.
 - Commit messages must not contain `Co-Authored-By` or `Claude-Session` trailers, regardless of any default.
 - Tests live next to the code. A test file only runs if it is reachable from the `test` block in `src/root.zig`; `refAllDecls` does not recurse, so a new file with tests must be added to that list (an unlisted ONNX test once never ran).
 - A GPU test compares against the CPU or a reference with `gradcheck.zig` helpers (`expectFiniteDifferences`, `expectGpuMatchesCpu`, `expectTensorCoresClose`, ...) or hand-written references; fixed bf16 or TF32 tolerances are loose on purpose. Use `Gpu.forTest(bytes)` to get a device or skip.
 - Zig 0.17 gotchas seen here: `[_]T{x} ** n` fails the `**` spacing rule in this toolchain (use `@splat` or a comptime loop); `zig fmt` rewrites some builtins (`@intFromEnum` becomes `@backingInt`), so re-read a line after formatting before patching it by text; a function parameter may not shadow a method or a file-level name; `gpa.create` does not apply struct field defaults, so set fields explicitly (see `Gpu.init`).
 - PowerShell does not stop at a failed .NET call unless `$ErrorActionPreference = 'Stop'` is set; scripted multi-file edits should set it, otherwise half of a patch can be written.
+
+## Mistakes that happened repeatedly (do not repeat them)
+
+- **A test counts as passing only if you saw it run.** `zig build test` prints nothing on success, so an empty `Select-String` proves nothing, and a test file missing from the `test` block of `src/root.zig` is never compiled. After adding a test, run `zig build test --summary all` and check that the pass count rose; break the code once on purpose to see the test fail.
+- **Report only what was measured.** Label estimates and anything never run (the Linux loader, multi-GPU) as such. Timings drift between sessions, so compare inside one session against a re-measured baseline of the previous commit.
+- **Ask before committing or pushing** unless the message says to ("커밋하고 푸시해").
+- **Read the current text before patching it.** `zig fmt` renames builtins, breaks lines and drops trailing commas, so an exact-match patch written from an older copy fails or applies halfway. Use unique anchors, set `$ErrorActionPreference = 'Stop'` in scripted edits, and run `git diff --stat` after a failure.
+- **Scripted patch helpers broke on PowerShell array unrolling** ("count 814 ... for: p": the pairs were flattened into strings, so the helper searched for one letter). Prefer the Edit tool for source edits. If a script is needed, build each pair as a hashtable or [pscustomobject] with named fields, never as nested arrays returned from a function, and never write backticks in double-quoted strings (backtick plus a letter is an escape). Test the helper on one pair before sending the full batch.
+- **Do not trust hand-computed expected values** (three were wrong: grouped convolution, dilated convolution, a causal limit). Compute them with an independent reference, and when a test fails decide whether the code or the expectation is wrong before editing either.
+- **Test inputs and device memory:** list every `Inputs` field in a gradcheck case's `names` (an uninitialised slice segfaults); make `acceptable` accept a reasonable share of random inputs (a strict filter looped for ten minutes); device slices hold device addresses, so never `@memcpy` or index them on the host; large GPU tests need a large `Gpu.forTest` arena.
+- **Compile errors that keep recurring:** `**` array repetition, locals that shadow file-level names or parameters (`nn`, `cpu`, `act`, `scores`, `p`, `state`, `shape`), and unused locals left behind by a refactor.
+- **No scratch code left behind:** remove debug prints and placeholder lines; write the test cleanly the first time.
+- **Do not rebuild an exe that a background run uses** (copy it first), do not start other GPU work while timing, and use `run_in_background` for anything longer than a few minutes.
+- **Try a tool behaviour before documenting it.** `--test-filter` is not accepted at run time by this Zig's test runner; it is the compile-time `-Dtest-filter` option here.

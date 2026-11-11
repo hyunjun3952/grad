@@ -46,10 +46,13 @@ fn reducedAxisMask(comptime target: []const usize) u32 {
     return mask;
 }
 
+/// A value on the tape: its tensor, the gradient buffer of the same shape, and whether a gradient is needed.
+/// Gradients are accumulated with +=, so the buffer starts at zero.
 pub fn Var(comptime Tn: type) type {
     return struct { value: Tn, grad: Tn, needs_grad: bool };
 }
 
+/// Views a variable with another shape of the same length. The data and gradient are shared, nothing is copied.
 pub fn reshape(x: anytype, comptime shape: []const usize) Var(Tensor(@TypeOf(x.value).Elem, shape)) {
     const R = Tensor(@TypeOf(x.value).Elem, shape);
     comptime std.debug.assert(R.len == @TypeOf(x.value).len);
@@ -89,11 +92,15 @@ fn PoolOut(comptime In: type, comptime opts: PoolOpts) type {
     return Tensor(In.Elem, &.{ In.shape[0], (In.shape[1] + 2 * opts.pad - opts.kernel) / opts.stride + 1, (In.shape[2] + 2 * opts.pad - opts.kernel) / opts.stride + 1, In.shape[3] });
 }
 
+// ***** tape *****
+
 const Node = struct {
     ctx: *anyopaque,
     run: *const fn (*Tape, *anyopaque) Error!void,
 };
 
+/// Records the operations of one forward pass so that backward can replay them in reverse.
+/// Every op has a CPU branch and a GPU branch (when par.gpu is set); results live in the GPU scratch arena or in gpa.
 pub const Tape = struct {
     gpa: Allocator,
     par: kernels.Parallel = .{},
@@ -112,6 +119,7 @@ pub const Tape = struct {
         return Tn.empty(self.gpa);
     }
 
+    /// Returns a new tensor with every element set to value; the exporter records it as a constant.
     pub fn filledTensor(self: *Tape, comptime Tn: type, value: f32) Error!Tn {
         const filled = try self.newTensor(Tn);
         if (self.par.gpu) |dev| try dev.fill(filled.data, value) else @memset(filled.data, value);
@@ -119,6 +127,7 @@ pub const Tape = struct {
         return filled;
     }
 
+    /// Returns a new tensor of zeros that the tape does not own on the GPU (it comes from the zero arena).
     pub fn zeroedTensor(self: *Tape, comptime Tn: type) Error!Tn {
         const zeroed: Tn = if (self.par.gpu) |dev| .{ .data = try dev.scratchZeroed(Tn.Elem, Tn.len) } else .{ .data = try self.gpa.alloc(Tn.Elem, Tn.len) };
         if (self.par.gpu == null) @memset(zeroed.data, 0);
@@ -140,6 +149,7 @@ pub const Tape = struct {
         return .{ .value = value, .grad = grad, .needs_grad = needs_grad };
     }
 
+    /// Reads a one-element variable back to the host, synchronizing the device if needed.
     pub fn scalar(self: *Tape, v: anytype) Error!@TypeOf(v.value).Elem {
         if (self.par.gpu) |dev| return dev.scalar(v.value.data);
         return v.value.data[0];
@@ -152,16 +162,19 @@ pub const Tape = struct {
             try dev.elementwise(op, a.data, b.data, out.data, .{ .dims = padToRank(&bc.dims, 1), .a_strides = padToRank(&bc.a, 0), .b_strides = padToRank(&bc.b, 0) });
             return out;
         }
+        if (comptime @TypeOf(a).Elem != f32) return error.NoDevice;
         return switch (op) {
             .add => ops.add(self.gpa, a, b),
             .mul => ops.mul(self.gpa, a, b),
         };
     }
 
+    /// Wraps a tensor as a trainable input whose gradient will be computed.
     pub fn leaf(self: *Tape, value: anytype) Error!Var(@TypeOf(value)) {
         return self.makeVar(value, true);
     }
 
+    /// Wraps a tensor as an input that receives no gradient.
     pub fn constant(self: *Tape, value: anytype) Error!Var(@TypeOf(value)) {
         return self.makeVar(value, false);
     }
@@ -192,6 +205,7 @@ pub const Tape = struct {
             }
             return;
         }
+        if (comptime D.Elem != f32) return error.NoDevice;
         if (comptime std.mem.eql(usize, D.shape, G.shape)) {
             for (v.grad.data, g.data) |*d, x| d.* += x;
         } else {
@@ -200,6 +214,7 @@ pub const Tape = struct {
         }
     }
 
+    /// Adds two tensors with broadcasting; the gradient of a broadcast operand is summed back to its shape.
     pub fn add(self: *Tape, a: anytype, b: anytype) Error!Var(ops.BroadcastResult(@TypeOf(a.value), @TypeOf(b.value))) {
         const out = try self.makeVar(try self.elementwise(.add, a.value, b.value), a.needs_grad or b.needs_grad);
         try self.note(.add, .{ a, b }, out, .{});
@@ -213,6 +228,7 @@ pub const Tape = struct {
         return out;
     }
 
+    /// Computes max(a + b, 0) in one pass, as used by residual connections. Both operands must have the same shape.
     pub fn addRelu(self: *Tape, a: anytype, b: anytype) Error!Var(@TypeOf(a.value)) {
         comptime if (@TypeOf(a.value) != @TypeOf(b.value)) @compileError("addRelu expects two tensors of the same shape");
         const T = @TypeOf(a.value);
@@ -239,6 +255,7 @@ pub const Tape = struct {
         return out;
     }
 
+    /// Multiplies two tensors element by element with broadcasting.
     pub fn mul(self: *Tape, a: anytype, b: anytype) Error!Var(ops.BroadcastResult(@TypeOf(a.value), @TypeOf(b.value))) {
         const out = try self.makeVar(try self.elementwise(.mul, a.value, b.value), a.needs_grad or b.needs_grad);
         try self.note(.mul, .{ a, b }, out, .{});
@@ -252,6 +269,7 @@ pub const Tape = struct {
         return out;
     }
 
+    /// Multiplies matrices (m, k) x (k, n); the backward pass uses the transposed products without materializing them.
     pub fn matmul(self: *Tape, a: anytype, b: anytype) Error!Var(tensor.MatmulResult(@TypeOf(a.value), @TypeOf(b.value), .{})) {
         const value = try self.newTensor(tensor.MatmulResult(@TypeOf(a.value), @TypeOf(b.value), .{}));
         try tensor.matmulInto(self.gpa, self.par, a.value, b.value, value, .{});
@@ -267,12 +285,14 @@ pub const Tape = struct {
         return out;
     }
 
+    /// Applies max(x, 0) element by element.
     pub fn relu(self: *Tape, x: anytype) Error!Var(@TypeOf(x.value)) {
         var value: @TypeOf(x.value) = undefined;
         if (self.par.gpu) |dev| {
             value = try self.newTensor(@TypeOf(x.value));
             try dev.relu(x.value.data, value.data);
         } else {
+            if (comptime @TypeOf(x.value).Elem != f32) return error.NoDevice;
             value = try ops.relu(self.gpa, x.value);
         }
         const out = try self.makeVar(value, x.needs_grad);
@@ -289,6 +309,7 @@ pub const Tape = struct {
         return out;
     }
 
+    /// Multiplies (batch, m, k) by (batch, k, n), or by (batch, n, k) when trans_b is set (attention scores).
     pub fn batchedMatmul(self: *Tape, a: anytype, b: anytype, comptime trans_b: bool) Error!Var(Tensor(f32, &.{ @TypeOf(a.value).shape[0], @TypeOf(a.value).shape[1], if (trans_b) @TypeOf(b.value).shape[1] else @TypeOf(b.value).shape[2] })) {
         const A = @TypeOf(a.value);
         const B = @TypeOf(b.value);
@@ -323,6 +344,7 @@ pub const Tape = struct {
         return out;
     }
 
+    /// Gathers the rows of table named by ids; the backward pass scatters the gradient back with atomic adds.
     pub fn embedding(self: *Tape, table: anytype, comptime n: usize, ids: []const u32) Error!Var(Tensor(f32, &.{ n, @TypeOf(table.value).shape[1] })) {
         const width = @TypeOf(table.value).shape[1];
         std.debug.assert(ids.len == n);
@@ -345,9 +367,10 @@ pub const Tape = struct {
         return out;
     }
 
+    /// Normalizes each row to zero mean and unit variance, then scales by gamma and shifts by beta.
     pub fn layerNorm(self: *Tape, x: anytype, gamma: anytype, beta: anytype) Error!Var(@TypeOf(x.value)) {
         const X = @TypeOf(x.value);
-        comptime if (X.rank != 2 or X.Elem != f32 or @TypeOf(gamma.value).shape[0] != X.shape[1]) @compileError("layerNorm expects an f32 (rows, columns) tensor and (columns) parameters");
+        comptime if (X.rank != 2 or @TypeOf(gamma.value).Elem != f32 or @TypeOf(gamma.value).shape[0] != X.shape[1]) @compileError("layerNorm expects a (rows, columns) tensor and f32 (columns) parameters");
         const rows = X.shape[0];
         const cols = X.shape[1];
         const Stats = Tensor(f32, &.{rows});
@@ -357,8 +380,9 @@ pub const Tape = struct {
         if (self.par.gpu) |dev| {
             try dev.layerNorm(.{ .x = x.value.data, .gamma = gamma.value.data, .mean = mean.data, .inv_std = inv_std.data }, beta.value.data, value.data);
         } else {
+            if (comptime X.Elem != f32) return error.NoDevice;
             for (0..rows) |r| {
-                const row = layernorm_math.forwardRow(x.value.data.ptr + r * cols, value.data.ptr + r * cols, gamma.value.data.ptr, beta.value.data.ptr, cols);
+                const row = layernorm_math.forwardRow(f32, x.value.data.ptr + r * cols, value.data.ptr + r * cols, gamma.value.data.ptr, beta.value.data.ptr, cols);
                 mean.data[r] = row.mean;
                 inv_std.data[r] = row.inv_std;
             }
@@ -368,30 +392,33 @@ pub const Tape = struct {
         if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .gamma = gamma, .beta = beta, .mean = mean, .inv_std = inv_std, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
                 if (t.par.gpu) |dev| {
-                    const p: gpu_mod.Gpu.LayerNorm = .{ .x = c.x.value.data, .gamma = c.gamma.value.data, .mean = c.mean.data, .inv_std = c.inv_std.data };
+                    const p: gpu_mod.Gpu.LayerNorm(X.Elem) = .{ .x = c.x.value.data, .gamma = c.gamma.value.data, .mean = c.mean.data, .inv_std = c.inv_std.data };
                     return dev.layerNormBackward(p, c.out.grad.data, if (c.x.needs_grad) c.x.grad.data else null, if (c.gamma.needs_grad) c.gamma.grad.data else null, if (c.gamma.needs_grad) c.beta.grad.data else null);
                 }
+                if (comptime X.Elem != f32) return error.NoDevice;
                 for (0..rows) |r| {
-                    if (c.x.needs_grad) layernorm_math.backwardRow(c.x.value.data.ptr + r * cols, c.out.grad.data.ptr + r * cols, c.x.grad.data.ptr + r * cols, c.gamma.value.data.ptr, .{ .mean = c.mean.data[r], .inv_std = c.inv_std.data[r] }, cols);
+                    if (c.x.needs_grad) layernorm_math.backwardRow(f32, c.x.value.data.ptr + r * cols, c.out.grad.data.ptr + r * cols, c.x.grad.data.ptr + r * cols, c.gamma.value.data.ptr, .{ .mean = c.mean.data[r], .inv_std = c.inv_std.data[r] }, cols);
                 }
-                if (c.gamma.needs_grad) for (0..cols) |j| layernorm_math.parameterGradient(c.x.value.data.ptr, c.out.grad.data.ptr, c.mean.data.ptr, c.inv_std.data.ptr, c.gamma.grad.data.ptr, c.beta.grad.data.ptr, rows, cols, j);
+                if (c.gamma.needs_grad) for (0..cols) |j| layernorm_math.parameterGradient(f32, c.x.value.data.ptr, c.out.grad.data.ptr, c.mean.data.ptr, c.inv_std.data.ptr, c.gamma.grad.data.ptr, c.beta.grad.data.ptr, rows, cols, j);
             }
         }.run);
         return out;
     }
 
+    /// Applies softmax over the last axis. With causal_period above zero, row i only sees columns up to i % causal_period.
     pub fn softmax(self: *Tape, x: anytype, comptime causal_period: usize) Error!Var(@TypeOf(x.value)) {
         const X = @TypeOf(x.value);
-        comptime if (X.rank != 2 or X.Elem != f32) @compileError("softmax expects an f32 (rows, columns) tensor");
+        comptime if (X.rank != 2) @compileError("softmax expects a (rows, columns) tensor");
         const cols = X.shape[1];
         const value = try self.newTensor(X);
         if (self.par.gpu) |dev| {
             try dev.softmax(x.value.data, value.data, cols, causal_period);
         } else {
+            if (comptime X.Elem != f32) return error.NoDevice;
             const Job = struct { x: [*]const f32, y: [*]f32 };
             kernels.parallelFor(self.par, X.shape[0], 16, Job{ .x = x.value.data.ptr, .y = value.data.ptr }, struct {
                 fn run(job: Job, lo: usize, hi: usize) void {
-                    for (lo..hi) |r| softmax_math.forwardRow(job.x + r * cols, job.y + r * cols, cols, softmax_math.limitOf(r, cols, causal_period));
+                    for (lo..hi) |r| softmax_math.forwardRow(f32, job.x + r * cols, job.y + r * cols, cols, softmax_math.limitOf(r, cols, causal_period));
                 }
             }.run);
         }
@@ -400,12 +427,14 @@ pub const Tape = struct {
         if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
                 if (t.par.gpu) |dev| return dev.softmaxBackward(c.out.value.data, c.out.grad.data, c.x.grad.data, cols);
-                for (0..X.shape[0]) |r| softmax_math.backwardRow(c.out.value.data.ptr + r * cols, c.out.grad.data.ptr + r * cols, c.x.grad.data.ptr + r * cols, cols);
+                if (comptime X.Elem != f32) return error.NoDevice;
+                for (0..X.shape[0]) |r| softmax_math.backwardRow(f32, c.out.value.data.ptr + r * cols, c.out.grad.data.ptr + r * cols, c.x.grad.data.ptr + r * cols, cols);
             }
         }.run);
         return out;
     }
 
+    /// Converts the element type (f32 to bf16 and back); the gradient is converted the other way.
     pub fn cast(self: *Tape, x: anytype, comptime To: type) Error!Var(Tensor(To, @TypeOf(x.value).shape)) {
         const X = @TypeOf(x.value);
         if (X.Elem == To) return x;
@@ -424,30 +453,39 @@ pub const Tape = struct {
         return out;
     }
 
+    /// Applies one of the smooth activations in Activation (gelu, silu, tanh, ...) element by element.
     pub fn activate(self: *Tape, x: anytype, comptime kind: Activation) Error!Var(@TypeOf(x.value)) {
         const value = try self.newTensor(@TypeOf(x.value));
         const Job = struct { x: []const f32, y: []f32 };
-        if (self.par.gpu) |dev| try dev.activation(x.value.data, value.data, kind) else kernels.parallelFor(self.par, value.data.len, 1 << 14, Job{ .x = x.value.data, .y = value.data }, struct {
-            fn run(job: Job, lo: usize, hi: usize) void {
-                activation_math.apply(job.x, job.y, kind, lo, hi);
-            }
-        }.run);
+        if (self.par.gpu) |dev| {
+            try dev.activation(x.value.data, value.data, kind);
+        } else {
+            if (comptime @TypeOf(x.value).Elem != f32) return error.NoDevice;
+            kernels.parallelFor(self.par, value.data.len, 1 << 14, Job{ .x = x.value.data, .y = value.data }, struct {
+                fn run(job: Job, lo: usize, hi: usize) void {
+                    activation_math.apply(job.x, job.y, kind, lo, hi);
+                }
+            }.run);
+        }
         const out = try self.makeVar(value, x.needs_grad);
         try self.note(@field(trace_mod.Op, @tagName(kind)), .{x}, out, .{});
         const Ctx = struct { x: @TypeOf(x), out: @TypeOf(out) };
         if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
                 if (t.par.gpu) |dev| return dev.activationBackward(c.x.value.data, c.out.value.data, c.out.grad.data, c.x.grad.data, kind);
+                if (comptime @TypeOf(c.x.value).Elem != f32) return error.NoDevice;
                 activation_math.applyBackward(c.x.value.data, c.out.value.data, c.out.grad.data, c.x.grad.data, kind, 0, c.x.grad.data.len);
             }
         }.run);
         return out;
     }
 
-    fn dropKernel(self: *Tape, src: []const f32, dst: []f32, seed: u64, keep: f32, accumulate: bool) Error!void {
+    fn dropKernel(self: *Tape, src: anytype, dst: anytype, seed: u64, keep: f32, accumulate: bool) Error!void {
         if (self.par.gpu) |dev| return dev.dropout(src, dst, seed, keep, accumulate);
+        if (comptime @typeInfo(@TypeOf(dst)).pointer.child != f32) return error.NoDevice;
         kernels.parallelEach(self.par, src.len, drop.apply, .{ src, dst, seed, keep, accumulate });
     }
+    /// Zeroes each element with probability 1 - keep and scales the rest by 1 / keep; does nothing unless training is set.
     pub fn dropout(self: *Tape, x: anytype, keep: f32) Error!Var(@TypeOf(x.value)) {
         if (!self.training) return x;
         const seed = self.seed;
@@ -464,10 +502,12 @@ pub const Tape = struct {
         return out;
     }
 
+    /// Normalizes over every axis except the last using batch statistics while training and running ones otherwise.
     pub fn batchNorm(self: *Tape, x: anytype, gamma: anytype, beta: anytype, running: anytype) Error!Var(@TypeOf(x.value)) {
         return self.batchNormImpl(false, x, gamma, beta, running);
     }
 
+    /// Batch norm followed by ReLU, fused into one kernel.
     pub fn batchNormRelu(self: *Tape, x: anytype, gamma: anytype, beta: anytype, running: anytype) Error!Var(@TypeOf(x.value)) {
         return self.batchNormImpl(true, x, gamma, beta, running);
     }
@@ -510,6 +550,7 @@ pub const Tape = struct {
         return out;
     }
 
+    /// Averages kernel x kernel windows of an NHWC tensor.
     pub fn avgPool(self: *Tape, x: anytype, comptime opts: PoolOpts) Error!Var(PoolOut(@TypeOf(x.value), opts)) {
         const In = @TypeOf(x.value);
         const d: conv.Dims = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = In.shape[3], .k = opts.kernel, .stride = opts.stride, .pad = opts.pad };
@@ -575,6 +616,8 @@ pub const Tape = struct {
         return out;
     }
 
+    /// Convolves an NHWC input with weights of shape (k*k*c/groups, out).
+    /// NOTE: the algorithm (direct, packed bf16, implicit GEMM, TF32, cuDNN, grouped) is chosen once per call from the shapes and device flags.
     pub fn conv2d(self: *Tape, x: anytype, w: anytype, comptime opts: ConvOpts) Error!Var(ConvOut(@TypeOf(x.value), @TypeOf(w.value), opts)) {
         const In = @TypeOf(x.value);
         if (comptime In.Elem == u16) return self.convHalf(x, w, opts);
@@ -706,6 +749,7 @@ pub const Tape = struct {
         }.run);
         return out;
     }
+    /// Takes the maximum over kernel x kernel windows of an NHWC tensor.
     pub fn maxPool(self: *Tape, x: anytype, comptime opts: PoolOpts) Error!Var(PoolOut(@TypeOf(x.value), opts)) {
         const In = @TypeOf(x.value);
         const d: conv.Dims = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = In.shape[3], .k = opts.kernel, .stride = opts.stride, .pad = opts.pad };
@@ -723,6 +767,7 @@ pub const Tape = struct {
         return out;
     }
 
+    /// Returns the mean softmax cross-entropy of logits against class labels, with label smoothing from smoothing.
     pub fn crossEntropy(self: *Tape, logits: anytype, labels: []const u8) Error!Var(Tensor(@TypeOf(logits.value).Elem, &.{})) {
         const L = @TypeOf(logits.value);
         comptime {
@@ -768,6 +813,7 @@ pub const Tape = struct {
         return out;
     }
 
+    /// Returns the mean squared error between prediction and target.
     pub fn mse(self: *Tape, prediction: anytype, target: anytype) Error!Var(Tensor(@TypeOf(prediction.value).Elem, &.{})) {
         const P = @TypeOf(prediction.value);
         comptime {
@@ -781,6 +827,7 @@ pub const Tape = struct {
         return reshape(mean, &.{});
     }
 
+    /// Seeds the gradient of the scalar loss with one and runs the recorded backward closures in reverse order.
     pub fn backward(self: *Tape, loss: anytype) Error!void {
         comptime {
             if (@TypeOf(loss.value).rank != 0) @compileError("backward needs a scalar loss");
@@ -1939,4 +1986,81 @@ test "average pooling takes window means and spreads gradients evenly, also on t
     var grads: [16]f32 = undefined;
     try gpu.download(&grads, dx);
     for (grads) |g| try testing.expectEqual(@as(f32, 1), g);
+}
+
+const OpsResult = struct { out: [64 * 16]f32, grad_x: [64 * 16]f32, grad_bias: [16]f32, grad_gamma: [16]f32, grad_beta: [16]f32 };
+
+fn runElementwiseChain(comptime half: bool, gpu: *gpu_mod.Gpu, x_values: []const f32, scale_values: []const f32, g_values: []const f32, result: *OpsResult) !void {
+    const X = Tensor(f32, &.{ 64, 16 });
+    const Row = Tensor(f32, &.{16});
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try gpu.resetStep();
+    var t: Tape = .{ .gpa = arena.allocator(), .par = .{ .gpu = gpu }, .training = true };
+    const x = try t.leaf(X{ .data = try gpu.alloc(f32, X.len) });
+    const bias = try t.leaf(Row{ .data = try gpu.alloc(f32, 16) });
+    const gamma = try t.leaf(Row{ .data = try gpu.alloc(f32, 16) });
+    const beta = try t.leaf(Row{ .data = try gpu.alloc(f32, 16) });
+    try gpu.upload(x.value.data, x_values);
+    try gpu.upload(bias.value.data, scale_values[0..16]);
+    try gpu.upload(gamma.value.data, scale_values[16..32]);
+    try gpu.upload(beta.value.data, scale_values[32..48]);
+    inline for (.{ x, bias, gamma, beta }) |v| try gpu.fill(v.grad.data, 0);
+
+    const input = if (half) try t.cast(x, u16) else x;
+    const shift = if (half) try t.cast(bias, u16) else bias;
+    const normed = try t.layerNorm(input, gamma, beta);
+    const summed = try t.add(normed, shift);
+    const product = try t.mul(summed, normed);
+    const smooth = try t.activate(product, .gelu);
+    const rectified = try t.relu(smooth);
+    const thinned = try t.dropout(rectified, 0.8);
+    // NOTE: the gain makes the softmax inputs large enough that its output depends on every op before it; near zero it is almost uniform.
+    const gain = try t.constant(try t.filledTensor(Tensor(f32, &.{}), 6));
+    const sharpened = try t.mul(thinned, if (half) try t.cast(gain, u16) else gain);
+    const probabilities = try t.cast(try t.softmax(sharpened, 4), f32);
+    try gpu.download(&result.out, probabilities.value.data);
+    try gpu.upload(probabilities.grad.data, g_values);
+    var at = t.nodes.items.len;
+    while (at > 0) {
+        at -= 1;
+        try t.nodes.items[at].run(&t, t.nodes.items[at].ctx);
+    }
+    try gpu.download(&result.grad_x, x.grad.data);
+    try gpu.download(&result.grad_bias, bias.grad.data);
+    try gpu.download(&result.grad_gamma, gamma.grad.data);
+    try gpu.download(&result.grad_beta, beta.grad.data);
+}
+
+// Counts the elements that differ by more than a small share of the largest reference value.
+fn countOutliers(want: []const f32, got: []const f32) usize {
+    var largest: f32 = 0;
+    for (want) |v| largest = @max(largest, @abs(v));
+    var outliers: usize = 0;
+    for (want, got) |w, g| {
+        if (@abs(w - g) > 0.06 * largest + 0.03 * @abs(w)) outliers += 1;
+    }
+    return outliers;
+}
+
+test "layer norm, add, mul, gelu, relu, dropout and softmax on bf16 activations match the f32 path within bf16 rounding" {
+    const gpu = try gpu_mod.Gpu.forTest(8 << 20);
+    defer gpu.deinit();
+    var prng = std.Random.DefaultPrng.init(41);
+    const rng = prng.random();
+    var x: [64 * 16]f32 = undefined;
+    var g: [64 * 16]f32 = undefined;
+    var scales: [48]f32 = undefined;
+    for (&x) |*v| v.* = rng.floatNorm(f32) * 2 + 0.5;
+    for (&g) |*v| v.* = rng.floatNorm(f32);
+    for (&scales) |*v| v.* = rng.floatNorm(f32) * 0.5 + 1;
+    var wide: OpsResult = undefined;
+    var half: OpsResult = undefined;
+    try runElementwiseChain(false, gpu, &x, &scales, &g, &wide);
+    try runElementwiseChain(true, gpu, &x, &scales, &g, &half);
+    for (wide.out, half.out) |want, got| try testing.expectApproxEqAbs(want, got, 0.02 + 0.02 * @abs(want));
+    try testing.expect(countOutliers(&wide.grad_x, &half.grad_x) <= 10);
+    try testing.expectEqual(@as(usize, 0), countOutliers(&wide.grad_bias, &half.grad_bias));
+    try testing.expectEqual(@as(usize, 0), countOutliers(&wide.grad_gamma, &half.grad_gamma));
+    try testing.expectEqual(@as(usize, 0), countOutliers(&wide.grad_beta, &half.grad_beta));
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const bf16 = @import("bf16.zig");
 
 pub inline fn hash(seed: u64, t: usize) u64 {
     // 0x9E37... is 2^64 / golden ratio and 0xD1B5... a second odd constant: they spread index and seed over 64 bits.
@@ -9,12 +10,18 @@ pub inline fn hash(seed: u64, t: usize) u64 {
     return z ^ (z >> 32);
 }
 
-pub inline fn apply(t: usize, src: [*]const f32, dst: [*]f32, seed: u64, keep: f32, accumulate: bool) void {
+// The element type E may be f32 or bf16; the mask depends only on the seed and the index, so both types drop the same positions.
+pub inline fn applyOf(comptime E: type, t: usize, src: [*]const E, dst: [*]E, seed: u64, keep: f32, accumulate: bool) void {
     // Top 24 bits give an exact f32 in [0, 1): 16777216 = 2^24.
     const u = @as(f32, @floatFromInt(hash(seed, t) >> 40)) * (1.0 / 16777216.0);
-    const v = if (u < keep) src[t] / keep else 0;
-    dst[t] = if (accumulate) dst[t] + v else v;
+    const v = if (u < keep) bf16.load(E, src, t) / keep else 0;
+    bf16.store(E, dst, t, if (accumulate) bf16.load(E, dst, t) + v else v);
 }
+
+pub inline fn apply(t: usize, src: [*]const f32, dst: [*]f32, seed: u64, keep: f32, accumulate: bool) void {
+    applyOf(f32, t, src, dst, seed, keep, accumulate);
+}
+
 test "the kept fraction follows the keep probability and kept values are scaled" {
     var src: [20000]f32 = undefined;
     var dst: [20000]f32 = undefined;

@@ -2,20 +2,41 @@ const std = @import("std");
 const kernels = @import("../cpu/kernels.zig");
 const ga = @import("../gpu/args.zig");
 
-fn tensorTable(params: anytype) ga.TensorTable {
-    comptime std.debug.assert(params.len <= ga.max_tensors);
+// ***** optimizers *****
+
+// NOTE: the device kernels take a table of raw addresses so that one launch updates many tensors.
+// A table holds at most max_tensors entries, so a model with more tensors is updated in several launches, one per chunk.
+fn countOf(comptime P: type) usize {
+    return switch (@typeInfo(P)) {
+        .array => |array| array.len,
+        else => @typeInfo(P).@"struct".field_types.len,
+    };
+}
+
+fn chunkCount(comptime P: type) usize {
+    return (countOf(P) + ga.max_tensors - 1) / ga.max_tensors;
+}
+
+fn tensorTable(params: anytype, comptime chunk: usize) ga.TensorTable {
+    const first = chunk * ga.max_tensors;
     var table = std.mem.zeroes(ga.TensorTable);
-    table.count = params.len;
+    table.count = @min(ga.max_tensors, countOf(@TypeOf(params)) - first);
     inline for (params, 0..) |p, i| {
-        table.len[i] = @intCast(p.value.data.len);
-        table.w[i] = @intFromPtr(p.value.data.ptr);
-        table.g[i] = @intFromPtr(p.grad.data.ptr);
+        if (i >= first and i < first + ga.max_tensors) {
+            table.len[i - first] = @intCast(p.value.data.len);
+            table.w[i - first] = @intFromPtr(p.value.data.ptr);
+            table.g[i - first] = @intFromPtr(p.grad.data.ptr);
+        }
     }
     return table;
 }
 
+/// Sets the gradient of every parameter to zero.
 pub fn zeroGrad(par: kernels.Parallel, params: anytype) !void {
-    if (par.gpu) |dev| return dev.zeroGrads(tensorTable(params));
+    if (par.gpu) |dev| {
+        inline for (0..comptime chunkCount(@TypeOf(params))) |chunk| try dev.zeroGrads(tensorTable(params, chunk));
+        return;
+    }
     inline for (params) |p| {
         const G = @TypeOf(p.grad.data);
         const body = struct {
@@ -27,8 +48,12 @@ pub fn zeroGrad(par: kernels.Parallel, params: anytype) !void {
     }
 }
 
+/// Takes one plain gradient descent step, w -= lr * grad, on every parameter.
 pub fn sgd(par: kernels.Parallel, lr: f32, params: anytype) !void {
-    if (par.gpu) |dev| return dev.sgd(tensorTable(params), lr);
+    if (par.gpu) |dev| {
+        inline for (0..comptime chunkCount(@TypeOf(params))) |chunk| try dev.sgd(tensorTable(params, chunk), lr);
+        return;
+    }
     inline for (params) |p| {
         const E = @TypeOf(p.value).Elem;
         const Ctx = struct { w: []E, g: []const E, lr: E };
@@ -41,12 +66,14 @@ pub fn sgd(par: kernels.Parallel, lr: f32, params: anytype) !void {
     }
 }
 
+/// Returns the learning rate for a step: a linear ramp over the first warmup steps, then a cosine decay from base to zero at total.
 pub fn cosineLr(base: f32, step: usize, total: usize, warmup: usize) f32 {
     if (step < warmup) return base * @as(f32, @floatFromInt(step + 1)) / @as(f32, @floatFromInt(warmup));
     const progress = @as(f32, @floatFromInt(step - warmup)) / @as(f32, @floatFromInt(total - warmup));
     return 0.5 * base * (1 + @cos(std.math.pi * progress));
 }
 
+/// Adam with optional decoupled weight decay. The moments m and v live in one buffer each, laid out in parameter order.
 pub const Adam = struct {
     gpa: std.mem.Allocator,
     on_gpu: bool,
@@ -59,6 +86,7 @@ pub const Adam = struct {
     eps: f32 = 1e-8,
     weight_decay: f32 = 0,
 
+    /// Allocates zeroed moments for params, on the device when par has one.
     pub fn init(gpa: std.mem.Allocator, par: kernels.Parallel, lr: f32, params: anytype) !Adam {
         var total: usize = 0;
         inline for (params) |p| total += p.value.data.len;
@@ -77,16 +105,20 @@ pub const Adam = struct {
         return .{ .gpa = gpa, .on_gpu = false, .m = m, .v = v, .lr = lr };
     }
 
+    /// Returns the two moment buffers so that a checkpoint can store them.
     pub fn state(self: Adam) struct { []f32, []f32 } {
         return .{ self.m, self.v };
     }
 
+    /// Frees the host buffers; device buffers belong to the Gpu.
     pub fn deinit(self: Adam) void {
         if (self.on_gpu) return;
         self.gpa.free(self.m);
         self.gpa.free(self.v);
     }
 
+    /// Applies one update to params using their gradients.
+    /// NOTE: the bias corrections are folded into the step size and the second moment scale, so the kernels need no powers.
     pub fn step(self: *Adam, par: kernels.Parallel, params: anytype) !void {
         self.t += 1;
         const t: f64 = @floatFromInt(self.t);
@@ -94,21 +126,28 @@ pub const Adam = struct {
         const c2 = 1 - std.math.pow(f64, self.beta2, t);
 
         if (par.gpu) |dev| {
-            var table = tensorTable(params);
-            var at: usize = 0;
-            inline for (params, 0..) |p, i| {
-                table.m[i] = @intFromPtr(self.m.ptr) + @sizeOf(f32) * at;
-                table.v[i] = @intFromPtr(self.v.ptr) + @sizeOf(f32) * at;
-                at += p.value.data.len;
-            }
-            return dev.adam(table, .{
+            const hyper: ga.AdamArgs = .{
                 .beta1 = self.beta1,
                 .beta2 = self.beta2,
                 .step = @floatCast(self.lr / c1),
                 .inv_sqrt_c2 = @floatCast(1 / @sqrt(c2)),
                 .eps = self.eps,
                 .decay = self.lr * self.weight_decay,
-            });
+            };
+            inline for (0..comptime chunkCount(@TypeOf(params))) |chunk| {
+                const first = chunk * ga.max_tensors;
+                var table = tensorTable(params, chunk);
+                var at: usize = 0;
+                inline for (params, 0..) |p, i| {
+                    if (i >= first and i < first + ga.max_tensors) {
+                        table.m[i - first] = @intFromPtr(self.m.ptr) + @sizeOf(f32) * at;
+                        table.v[i - first] = @intFromPtr(self.v.ptr) + @sizeOf(f32) * at;
+                    }
+                    at += p.value.data.len;
+                }
+                try dev.adam(table, hyper);
+            }
+            return;
         }
         var off: usize = 0;
         inline for (params) |p| {
@@ -160,6 +199,7 @@ pub const Adam = struct {
     }
 };
 
+/// An exponential moving average of the weights. The shadow copy is kept in one buffer; swap exchanges it with the live weights for evaluation.
 pub const Ema = struct {
     gpa: std.mem.Allocator,
     on_gpu: bool,
@@ -168,6 +208,7 @@ pub const Ema = struct {
     shadow: [][]f32,
     decay: f32 = 0,
 
+    /// Starts the shadow as a copy of the given weight slices. decay is set by the caller before the first update.
     pub fn init(gpa: std.mem.Allocator, par: kernels.Parallel, slices: anytype) !Ema {
         var total: usize = 0;
         inline for (slices) |s| total += s.len;
@@ -205,15 +246,19 @@ pub const Ema = struct {
         self.gpa.free(self.shadow);
     }
 
+    /// Returns the shadow buffer so that a checkpoint can store it.
     pub fn state(self: Ema) struct { []f32 } {
         return .{self.values};
     }
 
+    /// Moves the shadow towards the live weights.
+    /// NOTE: the decay is capped at (step + 1) / (step + 10) so that early steps do not keep the random initial weights.
     pub fn update(self: Ema, par: kernels.Parallel, step: usize) !void {
         const warm = @as(f32, @floatFromInt(step + 1)) / @as(f32, @floatFromInt(step + 10));
         try self.apply(par, .average, @min(self.decay, warm));
     }
 
+    /// Exchanges the live weights with the shadow; calling it twice restores the original state.
     pub fn swap(self: Ema, par: kernels.Parallel) !void {
         try self.apply(par, .swap, 0);
     }
@@ -461,5 +506,56 @@ test "ema averages with a warm-up decay and swap exchanges live and shadow value
             if (maybe) |dev| try dev.download(&seen, live[i]) else seen = live[i][0..5].*;
             for (seen) |got| try testing.expectEqual(@as(f32, 8), got);
         }
+    }
+}
+
+test "gpu optimizers update more tensors than fit in one device table" {
+    const gpu = try Gpu.forTest(1 << 20);
+    defer gpu.deinit();
+    const gpa = testing.allocator;
+    const Small = Tensor(f32, &.{37});
+    const count = 70;
+    var prng = std.Random.DefaultPrng.init(6);
+    const rng = prng.random();
+
+    var host: [count]Var(Small) = undefined;
+    var device: [count]Var(Small) = undefined;
+    for (&host, &device) |*h, *d| {
+        h.* = .{ .value = try Small.empty(gpa), .grad = try Small.empty(gpa), .needs_grad = true };
+        for (h.value.data) |*v| v.* = rng.float(f32);
+        d.* = .{ .value = .{ .data = try gpu.alloc(f32, Small.len) }, .grad = .{ .data = try gpu.alloc(f32, Small.len) }, .needs_grad = true };
+        try gpu.upload(d.value.data, h.value.data);
+    }
+    defer for (host) |h| {
+        h.value.deinit(gpa);
+        h.grad.deinit(gpa);
+    };
+
+    const gpu_par: kernels.Parallel = .{ .gpu = gpu };
+    var cpu_adam = try Adam.init(gpa, .{}, 0.01, host);
+    defer cpu_adam.deinit();
+    var gpu_adam = try Adam.init(gpa, gpu_par, 0.01, device);
+    defer gpu_adam.deinit();
+    for (0..3) |_| {
+        for (host, device) |h, d| {
+            for (h.grad.data) |*g| g.* = rng.float(f32) - 0.5;
+            try gpu.upload(d.grad.data, h.grad.data);
+        }
+        try cpu_adam.step(.{}, host);
+        try gpu_adam.step(gpu_par, device);
+        try sgd(.{}, 0.1, host);
+        try sgd(gpu_par, 0.1, device);
+    }
+
+    var back: [Small.len]f32 = undefined;
+    for (host, device) |h, d| {
+        try gpu.download(&back, d.value.data);
+        for (h.value.data, back) |want, got| try testing.expectApproxEqAbs(want, got, 2e-5);
+    }
+
+    try zeroGrad(gpu_par, device);
+    for (device) |d| {
+        try gpu.download(&back, d.grad.data);
+        for (back) |g| try testing.expectEqual(@as(f32, 0), g);
     }
 }

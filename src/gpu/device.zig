@@ -8,6 +8,11 @@ const nm = @import("math/norm.zig");
 const soft = @import("math/softmax.zig");
 const ln = @import("math/layernorm.zig");
 
+// Device code. Every export fn is a kernel that gpu.zig launches by name (see its Kernel enum),
+// and per-element math shared with the CPU lives in math/*.zig.
+
+// ***** helpers *****
+
 const BK = 8;
 const threads = 256;
 
@@ -15,6 +20,7 @@ const reduction = struct {
     var partial: [threads]f32 addrspace(.shared) = undefined;
 };
 
+// Adds value across the threads of a block with a shared-memory tree and returns the total to every thread.
 inline fn blockSum(value: f32, tid: usize) f32 {
     reduction.partial[tid] = value;
     barrier();
@@ -28,6 +34,7 @@ inline fn blockSum(value: f32, tid: usize) f32 {
     return total;
 }
 
+// Waits until every thread of the block has reached this point.
 inline fn barrier() void {
     asm volatile ("bar.sync 0;" ::: .{ .memory = true });
 }
@@ -36,6 +43,7 @@ inline fn globalIndex() usize {
     return @as(usize, @workGroupId(0)) * @workGroupSize(0) + @workItemId(0);
 }
 
+// NOTE: ex2.approx is much faster than a libm exp and accurate to about two ulp, which softmax and the losses tolerate.
 inline fn expf(x: f32) f32 {
     return asm ("ex2.approx.f32 %[out], %[in];"
         : [out] "=f" (-> f32),
@@ -51,6 +59,10 @@ inline fn logf(x: f32) f32 {
     return l2 * 0.6931471806;
 }
 
+// ***** f32 GEMM *****
+
+// A register-tiled f32 matrix product: a block of 16 x 16 threads computes a BM x BN tile of C,
+// each thread a (BM / 16) x (BN / 16) patch. The tiles are padded by one column to avoid shared-memory bank conflicts.
 fn Gemm(comptime BM: usize, comptime BN: usize) type {
     return struct {
         const BM_PAD = BM + 1;
@@ -147,7 +159,9 @@ comptime {
     exportGemm("sgemmSmallNT", 32, 32, false, true);
     exportGemm("sgemmSmallTN", 32, 32, true, false);
 }
-export fn elementwise(a: [*]const f32, b: [*]const f32, out: [*]f32, args: ga.ElementwiseArgs) callconv(.nvptx_kernel) void {
+// ***** elementwise and reductions *****
+
+inline fn elementwiseOf(comptime E: type, a: [*]const E, b: [*]const E, out: [*]E, args: ga.ElementwiseArgs) void {
     const t = globalIndex();
     if (t >= args.len) return;
     var rest = t;
@@ -160,7 +174,17 @@ export fn elementwise(a: [*]const f32, b: [*]const f32, out: [*]f32, args: ga.El
         from_a += position * args.a_strides[axis];
         from_b += position * args.b_strides[axis];
     }
-    out[t] = if (args.multiply != 0) a[from_a] * b[from_b] else a[from_a] + b[from_b];
+    const lhs = bf16.load(E, a, from_a);
+    const rhs = bf16.load(E, b, from_b);
+    bf16.store(E, out, t, if (args.multiply != 0) lhs * rhs else lhs + rhs);
+}
+
+export fn elementwise(a: [*]const f32, b: [*]const f32, out: [*]f32, args: ga.ElementwiseArgs) callconv(.nvptx_kernel) void {
+    elementwiseOf(f32, a, b, out, args);
+}
+
+export fn elementwiseHalf(a: [*]const u16, b: [*]const u16, out: [*]u16, args: ga.ElementwiseArgs) callconv(.nvptx_kernel) void {
+    elementwiseOf(u16, a, b, out, args);
 }
 
 export fn relu(x: [*]const f32, out: [*]f32, n: u32) callconv(.nvptx_kernel) void {
@@ -168,9 +192,19 @@ export fn relu(x: [*]const f32, out: [*]f32, n: u32) callconv(.nvptx_kernel) voi
     if (t < n) out[t] = @max(x[t], 0);
 }
 
+export fn reluHalf(x: [*]const u16, out: [*]u16, n: u32) callconv(.nvptx_kernel) void {
+    const t = globalIndex();
+    if (t < n) bf16.store(u16, out, t, @max(bf16.load(u16, x, t), 0));
+}
+
 export fn reluBackward(x: [*]const f32, g_out: [*]const f32, g_in: [*]f32, n: u32) callconv(.nvptx_kernel) void {
     const t = globalIndex();
     if (t < n) g_in[t] += if (x[t] > 0) g_out[t] else 0;
+}
+
+export fn reluBackwardHalf(x: [*]const u16, g_out: [*]const u16, g_in: [*]u16, n: u32) callconv(.nvptx_kernel) void {
+    const t = globalIndex();
+    if (t < n) bf16.store(u16, g_in, t, bf16.load(u16, g_in, t) + if (bf16.load(u16, x, t) > 0) bf16.load(u16, g_out, t) else 0);
 }
 
 export fn toHalf(x: [*]const f32, y: [*]u16, n: u32) callconv(.nvptx_kernel) void {
@@ -193,22 +227,46 @@ export fn addToHalf(x: [*]const f32, y: [*]u16, n: u32) callconv(.nvptx_kernel) 
     if (t < n) y[t] = bf16.encode(bf16.decode(y[t]) + x[t]);
 }
 
-export fn layerNormRows(x: [*]const f32, y: [*]f32, gamma: [*]const f32, beta: [*]const f32, mean: [*]f32, inv_std: [*]f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
+inline fn layerNormRowsOf(comptime E: type, x: [*]const E, y: [*]E, gamma: [*]const f32, beta: [*]const f32, mean: [*]f32, inv_std: [*]f32, rows: u32, cols: u32) void {
     const r = globalIndex();
     if (r >= rows) return;
-    const row = ln.forwardRow(x + r * cols, y + r * cols, gamma, beta, cols);
+    const row = ln.forwardRow(E, x + r * cols, y + r * cols, gamma, beta, cols);
     mean[r] = row.mean;
     inv_std[r] = row.inv_std;
 }
 
-export fn layerNormBackward(x: [*]const f32, dy: [*]const f32, dx: [*]f32, gamma: [*]const f32, mean: [*]const f32, inv_std: [*]const f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
+export fn layerNormRows(x: [*]const f32, y: [*]f32, gamma: [*]const f32, beta: [*]const f32, mean: [*]f32, inv_std: [*]f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
+    layerNormRowsOf(f32, x, y, gamma, beta, mean, inv_std, rows, cols);
+}
+
+export fn layerNormRowsHalf(x: [*]const u16, y: [*]u16, gamma: [*]const f32, beta: [*]const f32, mean: [*]f32, inv_std: [*]f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
+    layerNormRowsOf(u16, x, y, gamma, beta, mean, inv_std, rows, cols);
+}
+
+inline fn layerNormBackwardOf(comptime E: type, x: [*]const E, dy: [*]const E, dx: [*]E, gamma: [*]const f32, mean: [*]const f32, inv_std: [*]const f32, rows: u32, cols: u32) void {
     const r = globalIndex();
-    if (r < rows) ln.backwardRow(x + r * cols, dy + r * cols, dx + r * cols, gamma, .{ .mean = mean[r], .inv_std = inv_std[r] }, cols);
+    if (r < rows) ln.backwardRow(E, x + r * cols, dy + r * cols, dx + r * cols, gamma, .{ .mean = mean[r], .inv_std = inv_std[r] }, cols);
+}
+
+export fn layerNormBackward(x: [*]const f32, dy: [*]const f32, dx: [*]f32, gamma: [*]const f32, mean: [*]const f32, inv_std: [*]const f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
+    layerNormBackwardOf(f32, x, dy, dx, gamma, mean, inv_std, rows, cols);
+}
+
+export fn layerNormBackwardHalf(x: [*]const u16, dy: [*]const u16, dx: [*]u16, gamma: [*]const f32, mean: [*]const f32, inv_std: [*]const f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
+    layerNormBackwardOf(u16, x, dy, dx, gamma, mean, inv_std, rows, cols);
+}
+
+inline fn layerNormParametersOf(comptime E: type, x: [*]const E, dy: [*]const E, mean: [*]const f32, inv_std: [*]const f32, dgamma: [*]f32, dbeta: [*]f32, rows: u32, cols: u32) void {
+    const j = globalIndex();
+    if (j < cols) ln.parameterGradient(E, x, dy, mean, inv_std, dgamma, dbeta, rows, cols, j);
 }
 
 export fn layerNormParameters(x: [*]const f32, dy: [*]const f32, mean: [*]const f32, inv_std: [*]const f32, dgamma: [*]f32, dbeta: [*]f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
-    const j = globalIndex();
-    if (j < cols) ln.parameterGradient(x, dy, mean, inv_std, dgamma, dbeta, rows, cols, j);
+    layerNormParametersOf(f32, x, dy, mean, inv_std, dgamma, dbeta, rows, cols);
+}
+
+export fn layerNormParametersHalf(x: [*]const u16, dy: [*]const u16, mean: [*]const f32, inv_std: [*]const f32, dgamma: [*]f32, dbeta: [*]f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
+    layerNormParametersOf(u16, x, dy, mean, inv_std, dgamma, dbeta, rows, cols);
 }
 
 export fn embeddingGather(table: [*]const f32, ids: [*]const u32, out: [*]f32, n: u32, width: u32) callconv(.nvptx_kernel) void {
@@ -221,24 +279,56 @@ export fn embeddingScatter(dy: [*]const f32, ids: [*]const u32, dtable: [*]f32, 
     if (t < @as(usize, n) * width) _ = @atomicRmw(f32, &dtable[@as(usize, ids[t / width]) * width + t % width], .Add, dy[t], .monotonic);
 }
 
-export fn softmaxRows(x: [*]const f32, y: [*]f32, rows: u32, cols: u32, period: u32) callconv(.nvptx_kernel) void {
+inline fn softmaxRowsOf(comptime E: type, x: [*]const E, y: [*]E, rows: u32, cols: u32, period: u32) void {
     const r = globalIndex();
-    if (r < rows) soft.forwardRow(x + r * cols, y + r * cols, cols, soft.limitOf(r, cols, period));
+    if (r < rows) soft.forwardRow(E, x + r * cols, y + r * cols, cols, soft.limitOf(r, cols, period));
+}
+
+export fn softmaxRows(x: [*]const f32, y: [*]f32, rows: u32, cols: u32, period: u32) callconv(.nvptx_kernel) void {
+    softmaxRowsOf(f32, x, y, rows, cols, period);
+}
+
+export fn softmaxRowsHalf(x: [*]const u16, y: [*]u16, rows: u32, cols: u32, period: u32) callconv(.nvptx_kernel) void {
+    softmaxRowsOf(u16, x, y, rows, cols, period);
+}
+
+inline fn softmaxBackwardOf(comptime E: type, y: [*]const E, dy: [*]const E, dx: [*]E, rows: u32, cols: u32) void {
+    const r = globalIndex();
+    if (r < rows) soft.backwardRow(E, y + r * cols, dy + r * cols, dx + r * cols, cols);
 }
 
 export fn softmaxBackward(y: [*]const f32, dy: [*]const f32, dx: [*]f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
-    const r = globalIndex();
-    if (r < rows) soft.backwardRow(y + r * cols, dy + r * cols, dx + r * cols, cols);
+    softmaxBackwardOf(f32, y, dy, dx, rows, cols);
+}
+
+export fn softmaxBackwardHalf(y: [*]const u16, dy: [*]const u16, dx: [*]u16, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
+    softmaxBackwardOf(u16, y, dy, dx, rows, cols);
+}
+
+inline fn activationOf(comptime E: type, x: [*]const E, out: [*]E, n: u32, kind: u32) void {
+    const t = globalIndex();
+    if (t < n) bf16.store(E, out, t, act.forward(@fromBackingInt(@intCast(kind)), bf16.load(E, x, t)));
 }
 
 export fn activation(x: [*]const f32, out: [*]f32, n: u32, kind: u32) callconv(.nvptx_kernel) void {
+    activationOf(f32, x, out, n, kind);
+}
+
+export fn activationHalf(x: [*]const u16, out: [*]u16, n: u32, kind: u32) callconv(.nvptx_kernel) void {
+    activationOf(u16, x, out, n, kind);
+}
+
+inline fn activationBackwardOf(comptime E: type, x: [*]const E, y: [*]const E, g_out: [*]const E, g_in: [*]E, n: u32, kind: u32) void {
     const t = globalIndex();
-    if (t < n) out[t] = act.forward(@fromBackingInt(@intCast(kind)), x[t]);
+    if (t < n) bf16.store(E, g_in, t, bf16.load(E, g_in, t) + bf16.load(E, g_out, t) * act.derivative(@fromBackingInt(@intCast(kind)), bf16.load(E, x, t), bf16.load(E, y, t)));
 }
 
 export fn activationBackward(x: [*]const f32, y: [*]const f32, g_out: [*]const f32, g_in: [*]f32, n: u32, kind: u32) callconv(.nvptx_kernel) void {
-    const t = globalIndex();
-    if (t < n) g_in[t] += g_out[t] * act.derivative(@fromBackingInt(@intCast(kind)), x[t], y[t]);
+    activationBackwardOf(f32, x, y, g_out, g_in, n, kind);
+}
+
+export fn activationBackwardHalf(x: [*]const u16, y: [*]const u16, g_out: [*]const u16, g_in: [*]u16, n: u32, kind: u32) callconv(.nvptx_kernel) void {
+    activationBackwardOf(u16, x, y, g_out, g_in, n, kind);
 }
 
 inline fn addReluOf(comptime E: type, a: [*]const E, b: [*]const E, out: [*]E, n: u32) void {
@@ -289,7 +379,20 @@ export fn addInPlace(dst: [*]f32, src: [*]const f32, n: u32) callconv(.nvptx_ker
     if (t < n) dst[t] += src[t];
 }
 
+export fn addInPlaceHalf(dst: [*]u16, src: [*]const u16, n: u32) callconv(.nvptx_kernel) void {
+    const t = globalIndex();
+    if (t < n) bf16.store(u16, dst, t, bf16.load(u16, dst, t) + bf16.load(u16, src, t));
+}
+
 export fn sumTo(in: [*]const f32, out: [*]f32, args: ga.SumArgs) callconv(.nvptx_kernel) void {
+    sumToOf(f32, in, out, args);
+}
+
+export fn sumToHalf(in: [*]const u16, out: [*]u16, args: ga.SumArgs) callconv(.nvptx_kernel) void {
+    sumToOf(u16, in, out, args);
+}
+
+inline fn sumToOf(comptime E: type, in: [*]const E, out: [*]E, args: ga.SumArgs) void {
     const t: usize = @workGroupId(0);
     const tid: usize = @workItemId(0);
     var d: [ga.max_rank]usize = undefined;
@@ -322,11 +425,13 @@ export fn sumTo(in: [*]const f32, out: [*]f32, args: ga.SumArgs) callconv(.nvptx
                 left /= d[axis];
             }
         }
-        total += in[at];
+        total += bf16.load(E, in, at);
     }
     const sum = blockSum(total, tid);
-    if (tid == 0) out[t] = if (args.accumulate != 0) out[t] + sum else sum;
+    if (tid == 0) bf16.store(E, out, t, if (args.accumulate != 0) bf16.load(E, out, t) + sum else sum);
 }
+
+// ***** column reductions and batch norm *****
 
 const column = struct {
     var first: [threads]f32 addrspace(.shared) = undefined;
@@ -468,6 +573,8 @@ export fn batchNormGradInputHalf(io: nm.GradIo(u16), p: nm.Affine, l: nm.Layout)
     if (globalIndex() < l.len) nm.gradInput(u16, globalIndex(), io, p, l);
 }
 
+// ***** losses *****
+
 export fn crossEntropyRows(x: [*]const f32, logp: [*]f32, labels: [*]const u8, row_loss: [*]f32, rows: u32, cols: u32, smoothing: f32) callconv(.nvptx_kernel) void {
     const r = globalIndex();
     if (r >= rows) return;
@@ -505,6 +612,8 @@ export fn crossEntropyBackward(logp: [*]const f32, labels: [*]const u8, grad: [*
     if (j == labels[r]) p -= 1 - smoothing;
     grad[t] += p * (loss_grad[0] / @as(f32, @floatFromInt(rows)));
 }
+
+// ***** convolution helpers and pooling *****
 
 export fn im2col(x: [*]const f32, col: [*]f32, len: u32, d: cv.Dims) callconv(.nvptx_kernel) void {
     if (globalIndex() < len) cv.im2col(@intCast(globalIndex()), x, col, d);
@@ -563,9 +672,17 @@ export fn maxPoolBackwardHalf(index: [*]const u32, gout: [*]const u16, gin: [*]u
 }
 
 export fn dropout(src: [*]const f32, dst: [*]f32, len: u32, seed: u64, keep: f32, accumulate: u32) callconv(.nvptx_kernel) void {
-    if (globalIndex() < len) drop.apply(globalIndex(), src, dst, seed, keep, accumulate != 0);
+    if (globalIndex() < len) drop.applyOf(f32, globalIndex(), src, dst, seed, keep, accumulate != 0);
 }
 
+export fn dropoutHalf(src: [*]const u16, dst: [*]u16, len: u32, seed: u64, keep: f32, accumulate: u32) callconv(.nvptx_kernel) void {
+    if (globalIndex() < len) drop.applyOf(u16, globalIndex(), src, dst, seed, keep, accumulate != 0);
+}
+
+// ***** optimizers and data *****
+
+// NOTE: one launch updates every tensor of a model. The host passes a table of addresses, each block handles
+// tensor_chunk elements of one tensor, and tableBlock finds which tensor that is.
 const tensor_chunk = 1024;
 
 const TensorBlock = struct { w: u64, g: u64, m: u64, v: u64, at: usize, n: usize };
@@ -578,6 +695,7 @@ fn pointer(comptime T: type, address: u64) T {
     return @ptrFromInt(address);
 }
 
+// Thread 0 looks up the tensor that this block works on and shares it through shared memory.
 inline fn tableBlock(table: ga.TensorTable) TensorBlock {
     if (@workItemId(0) == 0) {
         const block: u32 = @workGroupId(0);
@@ -661,6 +779,8 @@ export fn gather(images: [*]const f32, labels_src: [*]const u8, order: [*]const 
         labels_other[r] = labels_src[order[args.start + partner]];
     }
 }
+
+// ***** tensor core GEMM *****
 
 fn TensorTile(comptime tile_rows: usize, comptime tile_cols: usize) type {
     return struct {
@@ -807,10 +927,14 @@ inline fn packTransposedOf(comptime E: type, src: [*]const E, dst: [*]u16, args:
     }
 }
 
+// How the operands of a tensor core GEMM are read. dense reads both matrices as stored. gather_a builds the left
+// operand from the NHWC input on the fly (implicit GEMM for the forward pass and the input gradient), and gather_b
+// does the same for the right operand (weight gradient), so no im2col buffer is ever written.
 const GemmMode = enum { dense, gather_a, gather_b };
 
 const zero_geometry: ga.ConvGeometry = .{ .n = 0, .h = 0, .w = 0, .c = 0, .k = 0, .stride = 0, .pad = 0, .out_h = 0, .out_w = 0, .positions = 0, .c_out = 0 };
 
+// Copies 16 bytes from global to shared memory without passing through registers. An invalid copy writes zeros, which pads the matrix edges.
 inline fn copyAsyncZfill(dst: u32, src: anytype, valid: bool) void {
     asm volatile ("cp.async.cg.shared.global [%[dst]], [%[src]], 16, %[size];"
         :
@@ -832,6 +956,7 @@ const Acc = [4][4][4]f32;
 const Warp = struct { lane: usize, row: usize, col: usize };
 const Block = struct { tid: usize, row0: usize, col0: usize, k_begin: usize };
 
+// Chooses a tensor core GEMM at compile time: bf16 or TF32 inputs, the block tile size and the operand mode.
 const GemmKind = struct {
     tf32: bool = false,
     rows: usize = 128,
@@ -968,6 +1093,7 @@ fn GemmLoader(comptime kind: GemmKind) type {
     };
 }
 
+// Overlaps loading and computing: the copies for the next stages are in flight while the current tile is multiplied.
 inline fn pipeline(comptime kind: GemmKind, loader: anytype, block: Block, tiles: usize, warp: Warp, acc: *Acc) void {
     const tc = kind.Tile();
     inline for (0..tc.stages - 1) |stage| {
@@ -986,6 +1112,8 @@ inline fn pipeline(comptime kind: GemmKind, loader: anytype, block: Block, tiles
     }
 }
 
+// Writes one accumulator tile. Depending on the shape flags the result is rounded to bf16, stored in its own slice of a
+// split-K workspace (deterministic mode), added atomically (split-K), or stored or accumulated directly.
 inline fn storeTile(comptime kind: GemmKind, c: [*]f32, acc: *const Acc, shape: ga.TensorShape, block: Block, warp: Warp) void {
     const tc = kind.Tile();
     const half_output = !kind.tf32;
@@ -1012,6 +1140,7 @@ inline fn storeTile(comptime kind: GemmKind, c: [*]f32, acc: *const Acc, shape: 
     }
 }
 
+// One thread block computes one tile of C. Work group x and y pick the tile and work group z picks the range of K for split-K.
 inline fn tileGemm(comptime kind: GemmKind, a: [*]const kind.Elem(), b: [*]const kind.Elem(), c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) void {
     const tc = kind.Tile();
     const tid: usize = @workItemId(0);

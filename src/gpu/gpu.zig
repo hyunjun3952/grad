@@ -8,6 +8,8 @@ const norm = @import("math/norm.zig");
 
 const ptx = @embedFile("kernels_ptx");
 
+/// Everything that can fail on the device path. The CUDA driver and cuDNN are loaded at run time,
+/// so a missing library is an error value rather than a link failure.
 pub const Error = Allocator.Error || error{ NoDevice, DriverNotFound, MissingSymbol, CudaFailed, CudnnNotFound, CudnnFailed, NoAlgorithm };
 
 pub const BinaryOp = enum { add, mul };
@@ -57,26 +59,38 @@ const Kernel = enum {
     convGemmWeightGradWide,
     packWeightsRotated,
     elementwise,
+    elementwiseHalf,
     relu,
+    reluHalf,
     reluBackward,
+    reluBackwardHalf,
     transposeHalf,
     embeddingGather,
     embeddingScatter,
     layerNormRows,
+    layerNormRowsHalf,
     layerNormBackward,
+    layerNormBackwardHalf,
     layerNormParameters,
+    layerNormParametersHalf,
     softmaxRows,
+    softmaxRowsHalf,
     softmaxBackward,
+    softmaxBackwardHalf,
     toHalf,
     fromHalf,
     addFromHalf,
     addToHalf,
     activation,
+    activationHalf,
     activationBackward,
+    activationBackwardHalf,
     addRelu,
     addReluBackward,
     addInPlace,
+    addInPlaceHalf,
     sumTo,
+    sumToHalf,
     crossEntropyRows,
     crossEntropyMean,
     crossEntropyBackward,
@@ -105,6 +119,7 @@ const Kernel = enum {
     batchNormApplyQuad,
     batchNormGradInputQuad,
     dropout,
+    dropoutHalf,
     columnReduce,
     columnReduceHalf,
     batchNormApplyHalf,
@@ -118,6 +133,11 @@ const Kernel = enum {
     batchNormGradInput,
 };
 const kernel_count = @typeInfo(Kernel).@"enum".field_names.len;
+
+// Tells whether a device slice holds bf16 (stored as u16) rather than f32, so a wrapper can pick the matching kernel.
+fn isHalf(slice: anytype) bool {
+    return @typeInfo(@TypeOf(slice)).pointer.child == u16;
+}
 
 fn toU32(x: usize) u32 {
     return @intCast(x);
@@ -174,6 +194,11 @@ fn slotName(slot: usize) []const u8 {
 
 const Profile = struct { io: Io, ns: [slot_count]i96 = @splat(0), calls: [slot_count]u32 = @splat(0) };
 
+// ***** device *****
+
+/// One CUDA device with all kernels loaded from the embedded PTX.
+/// Memory comes from three places: alloc (lives until deinit), scratch (reclaimed by resetStep) and
+/// scratchZeroed (zero at the start of every step, which is what gradient buffers rely on).
 pub const Gpu = struct {
     profile: ?Profile = null,
     tensor_cores: bool = false,
@@ -197,6 +222,7 @@ pub const Gpu = struct {
 
     const PlanEntry = struct { geometry: cudnn.Geometry, plan: cudnn.Plan };
 
+    /// Opens the driver, loads the kernels and reserves step_bytes for scratch plus a quarter of that for the zero arena.
     pub fn init(gpa: Allocator, step_bytes: usize) Error!*Gpu {
         const self = try gpa.create(Gpu);
         errdefer gpa.destroy(self);
@@ -228,6 +254,7 @@ pub const Gpu = struct {
         return self;
     }
 
+    /// Same as init, but skips the calling test when no driver is installed.
     pub fn forTest(step_bytes: usize) !*Gpu {
         return init(std.testing.allocator, step_bytes) catch |err| switch (err) {
             error.DriverNotFound => error.SkipZigTest,
@@ -250,6 +277,7 @@ pub const Gpu = struct {
         self.gpa.destroy(self);
     }
 
+    /// Allocates n elements of device memory that stay valid until deinit (weights, optimizer state).
     pub fn alloc(self: *Gpu, comptime T: type, n: usize) Error![]T {
         const ptr = try self.cu.alloc(@sizeOf(T) * n);
         errdefer self.cu.free(ptr);
@@ -257,6 +285,7 @@ pub const Gpu = struct {
         return @as([*]T, @ptrFromInt(ptr))[0..n];
     }
 
+    /// Takes n elements, 256-byte aligned, from the per-step arena; the memory is valid until resetStep.
     pub fn scratch(self: *Gpu, comptime T: type, n: usize) Error![]T {
         const at = std.mem.alignForward(usize, self.step_used, 256);
         const bytes = @sizeOf(T) * n;
@@ -265,6 +294,7 @@ pub const Gpu = struct {
         return @as([*]T, @ptrFromInt(self.step_base + at))[0..n];
     }
 
+    /// Takes n zeroed elements from the zero arena; resetStep clears what was used so the next step sees zeros again.
     pub fn scratchZeroed(self: *Gpu, comptime T: type, n: usize) Error![]T {
         const at = std.mem.alignForward(usize, self.zero_used, 256);
         const bytes = @sizeOf(T) * n;
@@ -273,6 +303,7 @@ pub const Gpu = struct {
         return @as([*]T, @ptrFromInt(self.zero_base + at))[0..n];
     }
 
+    /// Starts a new step: releases all scratch memory and re-zeroes the used part of the zero arena.
     pub fn resetStep(self: *Gpu) Error!void {
         self.step_used = 0;
         if (self.zero_used == 0) return;
@@ -282,6 +313,7 @@ pub const Gpu = struct {
         self.zero_used = 0;
     }
 
+    /// Loads cuDNN from dir so that convolutions may use it; does nothing if it is already loaded.
     pub fn enableCudnn(self: *Gpu, dir: [:0]const u8) Error!void {
         if (self.cudnn_lib != null) return;
         self.cudnn_lib = try cudnn.Cudnn.open(dir);
@@ -332,6 +364,7 @@ pub const Gpu = struct {
         try self.timerStop(slot_cudnn, started);
     }
 
+    /// Starts timing every launch. NOTE: each timed call waits for the device, so a profiled run is slower than a normal one.
     pub fn startProfile(self: *Gpu, io: Io) void {
         self.profile = .{ .io = io };
     }
@@ -349,6 +382,7 @@ pub const Gpu = struct {
         p.calls[slot] += 1;
     }
 
+    /// Prints the time per kernel, sorted by total time, if profiling was started.
     pub fn printProfile(self: *Gpu, out: *Io.Writer) !void {
         const p = self.profile orelse return;
         var order: [slot_count]usize = undefined;
@@ -368,6 +402,7 @@ pub const Gpu = struct {
         }
     }
 
+    /// Copies a host slice to a device slice of the same length.
     pub fn upload(self: *Gpu, dst: anytype, src: anytype) Error!void {
         std.debug.assert(dst.len == src.len);
         const started = try self.timerStart();
@@ -375,6 +410,7 @@ pub const Gpu = struct {
         try self.timerStop(slot_upload, started);
     }
 
+    /// Copies a device slice to a host slice of the same length.
     pub fn download(self: *Gpu, dst: anytype, src: anytype) Error!void {
         std.debug.assert(dst.len == src.len);
         const started = try self.timerStart();
@@ -382,18 +418,22 @@ pub const Gpu = struct {
         try self.timerStop(slot_download, started);
     }
 
+    /// Sets every element of a device slice to value.
     pub fn fill(self: *Gpu, dst: []f32, value: f32) Error!void {
         const started = try self.timerStart();
         try self.cu.memsetD32(@intFromPtr(dst.ptr), @bitCast(value), dst.len);
         try self.timerStop(slot_fill, started);
     }
 
+    /// Reads the first element of a device slice back to the host.
     pub fn scalar(self: *Gpu, src: []const f32) Error!f32 {
         var out: [1]f32 = undefined;
         try self.download(&out, src[0..1]);
         return out[0];
     }
 
+    // Launches a kernel with 256 threads per block. Slice arguments are converted to device addresses,
+    // and an empty grid is skipped.
     fn launch(self: *Gpu, kernel: Kernel, grid: [3]u32, args: anytype) Error!void {
         if (grid[0] == 0 or grid[1] == 0) return;
         const types = comptime blk: {
@@ -420,6 +460,10 @@ pub const Gpu = struct {
         try self.launch(kernel, .{ ceilDiv(items, 256), 1, 1 }, args);
     }
 
+    // ***** kernel wrappers *****
+
+    /// Multiplies row-major matrices into out, using tensor cores when tensorWorthwhile says so and the f32 kernels otherwise.
+    /// NOTE: for a long k and few output tiles the f32 path splits k across blocks that add atomically; deterministic mode uses one split.
     pub fn matmul(self: *Gpu, a: []const f32, b: []const f32, out: []f32, shape: MatmulShape, opts: MatmulOpts) Error!void {
         std.debug.assert(!(opts.trans_a and opts.trans_b));
         if (self.tensorWorthwhile(shape.m, shape.n, shape.k)) return self.matmulTensor(a, b, out, shape, opts);
@@ -436,8 +480,10 @@ pub const Gpu = struct {
         try self.launch(kernel, .{ ceilDiv(shape.n, tile_n), ceilDiv(shape.m, tile_m), ceilDiv(shape.k, chunk) }, .{ a, b, out, kernel_shape });
     }
 
+    /// A bf16 matrix padded to whole tiles, ready for the tensor core kernels.
     pub const Packed = struct { data: []u16, rows_padded: usize, cols_padded: usize };
 
+    /// Returns true when tensor cores are enabled and m * n * k reaches tensor_core_min_work; below that, packing costs more than it saves.
     pub fn tensorWorthwhile(self: *Gpu, m: usize, n: usize, k: usize) bool {
         return self.tensor_cores and m * n * k >= self.tensor_core_min_work;
     }
@@ -584,17 +630,17 @@ pub const Gpu = struct {
         const b_packed = try self.packMatrix(b, shape.k, shape.n, k_padded, std.mem.alignForward(usize, shape.n, 64), opts.trans_b);
         try self.matmulPacked(a_packed, b_packed, out, shape, opts.accumulate, false);
     }
-    pub fn elementwise(self: *Gpu, op: BinaryOp, a: []const f32, b: []const f32, out: []f32, plan: BroadcastPlan) Error!void {
+    pub fn elementwise(self: *Gpu, op: BinaryOp, a: anytype, b: anytype, out: anytype, plan: BroadcastPlan) Error!void {
         const args = pack(ga.ElementwiseArgs, .{ .len = out.len, .multiply = op == .mul, .dims = plan.dims, .a_strides = plan.a_strides, .b_strides = plan.b_strides });
-        try self.launchFlat(.elementwise, out.len, .{ a, b, out, args });
+        try self.launchFlat(if (isHalf(out)) .elementwiseHalf else .elementwise, out.len, .{ a, b, out, args });
     }
 
-    pub fn relu(self: *Gpu, x: []const f32, out: []f32) Error!void {
-        try self.launchFlat(.relu, x.len, .{ x, out, x.len });
+    pub fn relu(self: *Gpu, x: anytype, out: anytype) Error!void {
+        try self.launchFlat(if (isHalf(out)) .reluHalf else .relu, x.len, .{ x, out, x.len });
     }
 
-    pub fn reluBackward(self: *Gpu, x: []const f32, g_out: []const f32, g_in: []f32) Error!void {
-        try self.launchFlat(.reluBackward, x.len, .{ x, g_out, g_in, x.len });
+    pub fn reluBackward(self: *Gpu, x: anytype, g_out: anytype, g_in: anytype) Error!void {
+        try self.launchFlat(if (isHalf(g_in)) .reluBackwardHalf else .reluBackward, x.len, .{ x, g_out, g_in, x.len });
     }
 
     pub fn embeddingGather(self: *Gpu, table: []const f32, ids: []const u32, out: []f32) Error!void {
@@ -605,25 +651,29 @@ pub const Gpu = struct {
         try self.launchFlat(.embeddingScatter, dy.len, .{ dy, ids, dtable, ids.len, dy.len / ids.len });
     }
 
-    pub const LayerNorm = struct { x: []const f32, gamma: []const f32, mean: []f32, inv_std: []f32 };
-
-    pub fn layerNorm(self: *Gpu, p: LayerNorm, beta: []const f32, y: []f32) Error!void {
-        try self.launchFlat(.layerNormRows, p.mean.len, .{ p.x, y, p.gamma, beta, p.mean, p.inv_std, p.mean.len, p.gamma.len });
+    /// The input and the statistics of a layer norm; the activations x may be f32 or bf16, the rest is f32.
+    pub fn LayerNorm(comptime E: type) type {
+        return struct { x: []const E, gamma: []const f32, mean: []f32, inv_std: []f32 };
     }
 
-    pub fn layerNormBackward(self: *Gpu, p: LayerNorm, dy: []const f32, dx: ?[]f32, dgamma: ?[]f32, dbeta: ?[]f32) Error!void {
+    pub fn layerNorm(self: *Gpu, p: anytype, beta: []const f32, y: anytype) Error!void {
+        try self.launchFlat(if (isHalf(y)) .layerNormRowsHalf else .layerNormRows, p.mean.len, .{ p.x, y, p.gamma, beta, p.mean, p.inv_std, p.mean.len, p.gamma.len });
+    }
+
+    pub fn layerNormBackward(self: *Gpu, p: anytype, dy: anytype, dx: anytype, dgamma: ?[]f32, dbeta: ?[]f32) Error!void {
         const rows = p.mean.len;
         const cols = p.gamma.len;
-        if (dx) |out| try self.launchFlat(.layerNormBackward, rows, .{ p.x, dy, out, p.gamma, p.mean, p.inv_std, rows, cols });
-        if (dgamma) |g| try self.launchFlat(.layerNormParameters, cols, .{ p.x, dy, p.mean, p.inv_std, g, dbeta.?, rows, cols });
+        const half = isHalf(p.x);
+        if (dx) |out| try self.launchFlat(if (half) .layerNormBackwardHalf else .layerNormBackward, rows, .{ p.x, dy, out, p.gamma, p.mean, p.inv_std, rows, cols });
+        if (dgamma) |g| try self.launchFlat(if (half) .layerNormParametersHalf else .layerNormParameters, cols, .{ p.x, dy, p.mean, p.inv_std, g, dbeta.?, rows, cols });
     }
 
-    pub fn softmax(self: *Gpu, x: []const f32, y: []f32, cols: usize, period: usize) Error!void {
-        try self.launchFlat(.softmaxRows, x.len / cols, .{ x, y, x.len / cols, cols, period });
+    pub fn softmax(self: *Gpu, x: anytype, y: anytype, cols: usize, period: usize) Error!void {
+        try self.launchFlat(if (isHalf(y)) .softmaxRowsHalf else .softmaxRows, x.len / cols, .{ x, y, x.len / cols, cols, period });
     }
 
-    pub fn softmaxBackward(self: *Gpu, y: []const f32, dy: []const f32, dx: []f32, cols: usize) Error!void {
-        try self.launchFlat(.softmaxBackward, y.len / cols, .{ y, dy, dx, y.len / cols, cols });
+    pub fn softmaxBackward(self: *Gpu, y: anytype, dy: anytype, dx: anytype, cols: usize) Error!void {
+        try self.launchFlat(if (isHalf(dx)) .softmaxBackwardHalf else .softmaxBackward, y.len / cols, .{ y, dy, dx, y.len / cols, cols });
     }
 
     pub fn toHalf(self: *Gpu, x: []const f32, y: []u16) Error!void {
@@ -642,12 +692,12 @@ pub const Gpu = struct {
         try self.launchFlat(.addToHalf, x.len, .{ x, y, x.len });
     }
 
-    pub fn activation(self: *Gpu, x: []const f32, out: []f32, kind: Activation) Error!void {
-        try self.launchFlat(.activation, x.len, .{ x, out, x.len, kind });
+    pub fn activation(self: *Gpu, x: anytype, out: anytype, kind: Activation) Error!void {
+        try self.launchFlat(if (isHalf(out)) .activationHalf else .activation, x.len, .{ x, out, x.len, kind });
     }
 
-    pub fn activationBackward(self: *Gpu, x: []const f32, y: []const f32, g_out: []const f32, g_in: []f32, kind: Activation) Error!void {
-        try self.launchFlat(.activationBackward, x.len, .{ x, y, g_out, g_in, x.len, kind });
+    pub fn activationBackward(self: *Gpu, x: anytype, y: anytype, g_out: anytype, g_in: anytype, kind: Activation) Error!void {
+        try self.launchFlat(if (isHalf(g_in)) .activationBackwardHalf else .activationBackward, x.len, .{ x, y, g_out, g_in, x.len, kind });
     }
 
     pub fn addRelu(self: *Gpu, a: anytype, b: anytype, out: anytype) Error!void {
@@ -663,18 +713,19 @@ pub const Gpu = struct {
         try self.launchFlat(if (E == u16) .addReluBackwardHalf else .addReluBackward, out.len, .{ out, g, grad_a, grad_b, out.len, flags });
     }
 
-    pub fn addInPlace(self: *Gpu, dst: []f32, src: []const f32) Error!void {
-        try self.launchFlat(.addInPlace, dst.len, .{ dst, src, dst.len });
+    pub fn addInPlace(self: *Gpu, dst: anytype, src: anytype) Error!void {
+        try self.launchFlat(if (isHalf(dst)) .addInPlaceHalf else .addInPlace, dst.len, .{ dst, src, dst.len });
     }
 
-    pub fn sumTo(self: *Gpu, in: []const f32, out: []f32, plan: ReducePlan, accumulate: bool) Error!void {
+    pub fn sumTo(self: *Gpu, in: anytype, out: anytype, plan: ReducePlan, accumulate: bool) Error!void {
         const last = ga.max_rank - 1;
-        if (plan.mask == (1 << last) - 1 and plan.strides[last] == 1 and plan.dims[last] == out.len) {
+        const half = @typeInfo(@TypeOf(out)).pointer.child == u16;
+        if (!half and plan.mask == (1 << last) - 1 and plan.strides[last] == 1 and plan.dims[last] == out.len) {
             if (!accumulate) try self.fill(out, 0);
             return self.columnSums(in, out);
         }
         const args = pack(ga.SumArgs, .{ .out_len = out.len, .reduce_count = in.len / out.len, .mask = plan.mask, .accumulate = accumulate, .dims = plan.dims, .strides = plan.strides });
-        try self.launch(.sumTo, .{ toU32(out.len), 1, 1 }, .{ in, out, args });
+        try self.launch(if (half) .sumToHalf else .sumTo, .{ toU32(out.len), 1, 1 }, .{ in, out, args });
     }
 
     pub fn crossEntropy(self: *Gpu, logits: []const f32, logp: []f32, labels: []const u8, loss: []f32, cols: usize, smoothing: f32) Error!void {
@@ -750,8 +801,8 @@ pub const Gpu = struct {
         if (E == u16 and l.channels % 4 == 0 and l.len % 4 == 0) return self.launchFlat(.batchNormGradInputQuad, l.len / 4, .{ io, p, l });
         try self.launchFlat(if (E == u16) .batchNormGradInputHalf else .batchNormGradInput, l.len, .{ io, p, l });
     }
-    pub fn dropout(self: *Gpu, src: []const f32, dst: []f32, seed: u64, keep: f32, accumulate: bool) Error!void {
-        try self.launchFlat(.dropout, src.len, .{ src, dst, src.len, seed, keep, accumulate });
+    pub fn dropout(self: *Gpu, src: anytype, dst: anytype, seed: u64, keep: f32, accumulate: bool) Error!void {
+        try self.launchFlat(if (isHalf(dst)) .dropoutHalf else .dropout, src.len, .{ src, dst, src.len, seed, keep, accumulate });
     }
 
     fn launchTable(self: *Gpu, kernel: Kernel, table: ga.TensorTable, args: anytype) Error!void {
@@ -787,6 +838,7 @@ pub const Gpu = struct {
     pub const GatherFrom = struct { images: []const f32, labels: []const u8, order: []const u32 };
     pub const GatherTo = struct { batch: []f32, labels: []u8, other_labels: []u8 };
 
+    /// Builds one batch on the device from the dataset in the order given by from.order, applying the augmentation in augment.
     pub fn gather(self: *Gpu, from: GatherFrom, to: GatherTo, start: usize, augment: Augment) Error!void {
         const rows = to.labels.len;
         const pixels = to.batch.len / rows;
