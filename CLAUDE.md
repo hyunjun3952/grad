@@ -42,7 +42,7 @@ zig build -Dtarget=x86_64-linux-gnu --prefix zig-out-linux   # Linux compile che
 
 ## Conventions specific to this repo
 
-- Always answer the user in Korean only. Code, identifiers and commit messages stay in English.
+- **Never ignore this rule: every sentence the user can see is Korean.** That includes the short status lines written between tool calls, summaries, questions and error explanations, not only the final answer. Code, identifiers, comments, commit messages and repository documents (README.md, CLAUDE.md, TODO.md) stay in English.
 
 - A public item gets a `///` doc comment: a one-line summary in the third person, at most two or three more sentences, parameters described inline rather than in a list, and a short fenced example only where it clarifies the call. Never use backticks inside comments; write names and expressions as plain text. Bodies get `//` comments that say why (a constraint, a device quirk, a numerical reason), tagged `NOTE:` or `TODO:`, never what the next line does. Large files are divided with `// ***** name *****` banners. Private helpers are commented only where the logic is not obvious. Keep a comment true when the code changes.
 - Prefer one function with an options struct over sibling functions; bundle long argument lists into structs; keep the codebase small.
