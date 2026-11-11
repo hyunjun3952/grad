@@ -21,6 +21,8 @@ pub const AdamArgs = extern struct { beta1: f32, beta2: f32, step: f32, inv_sqrt
 
 pub const max_rank = 6;
 
+pub const ColumnArgs = extern struct { a: [*]const f32, b: [*]const f32, mean: [*]const f32, inv_std: [*]const f32, mask: [*]const f32, out: [*]f32, rows: u32, channels: u32, row_stride: u32, kind: u32, scale: f32 };
+
 pub const ElementwiseArgs = extern struct { len: u32, multiply: u32, dims: [max_rank]u32, a_strides: [max_rank]u32, b_strides: [max_rank]u32 };
 
 pub const SumArgs = extern struct { out_len: u32, reduce_count: u32, mask: u32, accumulate: u32, dims: [max_rank]u32, strides: [max_rank]u32 };

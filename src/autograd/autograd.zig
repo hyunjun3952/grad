@@ -6,6 +6,7 @@ const kernels = @import("../cpu/kernels.zig");
 const gpu_mod = @import("../gpu/gpu.zig");
 const ga = @import("../gpu/args.zig");
 const conv = @import("../gpu/math/conv.zig");
+const cpu_conv = @import("../cpu/conv.zig");
 const activation_math = @import("../gpu/math/activation.zig");
 const drop = @import("../gpu/math/dropout.zig");
 const norm = @import("../gpu/math/norm.zig");
@@ -328,31 +329,34 @@ pub const Tape = struct {
         const In = @TypeOf(x.value);
         const c = In.shape[In.rank - 1];
         const Channels = Tensor(f32, &.{c});
-        const rows = In.len / c;
         const mean = try self.newTensor(Channels);
         const inv_std = try self.newTensor(Channels);
         const value = try self.newTensor(In);
+        const st: norm.Stats = .{ .mean = mean.data.ptr, .inv_std = inv_std.data.ptr, .running_mean = running.mean.data.ptr, .running_var = running.variance.data.ptr };
+        const affine: norm.Affine = .{ .mean = st.mean, .inv_std = st.inv_std, .gamma = gamma.value.data.ptr, .beta = beta.value.data.ptr };
+        const layout: norm.Layout = .{ .len = In.len, .channels = c, .flag = @intFromBool(fuse_relu) };
         if (self.par.gpu) |dev| {
-            try dev.batchNormStats(x.value.data, mean.data, inv_std.data, running.mean.data, running.variance.data, self.training);
-            try dev.batchNormApply(x.value.data, value.data, mean.data, inv_std.data, gamma.value.data, beta.value.data, fuse_relu);
+            try dev.batchNormStats(x.value.data, st, c, self.training);
+            try dev.batchNormApply(x.value.data, value.data, affine, layout);
         } else {
-            norm.stats(x.value.data, mean.data, inv_std.data, running.mean.data, running.variance.data, self.training);
-            kernels.parallelEach(self.par, In.len, norm.apply, .{ x.value.data, value.data, c, mean.data, inv_std.data, gamma.value.data, beta.value.data, fuse_relu });
+            norm.stats(x.value.data, st, c, self.training);
+            cpu_conv.normApply(self.par, x.value.data, value.data, affine, layout);
         }
         const out = try self.makeVar(value, x.needs_grad or gamma.needs_grad or beta.needs_grad);
         try self.note(if (fuse_relu) .batch_norm_relu else .batch_norm, .{ x, gamma, beta, running.mean, running.variance }, out, .{});
 
-        const Ctx = struct { x: @TypeOf(x), gamma: @TypeOf(gamma), beta: @TypeOf(beta), mean: Channels, inv_std: Channels, out: @TypeOf(out) };
-        if (out.needs_grad and self.training) try self.recordBackward(Ctx{ .x = x, .gamma = gamma, .beta = beta, .mean = mean, .inv_std = inv_std, .out = out }, struct {
+        const Ctx = struct { x: @TypeOf(x), gamma: @TypeOf(gamma), beta: @TypeOf(beta), affine: norm.Affine, out: @TypeOf(out) };
+        if (out.needs_grad and self.training) try self.recordBackward(Ctx{ .x = x, .gamma = gamma, .beta = beta, .affine = affine, .out = out }, struct {
             fn run(t: *Tape, k: *const Ctx) Error!void {
                 const sums = try t.zeroedTensor(Tensor(f32, &.{2 * c}));
                 const mask: []const f32 = if (fuse_relu) k.out.value.data else &.{};
+                const grads: norm.GradOut = .{ .sums = sums.data, .gamma = k.gamma.grad.data, .beta = k.beta.grad.data };
                 if (t.par.gpu) |dev| {
-                    try dev.batchNormGradSums(k.x.value.data, k.out.grad.data, k.mean.data, k.inv_std.data, sums.data, k.gamma.grad.data, k.beta.grad.data, mask);
-                    if (k.x.needs_grad) try dev.batchNormGradInput(k.x.value.data, k.out.grad.data, k.x.grad.data, k.mean.data, k.inv_std.data, k.gamma.value.data, sums.data, mask);
+                    try dev.batchNormGradSums(k.x.value.data, k.out.grad.data, k.affine, mask, grads);
+                    if (k.x.needs_grad) try dev.batchNormGradInput(k.x.value.data, k.out.grad.data, k.x.grad.data, k.affine, sums.data, mask, layout);
                 } else {
-                    norm.gradSums(k.x.value.data, k.out.grad.data, k.mean.data, k.inv_std.data, sums.data, k.gamma.grad.data, k.beta.grad.data, mask);
-                    if (k.x.needs_grad) kernels.parallelEach(t.par, In.len, norm.gradInput, .{ k.x.value.data, k.out.grad.data, k.x.grad.data, c, rows, k.mean.data, k.inv_std.data, k.gamma.value.data, sums.data, if (fuse_relu) k.out.value.data else k.out.grad.data, fuse_relu });
+                    norm.gradSums(k.x.value.data, k.out.grad.data, k.affine, mask, grads);
+                    if (k.x.needs_grad) cpu_conv.normGradInput(t.par, k.x.value.data, k.out.grad.data, k.x.grad.data, k.affine, sums.data, if (fuse_relu) k.out.value.data else k.out.grad.data, layout);
                 }
             }
         }.run);
@@ -377,6 +381,11 @@ pub const Tape = struct {
 
     fn convKernel(self: *Tape, comptime op: conv.Op, slices: anytype, d: conv.Dims) Error!void {
         if (self.par.gpu) |dev| return dev.convKernel(op, slices, d);
+        switch (op) {
+            .im2col => return cpu_conv.im2col(self.par, slices[0], slices[1], d),
+            .col2im => return cpu_conv.col2im(self.par, slices[0], slices[1], d),
+            else => {},
+        }
         kernels.parallelEach(self.par, conv.workItems(op, d), @field(conv, @tagName(op)), slices ++ .{d});
     }
     pub fn conv2d(self: *Tape, x: anytype, w: anytype, comptime opts: ConvOpts) Error!Var(ConvOut(@TypeOf(x.value), @TypeOf(w.value), opts)) {
@@ -513,13 +522,14 @@ pub const Tape = struct {
         const In = @TypeOf(x.value);
         const d: conv.Dims = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = In.shape[3], .k = opts.kernel, .stride = opts.stride, .pad = opts.pad };
         const value = try self.newTensor(PoolOut(In, opts));
-        try self.convKernel(.maxPool, .{ x.value.data, value.data }, d);
+        const index = if (self.par.gpu) |dev| try dev.scratch(u32, value.data.len) else try self.gpa.alloc(u32, value.data.len);
+        try self.convKernel(.maxPool, .{ x.value.data, value.data, index }, d);
         const out = try self.makeVar(value, x.needs_grad);
         try self.note(.max_pool, .{x}, out, .{ .kernel = opts.kernel, .stride = opts.stride, .pad = opts.pad });
-        const Ctx = struct { x: @TypeOf(x), out: @TypeOf(out) };
-        if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .out = out }, struct {
+        const Ctx = struct { x: @TypeOf(x), out: @TypeOf(out), index: []u32 };
+        if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .out = out, .index = index }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
-                try t.convKernel(.maxPoolBackward, .{ c.x.value.data, c.out.grad.data, c.x.grad.data }, d);
+                try t.convKernel(.maxPoolBackward, .{ c.index, c.out.grad.data, c.x.grad.data }, d);
             }
         }.run);
         return out;

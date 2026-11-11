@@ -55,7 +55,7 @@ fn checkMatmul(gpu: *Gpu, m: usize, n: usize, k: usize, ta: bool, tb: bool, accu
     for (0..k) |p| {
         for (0..n) |j| lb[p * n + j] = if (tb) b[j * k + p] else b[p * n + j];
     }
-    kernels.matmulNaive(f32, m, k, n, la, lb, want);
+    kernels.matmulNaive(f32, .{ .m = m, .k = k, .n = n, .a = la, .b = lb, .out = want });
     @memset(got, 1);
     if (accumulate) {
         for (want) |*w| w.* += 1;

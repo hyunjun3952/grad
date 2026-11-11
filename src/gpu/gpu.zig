@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 const cuda = @import("cuda.zig");
 const conv = @import("math/conv.zig");
 const ga = @import("args.zig");
+const norm = @import("math/norm.zig");
 
 const ptx = @embedFile("kernels_ptx");
 
@@ -572,36 +573,44 @@ pub const Gpu = struct {
 
     const ColumnKind = enum(u32) { sum, gradient_sums, shifted_moments, masked_gradient_sums };
 
-    fn columnReduce(self: *Gpu, a: []const f32, b: []const f32, mean: []const f32, inv_std: []const f32, mask: []const f32, out: []f32, kind: ColumnKind, scale: f32, channels: usize) Error!void {
-        const rows = a.len / channels;
-        const blocks: u32 = if (self.deterministic) 1 else @min(256, ceilDiv(rows, 8 * 16));
-        try self.launch(.columnReduce, .{ blocks, ceilDiv(channels, 32), 1 }, .{ a, b, mean, inv_std, mask, out, rows, channels, blocks * 8, kind, scale });
+    fn columnReduce(self: *Gpu, args: ga.ColumnArgs) Error!void {
+        const blocks: u32 = if (self.deterministic) 1 else @min(256, ceilDiv(args.rows, 8 * 16));
+        var launched = args;
+        launched.row_stride = blocks * 8;
+        try self.launch(.columnReduce, .{ blocks, ceilDiv(args.channels, 32), 1 }, .{launched});
+    }
+
+    fn columns(a: []const f32, out: []f32, kind: ColumnKind) ga.ColumnArgs {
+        return .{ .a = a.ptr, .b = a.ptr, .mean = a.ptr, .inv_std = a.ptr, .mask = a.ptr, .out = out.ptr, .rows = @intCast(a.len / (if (kind == .sum) out.len else out.len / 2)), .channels = @intCast(if (kind == .sum) out.len else out.len / 2), .row_stride = 0, .kind = @backingInt(kind), .scale = 1 };
     }
 
     pub fn columnSums(self: *Gpu, in: []const f32, out: []f32) Error!void {
-        try self.columnReduce(in, in, in[0..out.len], in[0..out.len], in, out, .sum, 1, out.len);
+        try self.columnReduce(columns(in, out, .sum));
     }
 
-    pub fn batchNormStats(self: *Gpu, x: []const f32, mean: []f32, inv_std: []f32, running_mean: []f32, running_var: []f32, training: bool) Error!void {
-        const c = mean.len;
+    pub fn batchNormStats(self: *Gpu, x: []const f32, st: norm.Stats, c: usize, training: bool) Error!void {
         const sums = try self.scratchZeroed(f32, 2 * c);
-        if (training) try self.columnReduce(x, x, x[0..c], x[0..c], x, sums, .shifted_moments, 1, c);
-        try self.launchFlat(.batchNormFinish, c, .{ sums, x[0..c], mean, inv_std, running_mean, running_var, x.len / c, c, training });
+        if (training) try self.columnReduce(columns(x, sums, .shifted_moments));
+        try self.launchFlat(.batchNormFinish, c, .{ sums, x[0..c], st, norm.Layout{ .len = @intCast(x.len), .channels = @intCast(c), .flag = @intFromBool(training) } });
     }
 
-    pub fn batchNormApply(self: *Gpu, x: []const f32, y: []f32, mean: []const f32, inv_std: []const f32, gamma: []const f32, beta: []const f32, fuse_relu: bool) Error!void {
-        try self.launchFlat(.batchNormApply, x.len, .{ x, y, x.len, mean.len, mean, inv_std, gamma, beta, fuse_relu });
+    pub fn batchNormApply(self: *Gpu, x: []const f32, y: []f32, p: norm.Affine, l: norm.Layout) Error!void {
+        try self.launchFlat(.batchNormApply, x.len, .{ x, y, p, l });
     }
 
-    pub fn batchNormGradSums(self: *Gpu, x: []const f32, dy: []const f32, mean: []const f32, inv_std: []const f32, sums: []f32, gamma_grad: []f32, beta_grad: []f32, mask: []const f32) Error!void {
-        try self.columnReduce(dy, x, mean, inv_std, if (mask.len != 0) mask else x, sums, if (mask.len != 0) .masked_gradient_sums else .gradient_sums, 1, mean.len);
-        try self.launchFlat(.batchNormGradFinish, mean.len, .{ sums, gamma_grad, beta_grad, mean.len });
+    pub fn batchNormGradSums(self: *Gpu, x: []const f32, dy: []const f32, p: norm.Affine, mask: []const f32, out: norm.GradOut) Error!void {
+        var args = columns(dy, out.sums, if (mask.len != 0) .masked_gradient_sums else .gradient_sums);
+        args.b = x.ptr;
+        args.mean = p.mean;
+        args.inv_std = p.inv_std;
+        if (mask.len != 0) args.mask = mask.ptr;
+        try self.columnReduce(args);
+        try self.launchFlat(.batchNormGradFinish, out.beta.len, .{ out.sums, out.gamma, out.beta, out.beta.len });
     }
 
-    pub fn batchNormGradInput(self: *Gpu, x: []const f32, dy: []const f32, dx: []f32, mean: []const f32, inv_std: []const f32, gamma: []const f32, sums: []const f32, mask: []const f32) Error!void {
-        try self.launchFlat(.batchNormGradInput, x.len, .{ x, dy, dx, x.len, mean.len, mean, inv_std, gamma, sums, if (mask.len != 0) mask else x, mask.len != 0 });
+    pub fn batchNormGradInput(self: *Gpu, x: []const f32, dy: []const f32, dx: []f32, p: norm.Affine, sums: []const f32, mask: []const f32, l: norm.Layout) Error!void {
+        try self.launchFlat(.batchNormGradInput, x.len, .{ x, dy, dx, p, sums, if (mask.len != 0) mask else x, l });
     }
-
     pub fn dropout(self: *Gpu, src: []const f32, dst: []f32, seed: u64, keep: f32, accumulate: bool) Error!void {
         try self.launchFlat(.dropout, src.len, .{ src, dst, src.len, seed, keep, accumulate });
     }
@@ -720,7 +729,7 @@ test "deterministic mode gives bit-identical results on every run, for split-K p
         gpu.tensor_cores = tensor_cores == 1;
         for (0..6) |run| {
             try gpu.matmul(da, db, dc, .{ .m = m, .n = n, .k = k }, .{});
-            try gpu.batchNormStats(dx, mean, inv_std, running_mean, running_var, true);
+            try gpu.batchNormStats(dx, .{ .mean = mean.ptr, .inv_std = inv_std.ptr, .running_mean = running_mean.ptr, .running_var = running_var.ptr }, channels, true);
             var product: [m * n]f32 = undefined;
             var stats: [2 * channels]f32 = undefined;
             try gpu.download(&product, dc);

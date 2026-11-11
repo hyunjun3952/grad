@@ -431,7 +431,7 @@ fn matmul(a: Allocator, x: Array, y: Array) Error!Array {
     const out = try make(a, dims[0..x.dims.len]);
     for (0..batch) |b| {
         const w = y.data[(if (weight_batch == 1) 0 else b) * k * n ..][0 .. k * n];
-        kernels.matmulVector(f32, m, k, n, x.data[b * m * k ..][0 .. m * k], w, out.data[b * m * n ..][0 .. m * n]);
+        kernels.matmulVector(f32, .{ .m = m, .k = k, .n = n, .a = x.data[b * m * k ..][0 .. m * k], .b = w, .out = out.data[b * m * n ..][0 .. m * n] });
     }
     return out;
 }

@@ -243,19 +243,9 @@ const column = struct {
     var second: [threads]f32 addrspace(.shared) = undefined;
 };
 
-export fn columnReduce(
-    a: [*]const f32,
-    b: [*]const f32,
-    mean: [*]const f32,
-    inv_std: [*]const f32,
-    mask: [*]const f32,
-    out: [*]f32,
-    rows: u32,
-    c: u32,
-    row_stride: u32,
-    kind: u32,
-    scale: f32,
-) callconv(.nvptx_kernel) void {
+export fn columnReduce(args: ga.ColumnArgs) callconv(.nvptx_kernel) void {
+    const a, const b, const mean, const inv_std, const mask, const out = .{ args.a, args.b, args.mean, args.inv_std, args.mask, args.out };
+    const rows, const c, const row_stride, const kind, const scale = .{ args.rows, args.channels, args.row_stride, args.kind, args.scale };
     const tid: usize = @workItemId(0);
     const lane = tid % 32;
     const group = tid / 32;
@@ -296,10 +286,13 @@ export fn columnReduce(
     }
 }
 
-export fn batchNormFinish(sums: [*]const f32, shift: [*]const f32, mean: [*]f32, inv_std: [*]f32, running_mean: [*]f32, running_var: [*]f32, rows: u32, c: u32, training: u32) callconv(.nvptx_kernel) void {
+export fn batchNormFinish(sums: [*]const f32, shift: [*]const f32, st: nm.Stats, l: nm.Layout) callconv(.nvptx_kernel) void {
+    const mean, const inv_std, const running_mean, const running_var = .{ st.mean, st.inv_std, st.running_mean, st.running_var };
+    const c = l.channels;
+    const rows = l.len / c;
     const ch = globalIndex();
     if (ch >= c) return;
-    if (training == 0) {
+    if (l.flag == 0) {
         mean[ch] = running_mean[ch];
         inv_std[ch] = 1 / @sqrt(running_var[ch] + nm.eps);
         return;
@@ -320,12 +313,12 @@ export fn batchNormGradFinish(sums: [*]const f32, gamma_grad: [*]f32, beta_grad:
     beta_grad[ch] += sums[ch];
     gamma_grad[ch] += sums[c + ch];
 }
-export fn batchNormApply(x: [*]const f32, y: [*]f32, len: u32, c: u32, mean: [*]const f32, inv_std: [*]const f32, gamma: [*]const f32, beta: [*]const f32, fuse_relu: u32) callconv(.nvptx_kernel) void {
-    if (globalIndex() < len) nm.apply(globalIndex(), x, y, c, mean, inv_std, gamma, beta, fuse_relu != 0);
+export fn batchNormApply(x: [*]const f32, y: [*]f32, p: nm.Affine, l: nm.Layout) callconv(.nvptx_kernel) void {
+    if (globalIndex() < l.len) nm.apply(globalIndex(), x, y, p, l);
 }
 
-export fn batchNormGradInput(x: [*]const f32, dy: [*]const f32, dx: [*]f32, len: u32, c: u32, mean: [*]const f32, inv_std: [*]const f32, gamma: [*]const f32, sums: [*]const f32, mask: [*]const f32, use_mask: u32) callconv(.nvptx_kernel) void {
-    if (globalIndex() < len) nm.gradInput(globalIndex(), x, dy, dx, c, len / c, mean, inv_std, gamma, sums, mask, use_mask != 0);
+export fn batchNormGradInput(x: [*]const f32, dy: [*]const f32, dx: [*]f32, p: nm.Affine, sums: [*]const f32, mask: [*]const f32, l: nm.Layout) callconv(.nvptx_kernel) void {
+    if (globalIndex() < l.len) nm.gradInput(globalIndex(), x, dy, dx, p, sums, mask, l);
 }
 
 export fn crossEntropyRows(x: [*]const f32, logp: [*]f32, labels: [*]const u8, row_loss: [*]f32, rows: u32, cols: u32, smoothing: f32) callconv(.nvptx_kernel) void {
@@ -390,8 +383,8 @@ export fn groupedWeightGrad(x: [*]const f32, dy: [*]const f32, dw: [*]f32, len: 
     if (globalIndex() < len) cv.groupedWeightGrad(@intCast(globalIndex()), x, dy, dw, d);
 }
 
-export fn maxPool(x: [*]const f32, out: [*]f32, len: u32, d: cv.Dims) callconv(.nvptx_kernel) void {
-    if (globalIndex() < len) cv.maxPool(@intCast(globalIndex()), x, out, d);
+export fn maxPool(x: [*]const f32, out: [*]f32, index: [*]u32, len: u32, d: cv.Dims) callconv(.nvptx_kernel) void {
+    if (globalIndex() < len) cv.maxPool(@intCast(globalIndex()), x, out, index, d);
 }
 
 export fn avgPool(x: [*]const f32, out: [*]f32, len: u32, d: cv.Dims) callconv(.nvptx_kernel) void {
@@ -402,8 +395,8 @@ export fn avgPoolBackward(gout: [*]const f32, gin: [*]f32, len: u32, d: cv.Dims)
     if (globalIndex() < len) cv.avgPoolBackward(@intCast(globalIndex()), gout, gin, d);
 }
 
-export fn maxPoolBackward(x: [*]const f32, gout: [*]const f32, gin: [*]f32, len: u32, d: cv.Dims) callconv(.nvptx_kernel) void {
-    if (globalIndex() < len) cv.maxPoolBackward(@intCast(globalIndex()), x, gout, gin, d);
+export fn maxPoolBackward(index: [*]const u32, gout: [*]const f32, gin: [*]f32, len: u32, d: cv.Dims) callconv(.nvptx_kernel) void {
+    if (globalIndex() < len) cv.maxPoolBackward(@intCast(globalIndex()), index, gout, gin, d);
 }
 
 export fn dropout(src: [*]const f32, dst: [*]f32, len: u32, seed: u64, keep: f32, accumulate: u32) callconv(.nvptx_kernel) void {

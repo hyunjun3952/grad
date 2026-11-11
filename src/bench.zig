@@ -6,19 +6,19 @@ const kernels = grad.kernels;
 const Tensor = grad.Tensor;
 
 const T = f32;
-const Kernel = *const fn (usize, usize, usize, []const T, []const T, []T, []T) void;
+const Problem = kernels.Problem(T);
+const Kernel = *const fn (Problem, []T) void;
 
 fn wrap(comptime f: anytype) Kernel {
     return struct {
-        fn call(m: usize, k: usize, n: usize, a: []const T, b: []const T, out: []T, work: []T) void {
-            _ = work;
-            f(T, m, k, n, a, b, out);
+        fn call(p: Problem, _: []T) void {
+            f(T, p);
         }
     }.call;
 }
 
-fn tiled(m: usize, k: usize, n: usize, a: []const T, b: []const T, out: []T, work: []T) void {
-    kernels.matmulTiled(T, .{}, .{}, m, k, n, a, b, out, work);
+fn tiled(p: Problem, work: []T) void {
+    kernels.matmulTiled(T, .{}, .{}, p, work);
 }
 
 fn tiledWork(n: usize) usize {
@@ -53,7 +53,7 @@ fn kernelTable(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, rng: std.Random)
         for (a) |*x| x.* = rng.float(T) - 0.5;
         for (b) |*x| x.* = rng.float(T) - 0.5;
 
-        kernels.matmulNaive(T, n, n, n, a, b, ref);
+        kernels.matmulNaive(T, .{ .m = n, .k = n, .n = n, .a = a, .b = b, .out = ref });
 
         const flops = 2.0 * std.math.pow(f64, @floatFromInt(n), 3);
         const reps: usize = @max(3, @as(usize, @intFromFloat(2e9 / flops)));
@@ -62,13 +62,14 @@ fn kernelTable(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, rng: std.Random)
         for (entries, 0..) |e, idx| {
             const work = try gpa.alignedAlloc(T, .@"64", e.work_len(n));
             defer gpa.free(work);
+            const problem: Problem = .{ .m = n, .k = n, .n = n, .a = a, .b = b, .out = res };
 
-            e.run(n, n, n, a, b, res, work);
+            e.run(problem, work);
 
             var best_ns: i96 = std.math.maxInt(i96);
             for (0..reps) |_| {
                 const t0 = Io.Clock.awake.now(io);
-                e.run(n, n, n, a, b, res, work);
+                e.run(problem, work);
                 const t1 = Io.Clock.awake.now(io);
                 std.mem.doNotOptimizeAway(res.ptr);
                 best_ns = @min(best_ns, t1.nanoseconds - t0.nanoseconds);
@@ -145,7 +146,7 @@ fn scaling(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, rng: std.Random) !vo
             var best: i96 = std.math.maxInt(i96);
             for (0..200) |_| {
                 const t0 = Io.Clock.awake.now(io);
-                kernels.matmulTiled(T, .{}, par, s[0], s[1], s[2], a, b, c, work);
+                kernels.matmulTiled(T, .{}, par, .{ .m = s[0], .k = s[1], .n = s[2], .a = a, .b = b, .out = c }, work);
                 best = @min(best, Io.Clock.awake.now(io).nanoseconds - t0.nanoseconds);
             }
             try out.print("{d:>9.1}", .{@as(f64, @floatFromInt(best)) / 1000.0});
@@ -499,6 +500,86 @@ fn gpuTensorCore(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
     }
     try out.writeAll("\n");
 }
+fn milliseconds(io: Io, since: Io.Timestamp) f64 {
+    return @as(f64, @floatFromInt(Io.Clock.awake.now(io).nanoseconds - since.nanoseconds)) / 1e6;
+}
+
+fn cpuOps(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
+    const par: kernels.Parallel = .{ .io = io, .threads = std.Thread.getCpuCount() catch 1 };
+    const Tape = grad.autograd.Tape;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    try out.print("CPU ops of the MNIST CNN at batch 64, {d} threads (best of 20, ms)\n{s:<18} {s:>9} {s:>9}\n", .{ par.threads, "op", "forward", "backward" });
+
+    const Conv1 = struct { x: Tensor(f32, &.{ 64, 28, 28, 1 }), w: Tensor(f32, &.{ 25, 16 }) };
+    const Conv2 = struct { x: Tensor(f32, &.{ 64, 12, 12, 16 }), w: Tensor(f32, &.{ 400, 32 }) };
+    const Act = Tensor(f32, &.{ 64, 24, 24, 16 });
+    const Channels = Tensor(f32, &.{16});
+
+    inline for (.{ .{ "conv 5x5 1->16", Conv1 }, .{ "conv 5x5 16->32", Conv2 } }) |case| {
+        var best_forward: f64 = 1e9;
+        var best_backward: f64 = 1e9;
+        for (0..20) |_| {
+            _ = arena.reset(.retain_capacity);
+            var tape: Tape = .{ .gpa = arena.allocator(), .par = par };
+            const x = try tape.leaf(try @FieldType(case[1], "x").empty(arena.allocator()));
+            const w = try tape.leaf(try @FieldType(case[1], "w").empty(arena.allocator()));
+            @memset(x.value.data, 0.5);
+            @memset(w.value.data, 0.25);
+            const started = Io.Clock.awake.now(io);
+            const y = try tape.conv2d(x, w, .{});
+            best_forward = @min(best_forward, milliseconds(io, started));
+            @memset(y.grad.data, 1);
+            const back = Io.Clock.awake.now(io);
+            try tape.nodes.items[0].run(&tape, tape.nodes.items[0].ctx);
+            best_backward = @min(best_backward, milliseconds(io, back));
+        }
+        try out.print("{s:<18} {d:>9.3} {d:>9.3}\n", .{ case[0], best_forward, best_backward });
+    }
+
+    var best: [3][2]f64 = @splat(@splat(1e9));
+    for (0..20) |_| {
+        _ = arena.reset(.retain_capacity);
+        var tape: Tape = .{ .gpa = arena.allocator(), .par = par, .training = true };
+        const x = try tape.leaf(try Act.empty(arena.allocator()));
+        @memset(x.value.data, 0.5);
+        const gamma = try tape.leaf(try Channels.empty(arena.allocator()));
+        const beta = try tape.leaf(try Channels.empty(arena.allocator()));
+        @memset(gamma.value.data, 1);
+        @memset(beta.value.data, 0);
+        const mean = try Channels.empty(arena.allocator());
+        const variance = try Channels.empty(arena.allocator());
+        @memset(mean.data, 0);
+        @memset(variance.data, 1);
+
+        var started = Io.Clock.awake.now(io);
+        const pooled = try tape.maxPool(x, .{});
+        best[0][0] = @min(best[0][0], milliseconds(io, started));
+        @memset(pooled.grad.data, 1);
+        started = Io.Clock.awake.now(io);
+        try tape.nodes.items[0].run(&tape, tape.nodes.items[0].ctx);
+        best[0][1] = @min(best[0][1], milliseconds(io, started));
+
+        started = Io.Clock.awake.now(io);
+        const normalized = try tape.batchNormRelu(x, gamma, beta, .{ .mean = mean, .variance = variance });
+        best[1][0] = @min(best[1][0], milliseconds(io, started));
+        @memset(normalized.grad.data, 1);
+        started = Io.Clock.awake.now(io);
+        try tape.nodes.items[1].run(&tape, tape.nodes.items[1].ctx);
+        best[1][1] = @min(best[1][1], milliseconds(io, started));
+
+        started = Io.Clock.awake.now(io);
+        const activated = try tape.relu(x);
+        best[2][0] = @min(best[2][0], milliseconds(io, started));
+        @memset(activated.grad.data, 1);
+        started = Io.Clock.awake.now(io);
+        try tape.nodes.items[2].run(&tape, tape.nodes.items[2].ctx);
+        best[2][1] = @min(best[2][1], milliseconds(io, started));
+    }
+    inline for (.{ "maxPool 2x2", "batchNorm + relu", "relu" }, 0..) |name, i| try out.print("{s:<18} {d:>9.3} {d:>9.3}\n", .{ name, best[i][0], best[i][1] });
+    try out.writeAll("\n");
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
@@ -519,6 +600,11 @@ pub fn main(init: std.process.Init) !void {
     if (args.len > 1 and std.mem.eql(u8, args[1], "tc")) {
         try gpuTensorCore(io, gpa, out);
         try implicitGemm(io, gpa, out);
+        try out.flush();
+        return;
+    }
+    if (args.len > 1 and std.mem.eql(u8, args[1], "cpu")) {
+        try cpuOps(io, gpa, out);
         try out.flush();
         return;
     }

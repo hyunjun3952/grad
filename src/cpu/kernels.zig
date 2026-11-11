@@ -2,8 +2,24 @@ const std = @import("std");
 const Io = std.Io;
 const Gpu = @import("../gpu/gpu.zig").Gpu;
 
-pub fn matmulNaive(comptime T: type, m: usize, k: usize, n: usize, a: []const T, b: []const T, out: []T) void {
-    std.debug.assert(a.len >= m * k and b.len >= k * n and out.len >= m * n);
+pub fn Problem(comptime T: type) type {
+    return struct {
+        m: usize,
+        k: usize,
+        n: usize,
+        a: []const T,
+        b: []const T,
+        out: []T,
+
+        fn check(self: @This()) void {
+            std.debug.assert(self.a.len >= self.m * self.k and self.b.len >= self.k * self.n and self.out.len >= self.m * self.n);
+        }
+    };
+}
+
+pub fn matmulNaive(comptime T: type, problem: Problem(T)) void {
+    problem.check();
+    const m, const k, const n, const a, const b, const out = .{ problem.m, problem.k, problem.n, problem.a, problem.b, problem.out };
     for (0..m) |i| {
         for (0..n) |j| {
             var acc: T = 0;
@@ -15,8 +31,9 @@ pub fn matmulNaive(comptime T: type, m: usize, k: usize, n: usize, a: []const T,
     }
 }
 
-pub fn matmulVector(comptime T: type, m: usize, k: usize, n: usize, a: []const T, b: []const T, out: []T) void {
-    std.debug.assert(a.len >= m * k and b.len >= k * n and out.len >= m * n);
+pub fn matmulVector(comptime T: type, problem: Problem(T)) void {
+    problem.check();
+    const m, const k, const n, const a, const b, const out = .{ problem.m, problem.k, problem.n, problem.a, problem.b, problem.out };
     const lanes = comptime std.simd.suggestVectorLength(T) orelse 1;
     const Vec = @Vector(lanes, T);
 
@@ -212,19 +229,11 @@ pub fn matmulTiledWorkLen(comptime T: type, comptime cfg: TileConfig, par: Paral
     return s.parts * partWorkLen(T, cfg, s, m, k, n);
 }
 
-fn packB(
-    comptime T: type,
-    comptime NR: usize,
-    comptime trans: bool,
-    b: []const T,
-    k: usize,
-    n: usize,
-    pc: usize,
-    jc: usize,
-    kc: usize,
-    nc: usize,
-    dst: []T,
-) void {
+const Panel = struct { pc: usize, jc: usize, kc: usize, nc: usize };
+
+fn packB(comptime T: type, comptime NR: usize, comptime trans: bool, problem: Problem(T), panel: Panel, dst: []T) void {
+    const b, const k, const n = .{ problem.b, problem.k, problem.n };
+    const pc, const jc, const kc, const nc = .{ panel.pc, panel.jc, panel.kc, panel.nc };
     var jr: usize = 0;
     while (jr < nc) : (jr += NR) {
         const strip = dst[(jr / NR) * kc * NR ..];
@@ -283,55 +292,33 @@ inline fn microTile(
     return acc;
 }
 
-pub fn matmulTiled(
-    comptime T: type,
-    comptime cfg: TileConfig,
-    par: Parallel,
-    m: usize,
-    k: usize,
-    n: usize,
-    a: []const T,
-    b: []const T,
-    out: []T,
-    work: []T,
-) void {
-    const s = splitFor(T, cfg, par, m, k, n);
-    const part_len = partWorkLen(T, cfg, s, m, k, n);
+pub fn matmulTiled(comptime T: type, comptime cfg: TileConfig, par: Parallel, p: Problem(T), work: []T) void {
+    const s = splitFor(T, cfg, par, p.m, p.k, p.n);
+    const part_len = partWorkLen(T, cfg, s, p.m, p.k, p.n);
     std.debug.assert(work.len >= s.parts * part_len);
-    if (s.parts == 1) return matmulTiledRange(T, cfg, m, k, n, a, b, out, 0, m, 0, n, work);
+    if (s.parts == 1) return matmulTiledRange(T, cfg, p, .{ 0, p.m }, .{ 0, p.n }, work);
 
-    const Ctx = struct { s: Split, part_len: usize, m: usize, k: usize, n: usize, a: []const T, b: []const T, out: []T, work: []T };
+    const Ctx = struct { s: Split, part_len: usize, p: Problem(T), work: []T };
     const Task = struct {
-        fn run(raw: *const anyopaque, p: usize) void {
+        fn run(raw: *const anyopaque, part: usize) void {
             const c: *const Ctx = @ptrCast(@alignCast(raw));
-            const lo = p * c.s.chunk;
-            const w = c.work[p * c.part_len ..][0..c.part_len];
+            const lo = part * c.s.chunk;
+            const w = c.work[part * c.part_len ..][0..c.part_len];
             if (c.s.by_rows) {
-                matmulTiledRange(T, cfg, c.m, c.k, c.n, c.a, c.b, c.out, lo, @min(lo + c.s.chunk, c.m), 0, c.n, w);
+                matmulTiledRange(T, cfg, c.p, .{ lo, @min(lo + c.s.chunk, c.p.m) }, .{ 0, c.p.n }, w);
             } else {
-                matmulTiledRange(T, cfg, c.m, c.k, c.n, c.a, c.b, c.out, 0, c.m, lo, @min(lo + c.s.chunk, c.n), w);
+                matmulTiledRange(T, cfg, c.p, .{ 0, c.p.m }, .{ lo, @min(lo + c.s.chunk, c.p.n) }, w);
             }
         }
     };
-    const ctx: Ctx = .{ .s = s, .part_len = part_len, .m = m, .k = k, .n = n, .a = a, .b = b, .out = out, .work = work };
+    const ctx: Ctx = .{ .s = s, .part_len = part_len, .p = p, .work = work };
     parallelRun(par, s.parts, &ctx, Task.run);
 }
 
-fn matmulTiledRange(
-    comptime T: type,
-    comptime cfg: TileConfig,
-    m: usize,
-    k: usize,
-    n: usize,
-    a: []const T,
-    b: []const T,
-    out: []T,
-    r0: usize,
-    r1: usize,
-    c0: usize,
-    c1: usize,
-    work: []T,
-) void {
+fn matmulTiledRange(comptime T: type, comptime cfg: TileConfig, p: Problem(T), rows: [2]usize, cols: [2]usize, work: []T) void {
+    const m, const k, const n, const a, const out = .{ p.m, p.k, p.n, p.a, p.out };
+    const r0, const r1 = rows;
+    const c0, const c1 = cols;
     const MR = cfg.mr;
     const NV = cfg.nv;
     const MC = cfg.mc;
@@ -344,7 +331,7 @@ fn matmulTiledRange(
         if (MC % MR != 0) @compileError("tiled: mc must be a multiple of mr");
         if (NC % NR != 0) @compileError("tiled: nc must be a multiple of nv * lanes");
     }
-    std.debug.assert(a.len >= m * k and b.len >= k * n and out.len >= m * n);
+    p.check();
     const d = tiledDims(T, cfg, k, c1 - c0);
     std.debug.assert(work.len >= d.kc * d.nc);
     const b_pack = work[0 .. d.kc * d.nc];
@@ -359,7 +346,7 @@ fn matmulTiledRange(
         var pc: usize = 0;
         while (pc < k) : (pc += KC) {
             const kc = @min(KC, k - pc);
-            packB(T, NR, cfg.trans_b, b, k, n, pc, jc, kc, nc, b_pack);
+            packB(T, NR, cfg.trans_b, p, .{ .pc = pc, .jc = jc, .kc = kc, .nc = nc }, b_pack);
 
             var ic: usize = r0;
             while (ic < r1) : (ic += MC) {
@@ -407,21 +394,7 @@ fn matmulTiledRange(
     }
 }
 
-fn expectTiledCombos(
-    comptime T: type,
-    comptime base: TileConfig,
-    par: Parallel,
-    m: usize,
-    k: usize,
-    n: usize,
-    a: []const T,
-    b: []const T,
-    at: []const T,
-    bt: []const T,
-    want: []const T,
-    got: []T,
-    work: []T,
-) !void {
+fn expectTiledCombos(comptime T: type, comptime base: TileConfig, par: Parallel, p: Problem(T), transposed: [2][]const T, want: []const T, work: []T) !void {
     inline for (.{ .{ false, false }, .{ true, false }, .{ false, true }, .{ true, true } }) |flags| {
         const cfg = comptime blk: {
             var c = base;
@@ -429,9 +402,9 @@ fn expectTiledCombos(
             c.trans_b = flags[1];
             break :blk c;
         };
-        @memset(got, 99);
-        matmulTiled(T, cfg, par, m, k, n, if (flags[0]) at else a, if (flags[1]) bt else b, got, work);
-        try std.testing.expectEqualSlices(T, want, got);
+        @memset(p.out, 99);
+        matmulTiled(T, cfg, par, .{ .m = p.m, .k = p.k, .n = p.n, .a = if (flags[0]) transposed[0] else p.a, .b = if (flags[1]) transposed[1] else p.b, .out = p.out }, work);
+        try std.testing.expectEqualSlices(T, want, p.out);
     }
 }
 
@@ -449,10 +422,11 @@ fn expectSameResult(comptime T: type, par: Parallel, m: usize, k: usize, n: usiz
     for (a, 0..) |*x, idx| x.* = @as(T, @floatFromInt(idx % 7)) - 3;
     for (b, 0..) |*x, idx| x.* = @as(T, @floatFromInt(idx % 5)) - 2;
 
-    matmulNaive(T, m, k, n, a, b, want);
+    const problem: Problem(T) = .{ .m = m, .k = k, .n = n, .a = a, .b = b, .out = got };
+    matmulNaive(T, .{ .m = m, .k = k, .n = n, .a = a, .b = b, .out = want });
 
     @memset(got, 99);
-    matmulVector(T, m, k, n, a, b, got);
+    matmulVector(T, problem);
     try std.testing.expectEqualSlices(T, want, got);
 
     const at = try gpa.alloc(T, m * k);
@@ -469,12 +443,12 @@ fn expectSameResult(comptime T: type, par: Parallel, m: usize, k: usize, n: usiz
     const small: TileConfig = .{ .mr = 4, .nv = 2, .mc = 8, .kc = 5, .nc = 16 };
     const work_small = try gpa.alloc(T, matmulTiledWorkLen(T, small, par, m, k, n));
     defer gpa.free(work_small);
-    try expectTiledCombos(T, small, par, m, k, n, a, b, at, bt, want, got, work_small);
+    try expectTiledCombos(T, small, par, problem, .{ at, bt }, want, work_small);
 
     const dflt: TileConfig = .{};
     const work_dflt = try gpa.alloc(T, matmulTiledWorkLen(T, dflt, par, m, k, n));
     defer gpa.free(work_dflt);
-    try expectTiledCombos(T, dflt, par, m, k, n, a, b, at, bt, want, got, work_dflt);
+    try expectTiledCombos(T, dflt, par, problem, .{ at, bt }, want, work_dflt);
 }
 
 test "parallel tiled matmul matches in both split directions" {

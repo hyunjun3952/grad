@@ -20,7 +20,8 @@ pub fn workItems(op: Op, d: Dims) usize {
         .im2col => @as(usize, d.n) * outHeight(d) * outWidth(d) * d.k * d.k * d.c,
         .col2im, .col2imHalf => @as(usize, d.n) * d.h * d.w * d.c,
         .maxPool, .avgPool => @as(usize, d.n) * outHeight(d) * outWidth(d) * d.c,
-        .maxPoolBackward, .avgPoolBackward => @as(usize, d.n) * d.h * d.w * d.c,
+        .maxPoolBackward => if (d.stride >= d.k) @as(usize, d.n) * outHeight(d) * outWidth(d) * d.c else @as(usize, d.n) * d.h * d.w * d.c,
+        .avgPoolBackward => @as(usize, d.n) * d.h * d.w * d.c,
         .groupedForward => @as(usize, d.n) * outHeight(d) * outWidth(d) * d.c_out,
         .groupedInputGrad => @as(usize, d.n) * d.h * d.w * d.c,
         .groupedWeightGrad => @as(usize, d.k) * d.k * (d.c / d.groups) * d.c_out,
@@ -151,8 +152,10 @@ pub inline fn avgPool(t: Index, x: [*]const f32, out: [*]f32, d: Dims) void {
     out[t] = total / windowCount(w, d);
 }
 
-pub inline fn maxPool(t: Index, x: [*]const f32, out: [*]f32, d: Dims) void {
-    out[t] = x[firstMax(x, windowOf(t, d), d)];
+pub inline fn maxPool(t: Index, x: [*]const f32, out: [*]f32, index: [*]u32, d: Dims) void {
+    const winner = firstMax(x, windowOf(t, d), d);
+    out[t] = x[winner];
+    index[t] = winner;
 }
 
 inline fn firstWindow(position: Index, d: Dims) Index {
@@ -160,7 +163,7 @@ inline fn firstWindow(position: Index, d: Dims) Index {
     return if (shifted > d.k) (shifted - d.k + d.stride - 1) / d.stride else 0;
 }
 
-inline fn pooledGradient(comptime is_max: bool, t: Index, x: [*]const f32, gout: [*]const f32, d: Dims) f32 {
+inline fn pooledGradient(comptime winner: bool, t: Index, index: [*]const u32, gout: [*]const f32, d: Dims) f32 {
     const ch = t % d.c;
     const xx = t / d.c % d.w;
     const yy = t / d.c / d.w % d.h;
@@ -174,12 +177,11 @@ inline fn pooledGradient(comptime is_max: bool, t: Index, x: [*]const f32, gout:
     while (oy <= last_y) : (oy += 1) {
         var ox = firstWindow(xx, d);
         while (ox <= last_x) : (ox += 1) {
-            const w: Window = .{ .n = n, .oy = oy, .ox = ox, .ch = ch };
-            const g = gout[((n * oh + oy) * ow + ox) * d.c + ch];
-            if (is_max) {
-                if (firstMax(x, w, d) == t) total += g;
+            const at = ((n * oh + oy) * ow + ox) * d.c + ch;
+            if (winner) {
+                if (index[at] == t) total += gout[at];
             } else {
-                total += g / windowCount(w, d);
+                total += gout[at] / windowCount(.{ .n = n, .oy = oy, .ox = ox, .ch = ch }, d);
             }
         }
     }
@@ -187,11 +189,15 @@ inline fn pooledGradient(comptime is_max: bool, t: Index, x: [*]const f32, gout:
 }
 
 pub inline fn avgPoolBackward(t: Index, gout: [*]const f32, gin: [*]f32, d: Dims) void {
-    gin[t] += pooledGradient(false, t, gout, gout, d);
+    gin[t] += pooledGradient(false, t, undefined, gout, d);
 }
 
-pub inline fn maxPoolBackward(t: Index, x: [*]const f32, gout: [*]const f32, gin: [*]f32, d: Dims) void {
-    gin[t] += pooledGradient(true, t, x, gout, d);
+pub inline fn maxPoolBackward(t: Index, index: [*]const u32, gout: [*]const f32, gin: [*]f32, d: Dims) void {
+    if (d.stride >= d.k) {
+        gin[index[t]] += gout[t];
+        return;
+    }
+    gin[t] += pooledGradient(true, t, index, gout, d);
 }
 pub inline fn groupedForward(t: Index, x: [*]const f32, w: [*]const f32, out: [*]f32, d: Dims) void {
     const ow = outWidth(d);
@@ -279,18 +285,20 @@ pub inline fn groupedWeightGrad(t: Index, x: [*]const f32, dy: [*]const f32, dw:
     dw[t] += total;
 }
 test "max maxPool picks the first maximum, so a tied window routes its gradient to one element" {
-    const x = [_]f32{ 1, 1, 1, 1 };
-    const gout = [_]f32{5};
-    var gin = [_]f32{ 0, 0, 0, 0 };
     const d: Dims = .{ .n = 1, .h = 2, .w = 2, .c = 1, .k = 2 };
-    for (0..4) |i| maxPoolBackward(@intCast(i), &x, &gout, &gin, d);
+    const gout = [_]f32{5};
+    var out: [1]f32 = undefined;
+    var index: [1]u32 = undefined;
+    const tied = [_]f32{ 1, 1, 1, 1 };
+    var gin = [_]f32{ 0, 0, 0, 0 };
+    maxPool(0, &tied, &out, &index, d);
+    for (0..4) |i| maxPoolBackward(@intCast(i), &index, &gout, &gin, d);
     try std.testing.expectEqualSlices(f32, &.{ 5, 0, 0, 0 }, &gin);
 
     const y = [_]f32{ 1, 3, 3, 2 };
-    var out: [1]f32 = undefined;
-    maxPool(0, &y, &out, d);
+    maxPool(0, &y, &out, &index, d);
     try std.testing.expectEqual(@as(f32, 3), out[0]);
     gin = .{ 0, 0, 0, 0 };
-    for (0..4) |i| maxPoolBackward(@intCast(i), &y, &gout, &gin, d);
+    for (0..4) |i| maxPoolBackward(@intCast(i), &index, &gout, &gin, d);
     try std.testing.expectEqualSlices(f32, &.{ 0, 5, 0, 0 }, &gin);
 }
