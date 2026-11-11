@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const dynlib = @import("dynlib.zig");
 
 const Status = c_int;
 const Handle = ?*anyopaque;
@@ -41,11 +42,6 @@ const Api = struct {
     cudnnConvolutionBackwardFilter: *const fn (handle: Handle, alpha: *const f32, x_desc: Handle, x: ?*const anyopaque, dy_desc: Handle, dy: ?*const anyopaque, conv: Handle, algo: c_int, workspace: ?*anyopaque, workspace_bytes: usize, beta: *const f32, dw_desc: Handle, dw: ?*anyopaque) callconv(.c) Status,
 };
 
-extern "kernel32" fn LoadLibraryA(name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
-extern "kernel32" fn SetDllDirectoryA(path: [*:0]const u8) callconv(.winapi) c_int;
-extern "kernel32" fn GetProcAddress(module: ?*anyopaque, name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
-extern "kernel32" fn FreeLibrary(module: ?*anyopaque) callconv(.winapi) c_int;
-
 pub const Geometry = struct {
     n: usize,
     h: usize,
@@ -74,20 +70,14 @@ pub const Plan = struct {
 };
 
 pub const Cudnn = struct {
-    lib: ?*anyopaque,
+    lib: dynlib.Library,
     api: Api,
     handle: Handle,
 
     pub fn open(dir: [:0]const u8) Error!Cudnn {
-        _ = SetDllDirectoryA(dir.ptr);
-        const lib = LoadLibraryA("cudnn64_9.dll") orelse return error.CudnnNotFound;
-        errdefer _ = FreeLibrary(lib);
-
-        var api: Api = undefined;
-        inline for (@typeInfo(Api).@"struct".field_names) |name| {
-            const address = GetProcAddress(lib, name) orelse return error.MissingSymbol;
-            @field(api, name) = @ptrCast(address);
-        }
+        const lib = dynlib.Library.open(.{ .windows = "cudnn64_9.dll", .linux = &.{ "libcudnn.so.9", "libcudnn.so" } }, dir) catch return error.CudnnNotFound;
+        errdefer lib.close();
+        const api = lib.bind(Api) catch return error.MissingSymbol;
         var self: Cudnn = .{ .lib = lib, .api = api, .handle = null };
         try self.check(api.cudnnCreate(&self.handle));
         return self;
@@ -95,7 +85,7 @@ pub const Cudnn = struct {
 
     pub fn close(self: *Cudnn) void {
         _ = self.api.cudnnDestroy(self.handle);
-        _ = FreeLibrary(self.lib);
+        self.lib.close();
     }
 
     pub fn version(self: *const Cudnn) usize {

@@ -6,7 +6,7 @@ const kernels = @import("../cpu/kernels.zig");
 const gpu_mod = @import("../gpu/gpu.zig");
 const ga = @import("../gpu/args.zig");
 const conv = @import("../gpu/math/conv.zig");
-const cpu_conv = @import("../cpu/conv.zig");
+const cpu = @import("../cpu/ops.zig");
 const activation_math = @import("../gpu/math/activation.zig");
 const drop = @import("../gpu/math/dropout.zig");
 const norm = @import("../gpu/math/norm.zig");
@@ -339,8 +339,8 @@ pub const Tape = struct {
             try dev.batchNormStats(x.value.data, st, c, self.training);
             try dev.batchNormApply(x.value.data, value.data, affine, layout);
         } else {
-            norm.stats(x.value.data, st, c, self.training);
-            cpu_conv.normApply(self.par, x.value.data, value.data, affine, layout);
+            cpu.normStats(self.par, x.value.data, st, c, self.training);
+            cpu.normApply(self.par, x.value.data, value.data, affine, layout);
         }
         const out = try self.makeVar(value, x.needs_grad or gamma.needs_grad or beta.needs_grad);
         try self.note(if (fuse_relu) .batch_norm_relu else .batch_norm, .{ x, gamma, beta, running.mean, running.variance }, out, .{});
@@ -355,8 +355,8 @@ pub const Tape = struct {
                     try dev.batchNormGradSums(k.x.value.data, k.out.grad.data, k.affine, mask, grads);
                     if (k.x.needs_grad) try dev.batchNormGradInput(k.x.value.data, k.out.grad.data, k.x.grad.data, k.affine, sums.data, mask, layout);
                 } else {
-                    norm.gradSums(k.x.value.data, k.out.grad.data, k.affine, mask, grads);
-                    if (k.x.needs_grad) cpu_conv.normGradInput(t.par, k.x.value.data, k.out.grad.data, k.x.grad.data, k.affine, sums.data, if (fuse_relu) k.out.value.data else k.out.grad.data, layout);
+                    cpu.normGradSums(t.par, k.x.value.data, k.out.grad.data, k.affine, mask, grads);
+                    if (k.x.needs_grad) cpu.normGradInput(t.par, k.x.value.data, k.out.grad.data, k.x.grad.data, k.affine, sums.data, if (fuse_relu) k.out.value.data else k.out.grad.data, layout);
                 }
             }
         }.run);
@@ -382,8 +382,8 @@ pub const Tape = struct {
     fn convKernel(self: *Tape, comptime op: conv.Op, slices: anytype, d: conv.Dims) Error!void {
         if (self.par.gpu) |dev| return dev.convKernel(op, slices, d);
         switch (op) {
-            .im2col => return cpu_conv.im2col(self.par, slices[0], slices[1], d),
-            .col2im => return cpu_conv.col2im(self.par, slices[0], slices[1], d),
+            .im2col => return cpu.im2col(self.par, slices[0], slices[1], d),
+            .col2im => return cpu.col2im(self.par, slices[0], slices[1], d),
             else => {},
         }
         kernels.parallelEach(self.par, conv.workItems(op, d), @field(conv, @tagName(op)), slices ++ .{d});

@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const dynlib = @import("dynlib.zig");
 
 pub const DevicePtr = u64;
 pub const Handle = ?*anyopaque;
@@ -34,24 +35,15 @@ const Api = struct {
     cuGetErrorName: *const fn (code: Status, name: *[*:0]const u8) callconv(.c) Status,
 };
 
-extern "kernel32" fn LoadLibraryA(name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
-extern "kernel32" fn GetProcAddress(module: ?*anyopaque, name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
-extern "kernel32" fn FreeLibrary(module: ?*anyopaque) callconv(.winapi) c_int;
-
 pub const Cuda = struct {
-    lib: ?*anyopaque,
+    lib: dynlib.Library,
     api: Api,
     device: c_int,
 
     pub fn open() !Cuda {
-        const lib = LoadLibraryA("nvcuda.dll") orelse return error.DriverNotFound;
-        errdefer _ = FreeLibrary(lib);
-
-        var api: Api = undefined;
-        inline for (@typeInfo(Api).@"struct".field_names) |name| {
-            const address = GetProcAddress(lib, name) orelse return error.MissingSymbol;
-            @field(api, name) = @ptrCast(address);
-        }
+        const lib = dynlib.Library.open(.{ .windows = "nvcuda.dll", .linux = &.{ "libcuda.so.1", "libcuda.so" } }, null) catch return error.DriverNotFound;
+        errdefer lib.close();
+        const api = try lib.bind(Api);
 
         var self: Cuda = .{ .lib = lib, .api = api, .device = 0 };
         try self.check(api.cuInit(0));
@@ -63,7 +55,7 @@ pub const Cuda = struct {
     }
 
     pub fn close(self: *Cuda) void {
-        _ = FreeLibrary(self.lib);
+        self.lib.close();
     }
 
     fn check(self: *const Cuda, status: Status) !void {

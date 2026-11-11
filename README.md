@@ -24,7 +24,7 @@ Measured on an i5-8500 (6 cores) and an RTX 3060 12 GB. About 7,600 lines includ
 ## Requirements
 
 - Zig 0.17.1.
-- For the GPU path: Windows and an NVIDIA GPU (the driver loader uses `kernel32` and `nvcuda.dll`; the kernels target Ampere, `sm_86`). GPU tests are skipped when no driver is found.
+- For the GPU path: an NVIDIA GPU with Ampere or newer (the kernels target `sm_86`). The driver and cuDNN are loaded at run time through one small loader (`src/gpu/dynlib.zig`): `nvcuda.dll` / `cudnn64_9.dll` on Windows, `libcuda.so.1` (then `libcuda.so`) / `libcudnn.so.9` on Linux, the same names and order that other CUDA wrappers such as [oxicuda](https://docs.rs/oxicuda-driver/0.1.7/src/oxicuda_driver/loader.rs.html) and the LLVM OpenMP [CUDA plugin](https://llvm.googlesource.com/llvm-project/+/890c4bece26e005cd9fa5511fe0efa7307794de5/offload/plugins-nextgen/cuda/dynamic_cuda/cuda.cpp) use. Windows is what the project is developed and tested on; all programs also cross-compile for Linux (`zig build -Dtarget=x86_64-linux-gnu`), but that path has not been run on a Linux machine. Pick a GPU with `CUDA_VISIBLE_DEVICES`. GPU tests are skipped when no driver is found.
 - No CUDA toolkit, no Python.
 
 ## Quick start
@@ -161,8 +161,8 @@ pub fn main(init: std.process.Init) !void {
 A layer is any struct with `init`, `deinit`, `toGpu`, `forward`, `params` and `state`. `nn.initAll`, `nn.params` and `nn.state` walk a tuple of layers, and `grad.trainer.run` takes care of batching, shuffling, augmentation, evaluation, checkpoints and the GPU.
 ## Limitations
 
-- Windows-only GPU loader, f32 tensors (bf16 only inside GEMM), activations in NHWC, tensors of rank 4 or less on the GPU.
+- The Linux GPU loader compiles but is untested; f32 tensors (bf16 only inside GEMM), activations in NHWC, tensors of rank 6 or less on the GPU.
 - Grouped and dilated convolutions use a simple one-thread-per-output kernel (correct but not tuned); only the dense stride-1 shapes get the tensor-core paths.
 - Batch sizes are compile-time constants; a program lists the sizes it is built for (`--batch=N` picks one).
 - ONNX files can be imported for CPU inference only, and only single-input graphs can be exported.
-- Training is single-GPU and deterministic on the CPU; GPU runs differ in the last bits because of atomic accumulation.
+- Training is single-GPU. The CPU is deterministic, and so is the GPU with `--deterministic` (no split-K, ordered reductions, deterministic cuDNN algorithms, somewhat slower); without it GPU runs differ in the last bits because of atomic accumulation.

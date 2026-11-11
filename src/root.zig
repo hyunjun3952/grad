@@ -19,7 +19,7 @@ pub const matmul = tensor.matmul;
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("gpu/parity.zig");
-    _ = @import("cpu/conv.zig");
+    _ = @import("cpu/ops.zig");
     _ = @import("onnx/onnx.zig");
     _ = @import("onnx/runtime.zig");
     _ = @import("gpu/math/conv.zig");
