@@ -1,5 +1,3 @@
-const std = @import("std");
-
 pub inline fn encode(x: f32) u16 {
     const bits: u32 = @bitCast(x);
     // Round to nearest even: add half of the dropped 16 bits, plus one when the kept lowest bit is set.

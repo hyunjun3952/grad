@@ -2,7 +2,6 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Tensor = @import("../tensor/tensor.zig").Tensor;
 const autograd = @import("../autograd/autograd.zig");
-const optim = @import("optim.zig");
 const Gpu = @import("../gpu/gpu.zig").Gpu;
 const Var = autograd.Var;
 const Tape = autograd.Tape;
@@ -11,6 +10,32 @@ const Tape = autograd.Tape;
 //
 // A layer is a struct with init, deinit, toGpu, forward, params and state. params lists the
 // trainable variables for the optimizer; state lists every float slice a checkpoint must store.
+
+// Trainable variables share their life cycle: a value, a gradient that starts at zero, and a copy on the device.
+fn newParam(comptime Tn: type, gpa: Allocator, value: Tn) Allocator.Error!Var(Tn) {
+    errdefer value.deinit(gpa);
+    return .{ .value = value, .grad = try Tn.zeros(gpa), .needs_grad = true };
+}
+
+fn freeParam(param: anytype, gpa: Allocator) void {
+    param.value.deinit(gpa);
+    param.grad.deinit(gpa);
+}
+
+fn paramToGpu(param: anytype, gpu: *Gpu) autograd.Error!@TypeOf(param) {
+    const value = try gpu.alloc(f32, param.value.data.len);
+    const grad = try gpu.alloc(f32, param.grad.data.len);
+    try gpu.upload(value, param.value.data);
+    try gpu.fill(grad, 0);
+    return .{ .value = .{ .data = value }, .grad = .{ .data = grad }, .needs_grad = true };
+}
+
+// Statistics that are stored but not trained, such as the running mean of batch norm.
+fn statisticToGpu(statistic: anytype, gpu: *Gpu) autograd.Error!@TypeOf(statistic) {
+    const copy = try gpu.alloc(f32, statistic.data.len);
+    try gpu.upload(copy, statistic.data);
+    return .{ .data = copy };
+}
 
 /// A fully connected layer, y = x * w + b, with He-normal weights and zero bias.
 /// x has shape (rows, n_in) and the result has shape (rows, n_out).
@@ -25,40 +50,21 @@ pub fn Linear(comptime n_in: usize, comptime n_out: usize) type {
         b: Var(B),
 
         pub fn init(gpa: Allocator, rng: std.Random) Allocator.Error!Self {
-            const w = try W.empty(gpa);
-            errdefer w.deinit(gpa);
+            const values = try W.empty(gpa);
             const std_dev = @sqrt(2.0 / @as(f32, n_in));
-            for (w.data) |*v| v.* = rng.floatNorm(f32) * std_dev;
-            const grad_w = try W.zeros(gpa);
-            errdefer grad_w.deinit(gpa);
-            const b = try B.zeros(gpa);
-            errdefer b.deinit(gpa);
-            return .{
-                .w = .{ .value = w, .grad = grad_w, .needs_grad = true },
-                .b = .{ .value = b, .grad = try B.zeros(gpa), .needs_grad = true },
-            };
+            for (values.data) |*v| v.* = rng.floatNorm(f32) * std_dev;
+            const w = try newParam(W, gpa, values);
+            errdefer freeParam(w, gpa);
+            return .{ .w = w, .b = try newParam(B, gpa, try B.zeros(gpa)) };
         }
 
         pub fn deinit(self: Self, gpa: Allocator) void {
-            self.w.value.deinit(gpa);
-            self.w.grad.deinit(gpa);
-            self.b.value.deinit(gpa);
-            self.b.grad.deinit(gpa);
+            freeParam(self.w, gpa);
+            freeParam(self.b, gpa);
         }
 
         pub fn toGpu(self: Self, gpu: *Gpu) autograd.Error!Self {
-            const w = try gpu.alloc(f32, W.len);
-            const grad_w = try gpu.alloc(f32, W.len);
-            const b = try gpu.alloc(f32, B.len);
-            const grad_b = try gpu.alloc(f32, B.len);
-            try gpu.upload(w, self.w.value.data);
-            try gpu.upload(b, self.b.value.data);
-            try gpu.fill(grad_w, 0);
-            try gpu.fill(grad_b, 0);
-            return .{
-                .w = .{ .value = .{ .data = w }, .grad = .{ .data = grad_w }, .needs_grad = true },
-                .b = .{ .value = .{ .data = b }, .grad = .{ .data = grad_b }, .needs_grad = true },
-            };
+            return .{ .w = try paramToGpu(self.w, gpu), .b = try paramToGpu(self.b, gpu) };
         }
 
         pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(Tensor(@TypeOf(x.value).Elem, &.{ @TypeOf(x.value).shape[0], n_out })) {
@@ -91,50 +97,30 @@ pub fn BatchNorm(comptime c: usize) type {
 
         pub fn init(gpa: Allocator, rng: std.Random) Allocator.Error!Self {
             _ = rng;
-            const gamma = try V.full(gpa, 1);
-            errdefer gamma.deinit(gpa);
-            const grad_gamma = try V.zeros(gpa);
-            errdefer grad_gamma.deinit(gpa);
-            const beta = try V.zeros(gpa);
-            errdefer beta.deinit(gpa);
-            const grad_beta = try V.zeros(gpa);
-            errdefer grad_beta.deinit(gpa);
+            const gamma = try newParam(V, gpa, try V.full(gpa, 1));
+            errdefer freeParam(gamma, gpa);
+            const beta = try newParam(V, gpa, try V.zeros(gpa));
+            errdefer freeParam(beta, gpa);
             const mean = try V.zeros(gpa);
             errdefer mean.deinit(gpa);
-            return .{
-                .gamma = .{ .value = gamma, .grad = grad_gamma, .needs_grad = true },
-                .beta = .{ .value = beta, .grad = grad_beta, .needs_grad = true },
-                .mean = mean,
-                .variance = try V.full(gpa, 1),
-            };
+            return .{ .gamma = gamma, .beta = beta, .mean = mean, .variance = try V.full(gpa, 1) };
         }
 
         pub fn deinit(self: Self, gpa: Allocator) void {
-            self.gamma.value.deinit(gpa);
-            self.gamma.grad.deinit(gpa);
-            self.beta.value.deinit(gpa);
-            self.beta.grad.deinit(gpa);
+            freeParam(self.gamma, gpa);
+            freeParam(self.beta, gpa);
             self.mean.deinit(gpa);
             self.variance.deinit(gpa);
         }
 
         pub fn toGpu(self: Self, gpu: *Gpu) autograd.Error!Self {
-            var out: Self = undefined;
-            inline for (.{ "gamma", "beta" }) |name| {
-                const value = try gpu.alloc(f32, c);
-                const grad = try gpu.alloc(f32, c);
-                try gpu.upload(value, @field(self, name).value.data);
-                try gpu.fill(grad, 0);
-                @field(out, name) = .{ .value = .{ .data = value }, .grad = .{ .data = grad }, .needs_grad = true };
-            }
-            inline for (.{ "mean", "variance" }) |name| {
-                const statistic = try gpu.alloc(f32, c);
-                try gpu.upload(statistic, @field(self, name).data);
-                @field(out, name) = .{ .data = statistic };
-            }
-            return out;
+            return .{
+                .gamma = try paramToGpu(self.gamma, gpu),
+                .beta = try paramToGpu(self.beta, gpu),
+                .mean = try statisticToGpu(self.mean, gpu),
+                .variance = try statisticToGpu(self.variance, gpu),
+            };
         }
-
         pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(@TypeOf(x.value)) {
             return tape.batchNorm(x, self.gamma, self.beta, .{ .mean = self.mean, .variance = self.variance });
         }
@@ -159,6 +145,7 @@ pub fn Conv2d(comptime c_in: usize, comptime c_out: usize, comptime k: usize, co
 
     return struct {
         const Self = @This();
+        pub const Weights = Tensor(f32, &.{ k * k * c_in / opts.groups, c_out });
 
         inner: Inner,
 
@@ -174,7 +161,7 @@ pub fn Conv2d(comptime c_in: usize, comptime c_out: usize, comptime k: usize, co
             return .{ .inner = try self.inner.toGpu(gpu) };
         }
 
-        pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(Tensor(@TypeOf(x.value).Elem, &.{ @TypeOf(x.value).shape[0], (@TypeOf(x.value).shape[1] + 2 * opts.pad - k) / opts.stride + 1, (@TypeOf(x.value).shape[2] + 2 * opts.pad - k) / opts.stride + 1, c_out })) {
+        pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(autograd.ConvOut(@TypeOf(x.value), Weights, opts)) {
             return tape.add(try tape.conv2d(x, self.inner.w, opts), self.inner.b);
         }
 
@@ -214,11 +201,11 @@ pub fn ConvBn(comptime c_in: usize, comptime c_out: usize, comptime k: usize, co
             return .{ .conv = try self.conv.toGpu(gpu), .norm = try self.norm.toGpu(gpu) };
         }
 
-        pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(Tensor(@TypeOf(x.value).Elem, &.{ @TypeOf(x.value).shape[0], (@TypeOf(x.value).shape[1] + 2 * opts.pad - k) / opts.stride + 1, (@TypeOf(x.value).shape[2] + 2 * opts.pad - k) / opts.stride + 1, c_out })) {
+        pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(autograd.ConvOut(@TypeOf(x.value), Conv.Weights, opts)) {
             return self.norm.forward(tape, try tape.conv2d(x, self.conv.inner.w, opts));
         }
 
-        pub fn forwardRelu(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(Tensor(@TypeOf(x.value).Elem, &.{ @TypeOf(x.value).shape[0], (@TypeOf(x.value).shape[1] + 2 * opts.pad - k) / opts.stride + 1, (@TypeOf(x.value).shape[2] + 2 * opts.pad - k) / opts.stride + 1, c_out })) {
+        pub fn forwardRelu(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(autograd.ConvOut(@TypeOf(x.value), Conv.Weights, opts)) {
             return self.norm.forwardRelu(tape, try tape.conv2d(x, self.conv.inner.w, opts));
         }
 
@@ -291,37 +278,19 @@ pub fn LayerNorm(comptime c: usize) type {
 
         pub fn init(gpa: Allocator, rng: std.Random) Allocator.Error!Self {
             _ = rng;
-            const gamma = try V.full(gpa, 1);
-            errdefer gamma.deinit(gpa);
-            const grad_gamma = try V.zeros(gpa);
-            errdefer grad_gamma.deinit(gpa);
-            const beta = try V.zeros(gpa);
-            errdefer beta.deinit(gpa);
-            return .{
-                .gamma = .{ .value = gamma, .grad = grad_gamma, .needs_grad = true },
-                .beta = .{ .value = beta, .grad = try V.zeros(gpa), .needs_grad = true },
-            };
+            const gamma = try newParam(V, gpa, try V.full(gpa, 1));
+            errdefer freeParam(gamma, gpa);
+            return .{ .gamma = gamma, .beta = try newParam(V, gpa, try V.zeros(gpa)) };
         }
 
         pub fn deinit(self: Self, gpa: Allocator) void {
-            self.gamma.value.deinit(gpa);
-            self.gamma.grad.deinit(gpa);
-            self.beta.value.deinit(gpa);
-            self.beta.grad.deinit(gpa);
+            freeParam(self.gamma, gpa);
+            freeParam(self.beta, gpa);
         }
 
         pub fn toGpu(self: Self, gpu: *Gpu) autograd.Error!Self {
-            var out: Self = undefined;
-            inline for (.{ "gamma", "beta" }) |name| {
-                const value = try gpu.alloc(f32, c);
-                const grad = try gpu.alloc(f32, c);
-                try gpu.upload(value, @field(self, name).value.data);
-                try gpu.fill(grad, 0);
-                @field(out, name) = .{ .value = .{ .data = value }, .grad = .{ .data = grad }, .needs_grad = true };
-            }
-            return out;
+            return .{ .gamma = try paramToGpu(self.gamma, gpu), .beta = try paramToGpu(self.beta, gpu) };
         }
-
         pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(@TypeOf(x.value)) {
             return tape.layerNorm(x, self.gamma, self.beta);
         }
@@ -346,25 +315,18 @@ pub fn Embedding(comptime vocab: usize, comptime width: usize) type {
         table: Var(W),
 
         pub fn init(gpa: Allocator, rng: std.Random) Allocator.Error!Self {
-            const table = try W.empty(gpa);
-            errdefer table.deinit(gpa);
-            for (table.data) |*v| v.* = rng.floatNorm(f32) * 0.1;
-            return .{ .table = .{ .value = table, .grad = try W.zeros(gpa), .needs_grad = true } };
+            const values = try W.empty(gpa);
+            for (values.data) |*v| v.* = rng.floatNorm(f32) * 0.1;
+            return .{ .table = try newParam(W, gpa, values) };
         }
 
         pub fn deinit(self: Self, gpa: Allocator) void {
-            self.table.value.deinit(gpa);
-            self.table.grad.deinit(gpa);
+            freeParam(self.table, gpa);
         }
 
         pub fn toGpu(self: Self, gpu: *Gpu) autograd.Error!Self {
-            const value = try gpu.alloc(f32, W.len);
-            const grad = try gpu.alloc(f32, W.len);
-            try gpu.upload(value, self.table.value.data);
-            try gpu.fill(grad, 0);
-            return .{ .table = .{ .value = .{ .data = value }, .grad = .{ .data = grad }, .needs_grad = true } };
+            return .{ .table = try paramToGpu(self.table, gpu) };
         }
-
         pub fn forward(self: Self, tape: *Tape, comptime n: usize, ids: []const u32, comptime Out: type) autograd.Error!Var(Tensor(Out, &.{ n, width })) {
             return tape.embedding(self.table, n, ids, Out);
         }

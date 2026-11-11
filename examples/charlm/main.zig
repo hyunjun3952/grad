@@ -14,23 +14,6 @@ const Net = struct { nn.Gru(vocab, hidden), nn.Linear(hidden, vocab) };
 const Input = Tensor(f32, &.{ batch, vocab });
 const State = Tensor(f32, &.{ batch, hidden });
 
-const Run = struct {
-    gpu: ?*grad.gpu.Gpu,
-    par: grad.kernels.Parallel,
-
-    fn buffer(self: Run, comptime T: type, gpa: std.mem.Allocator, n: usize) ![]T {
-        return if (self.gpu) |dev| dev.alloc(T, n) else gpa.alloc(T, n);
-    }
-
-    fn put(self: Run, dst: anytype, src: anytype) !void {
-        if (self.gpu) |dev| try dev.upload(dst, src) else @memcpy(dst, src);
-    }
-
-    fn get(self: Run, dst: anytype, src: anytype) !void {
-        if (self.gpu) |dev| try dev.download(dst, src) else @memcpy(dst, src);
-    }
-};
-
 fn step(model: Net, tape: *Tape, x: Input, h: Var(State)) !struct { Var(State), Var(Tensor(f32, &.{ batch, vocab })) } {
     const cell, const out = model;
     const next = try cell.forward(tape, try tape.constant(x), h);
@@ -54,11 +37,11 @@ fn sample(rng: std.Random, logits: []const f32, temperature: f32) u8 {
     return vocab - 1;
 }
 
-fn generate(run: Run, gpa: std.mem.Allocator, model: Net, rng: std.Random, out: *std.Io.Writer, seed_text: []const u8, length: usize) !void {
+fn generate(par: grad.kernels.Parallel, gpa: std.mem.Allocator, model: Net, rng: std.Random, out: *std.Io.Writer, seed_text: []const u8, length: usize) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const input = try run.buffer(f32, gpa, batch * vocab);
-    const state = try run.buffer(f32, gpa, batch * hidden);
+    const input = try par.alloc(f32, gpa, batch * vocab);
+    const state = try par.alloc(f32, gpa, batch * hidden);
     const logits = try gpa.alloc(f32, batch * vocab);
     defer gpa.free(logits);
     const hidden_host = try gpa.alloc(f32, batch * hidden);
@@ -66,25 +49,23 @@ fn generate(run: Run, gpa: std.mem.Allocator, model: Net, rng: std.Random, out: 
     @memset(hidden_host, 0);
     var host_input = try gpa.alloc(f32, batch * vocab);
     defer gpa.free(host_input);
-    defer if (run.gpu == null) {
-        gpa.free(input);
-        gpa.free(state);
-    };
+    defer par.free(gpa, input);
+    defer par.free(gpa, state);
 
     var current: u8 = seed_text[0];
     try out.writeByte(current);
     var at: usize = 1;
     for (0..length) |_| {
         _ = arena.reset(.retain_capacity);
-        if (run.gpu) |dev| try dev.resetStep();
-        var tape: Tape = .{ .gpa = arena.allocator(), .par = run.par };
+        if (par.gpu) |dev| try dev.resetStep();
+        var tape: Tape = .{ .gpa = arena.allocator(), .par = par };
         @memset(host_input, 0);
         for (0..batch) |row| host_input[row * vocab + current] = 1;
-        try run.put(input, host_input);
-        try run.put(state, hidden_host);
+        try par.upload(input, host_input);
+        try par.upload(state, hidden_host);
         const next, const scores = try step(model, &tape, .{ .data = input }, try tape.constant(State{ .data = state }));
-        try run.get(hidden_host, next.value.data);
-        try run.get(logits, scores.value.data);
+        try par.download(hidden_host, next.value.data);
+        try par.download(logits, scores.value.data);
         if (at < seed_text.len) {
             current = seed_text[at];
             at += 1;
@@ -127,7 +108,7 @@ pub fn main(init: std.process.Init) !void {
     if (gpu) |dev| {
         if (profile) dev.startProfile(init.io);
     }
-    const run: Run = .{ .gpu = gpu, .par = .{ .io = init.io, .threads = std.Thread.getCpuCount() catch 1, .gpu = gpu } };
+    const par: grad.kernels.Parallel = .{ .io = init.io, .threads = std.Thread.getCpuCount() catch 1, .gpu = gpu };
 
     var prng = std.Random.DefaultPrng.init(42);
     const rng = prng.random();
@@ -135,11 +116,11 @@ pub fn main(init: std.process.Init) !void {
     defer nn.deinitAll(host_model, gpa);
     const model = if (gpu) |dev| try nn.toGpuAll(host_model, dev) else host_model;
     const params = nn.params(model);
-    var adam = try grad.optim.Adam.init(gpa, run.par, 0.003, params);
+    var adam = try grad.optim.Adam.init(gpa, par, 0.003, params);
     defer adam.deinit();
 
-    const inputs = try run.buffer(f32, gpa, unroll * batch * vocab);
-    const targets = try run.buffer(u8, gpa, unroll * batch);
+    const inputs = try par.alloc(f32, gpa, unroll * batch * vocab);
+    const targets = try par.alloc(u8, gpa, unroll * batch);
     defer if (gpu == null) {
         gpa.free(inputs);
         gpa.free(targets);
@@ -168,8 +149,8 @@ pub fn main(init: std.process.Init) !void {
                 host_targets[t * batch + row] = text[start + t + 1] & 0x7f;
             }
         }
-        try run.put(inputs, host_inputs);
-        try run.put(targets, host_targets);
+        try par.upload(inputs, host_inputs);
+        try par.upload(targets, host_targets);
 
         // NOTE: the step is launch-bound (thousands of tiny kernels), so on the GPU it is recorded once into a graph and replayed.
         // Nothing in it changes between steps: the inputs and targets are refilled in place and the scratch addresses repeat.
@@ -179,8 +160,8 @@ pub fn main(init: std.process.Init) !void {
                 try dev.resetStep();
                 if (use_graph) try dev.beginCapture();
             }
-            var tape: Tape = .{ .gpa = arena.allocator(), .par = run.par, .training = true };
-            try grad.optim.zeroGrad(run.par, params);
+            var tape: Tape = .{ .gpa = arena.allocator(), .par = par, .training = true };
+            try grad.optim.zeroGrad(par, params);
             var state = try tape.constant(try tape.zeroedTensor(State));
             var total: ?Var(Tensor(f32, &.{})) = null;
             for (0..unroll) |t| {
@@ -195,10 +176,10 @@ pub fn main(init: std.process.Init) !void {
         }
         if (use_graph) try gpu.?.replay(graph.?);
         adam.lr = grad.optim.cosineLr(0.003, iteration, steps, 50);
-        try adam.step(run.par, params);
+        try adam.step(par, params);
 
         var value: [1]f32 = undefined;
-        try run.get(&value, mean.value.data);
+        try par.download(&value, mean.value.data);
         running = if (iteration == 0) value[0] else 0.98 * running + 0.02 * value[0];
         if ((iteration + 1) % 100 == 0) {
             try out.print("step {d:>5}  loss {d:.3} nats/char\n", .{ iteration + 1, running });
@@ -208,6 +189,6 @@ pub fn main(init: std.process.Init) !void {
 
     if (gpu) |dev| try dev.printProfile(out);
     try out.writeAll("\n--- sample ---\n");
-    try generate(run, gpa, model, rng, out, "ROMEO:", 600);
+    try generate(par, gpa, model, rng, out, "ROMEO:", 600);
     try out.flush();
 }

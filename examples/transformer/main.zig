@@ -28,23 +28,6 @@ fn Logits(comptime n: usize) type {
     return Tensor(Act, &.{ n, vocab });
 }
 
-const Run = struct {
-    gpu: ?*grad.gpu.Gpu,
-    par: grad.kernels.Parallel,
-
-    fn buffer(self: Run, comptime T: type, gpa: std.mem.Allocator, n: usize) ![]T {
-        return if (self.gpu) |dev| dev.alloc(T, n) else gpa.alloc(T, n);
-    }
-
-    fn put(self: Run, dst: anytype, src: anytype) !void {
-        if (self.gpu) |dev| try dev.upload(dst, src) else @memcpy(dst, src);
-    }
-
-    fn get(self: Run, dst: anytype, src: anytype) !void {
-        if (self.gpu) |dev| try dev.download(dst, src) else @memcpy(dst, src);
-    }
-};
-
 // Token and position embeddings are added, passed through three causal blocks, and projected to one score per character.
 // n is the number of rows, a whole number of sequences of context characters.
 fn forward(model: Net, tape: *Tape, comptime n: usize, tokens: []const u32, positions: []const u32) !Var(Logits(n)) {
@@ -73,21 +56,19 @@ fn sample(rng: std.Random, logits: []const f32, temperature: f32) u8 {
 
 // Writes length characters after seed_text. Every batch row holds the same window, because the model works on whole batches.
 // NOTE: attention is causal, so the scores at the last filled position do not depend on the padding after it.
-fn generate(run: Run, gpa: std.mem.Allocator, model: Net, rng: std.Random, out: *std.Io.Writer, seed_text: []const u8, length: usize) !void {
+fn generate(par: grad.kernels.Parallel, gpa: std.mem.Allocator, model: Net, rng: std.Random, out: *std.Io.Writer, seed_text: []const u8, length: usize) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const tokens = try run.buffer(u32, gpa, rows);
-    const positions = try run.buffer(u32, gpa, rows);
-    defer if (run.gpu == null) {
-        gpa.free(tokens);
-        gpa.free(positions);
-    };
+    const tokens = try par.alloc(u32, gpa, rows);
+    const positions = try par.alloc(u32, gpa, rows);
+    defer par.free(gpa, tokens);
+    defer par.free(gpa, positions);
     const host_tokens = try gpa.alloc(u32, rows);
     defer gpa.free(host_tokens);
     const host_positions = try gpa.alloc(u32, rows);
     defer gpa.free(host_positions);
     for (host_positions, 0..) |*p, i| p.* = @intCast(i % context);
-    try run.put(positions, host_positions);
+    try par.upload(positions, host_positions);
     const logits = try gpa.alloc(f32, rows * vocab);
     defer gpa.free(logits);
 
@@ -104,14 +85,14 @@ fn generate(run: Run, gpa: std.mem.Allocator, model: Net, rng: std.Random, out: 
     }
     for (0..length) |_| {
         _ = arena.reset(.retain_capacity);
-        if (run.gpu) |dev| try dev.resetStep();
+        if (par.gpu) |dev| try dev.resetStep();
         for (0..batch) |row| {
             for (0..context) |t| host_tokens[row * context + t] = window[t];
         }
-        try run.put(tokens, host_tokens);
-        var tape: Tape = .{ .gpa = arena.allocator(), .par = run.par };
+        try par.upload(tokens, host_tokens);
+        var tape: Tape = .{ .gpa = arena.allocator(), .par = par };
         const scores = try tape.cast(try forward(model, &tape, rows, tokens, positions), f32);
-        try run.get(logits, scores.value.data);
+        try par.download(logits, scores.value.data);
         const next = sample(rng, logits[(filled - 1) * vocab ..][0..vocab], 0.8);
         try out.writeByte(next);
         if (filled == context) {
@@ -126,46 +107,37 @@ fn generate(run: Run, gpa: std.mem.Allocator, model: Net, rng: std.Random, out: 
 
 // Writes the model as ONNX for one sequence of context characters. The graph takes the character codes and the positions as
 // int32 inputs "input0" and "input1" and gives the scores of every position; it is traced with the first characters of text.
-fn exportOnnx(run: Run, gpa: std.mem.Allocator, io: std.Io, model: Net, text: []const u8, path: []const u8, out: *std.Io.Writer) !void {
+fn exportOnnx(par: grad.kernels.Parallel, gpa: std.mem.Allocator, io: std.Io, model: Net, text: []const u8, path: []const u8, out: *std.Io.Writer) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const tokens = try run.buffer(u32, gpa, context);
-    const positions = try run.buffer(u32, gpa, context);
-    defer if (run.gpu == null) {
-        gpa.free(tokens);
-        gpa.free(positions);
-    };
+    const tokens = try par.alloc(u32, gpa, context);
+    const positions = try par.alloc(u32, gpa, context);
+    defer par.free(gpa, tokens);
+    defer par.free(gpa, positions);
     var host_tokens: [context]u32 = undefined;
     var host_positions: [context]u32 = undefined;
     for (&host_tokens, &host_positions, 0..) |*t, *p, i| {
         t.* = text[i] & 0x7f;
         p.* = @intCast(i);
     }
-    try run.put(tokens, &host_tokens);
-    try run.put(positions, &host_positions);
+    try par.upload(tokens, &host_tokens);
+    try par.upload(positions, &host_positions);
 
-    if (run.gpu) |dev| try dev.resetStep();
+    if (par.gpu) |dev| try dev.resetStep();
     var trace: grad.onnx.Trace = .{ .gpa = gpa };
     defer trace.deinit();
-    var tape: Tape = .{ .gpa = arena.allocator(), .par = run.par, .trace = &trace };
+    var tape: Tape = .{ .gpa = arena.allocator(), .par = par, .trace = &trace };
     const logits = try tape.cast(try forward(model, &tape, context, tokens, positions), f32);
 
     const slices = nn.state(model);
-    var weights: [slices.len]grad.onnx.Weight = undefined;
-    var copied: usize = 0;
-    defer for (weights[0..copied]) |w| gpa.free(w.data);
-    inline for (slices, 0..) |slice, i| {
-        const host = try gpa.alloc(f32, slice.len);
-        weights[i] = .{ .id = @intFromPtr(slice.ptr), .data = host };
-        copied += 1;
-        try run.get(host, slice);
-    }
-    try grad.onnx.save(gpa, io, path, .{ .trace = &trace, .weights = &weights, .inputs = &.{ grad.onnx.View.ofIds(tokens), grad.onnx.View.ofIds(positions) }, .outputs = &.{grad.onnx.View.of(logits)} });
+    const weights = try grad.onnx.WeightSet(slices.len).collect(gpa, par, slices);
+    defer weights.deinit(gpa);
+    try grad.onnx.save(gpa, io, path, .{ .trace = &trace, .weights = &weights.items, .inputs = &.{ grad.onnx.View.ofIds(tokens), grad.onnx.View.ofIds(positions) }, .outputs = &.{grad.onnx.View.of(logits)} });
 
     // The scores of the last position, for scripts/check-onnx.py to compare with.
     const scores = try gpa.alloc(f32, context * vocab);
     defer gpa.free(scores);
-    try run.get(scores, logits.value.data);
+    try par.download(scores, logits.value.data);
     try out.print("exported {s}\nlogits of the last position:", .{path});
     for (scores[(context - 1) * vocab ..]) |s| try out.print(" {d:.5}", .{s});
     try out.writeByte('\n');
@@ -205,7 +177,7 @@ pub fn main(init: std.process.Init) !void {
     if (gpu) |dev| {
         if (profile) dev.startProfile(init.io);
     }
-    const run: Run = .{ .gpu = gpu, .par = .{ .io = init.io, .threads = std.Thread.getCpuCount() catch 1, .gpu = gpu } };
+    const par: grad.kernels.Parallel = .{ .io = init.io, .threads = std.Thread.getCpuCount() catch 1, .gpu = gpu };
 
     var prng = std.Random.DefaultPrng.init(42);
     const rng = prng.random();
@@ -213,12 +185,12 @@ pub fn main(init: std.process.Init) !void {
     defer nn.deinitAll(host_model, gpa);
     const model = if (gpu) |dev| try nn.toGpuAll(host_model, dev) else host_model;
     const params = nn.params(model);
-    var adam = try grad.optim.Adam.init(gpa, run.par, 0.003, params);
+    var adam = try grad.optim.Adam.init(gpa, par, 0.003, params);
     defer adam.deinit();
 
-    const tokens = try run.buffer(u32, gpa, rows);
-    const positions = try run.buffer(u32, gpa, rows);
-    const targets = try run.buffer(u8, gpa, rows);
+    const tokens = try par.alloc(u32, gpa, rows);
+    const positions = try par.alloc(u32, gpa, rows);
+    const targets = try par.alloc(u8, gpa, rows);
     defer if (gpu == null) {
         gpa.free(tokens);
         gpa.free(positions);
@@ -231,7 +203,7 @@ pub fn main(init: std.process.Init) !void {
     const host_targets = try gpa.alloc(u8, rows);
     defer gpa.free(host_targets);
     for (host_positions, 0..) |*p, i| p.* = @intCast(i % context);
-    try run.put(positions, host_positions);
+    try par.upload(positions, host_positions);
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -247,20 +219,20 @@ pub fn main(init: std.process.Init) !void {
                 host_targets[row * context + t] = text[start + t + 1] & 0x7f;
             }
         }
-        try run.put(tokens, host_tokens);
-        try run.put(targets, host_targets);
+        try par.upload(tokens, host_tokens);
+        try par.upload(targets, host_targets);
 
         _ = arena.reset(.retain_capacity);
         if (gpu) |dev| try dev.resetStep();
-        var tape: Tape = .{ .gpa = arena.allocator(), .par = run.par, .training = true };
-        try grad.optim.zeroGrad(run.par, params);
+        var tape: Tape = .{ .gpa = arena.allocator(), .par = par, .training = true };
+        try grad.optim.zeroGrad(par, params);
         const loss = try tape.crossEntropy(try forward(model, &tape, rows, tokens, positions), targets);
         try tape.backward(loss);
         adam.lr = grad.optim.cosineLr(0.003, iteration, iterations, 50);
-        try adam.step(run.par, params);
+        try adam.step(par, params);
 
         var value: [1]f32 = undefined;
-        try run.get(&value, loss.value.data);
+        try par.download(&value, loss.value.data);
         running = if (iteration == 0) value[0] else 0.98 * running + 0.02 * value[0];
         if ((iteration + 1) % 100 == 0) {
             try out.print("step {d:>5}  loss {d:.3} nats/char\n", .{ iteration + 1, running });
@@ -270,7 +242,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (gpu) |dev| try dev.printProfile(out);
     try out.writeAll("\n--- sample ---\n");
-    try generate(run, gpa, model, rng, out, "ROMEO:", 600);
-    if (onnx_path) |p| try exportOnnx(run, gpa, init.io, model, text, p, out);
+    try generate(par, gpa, model, rng, out, "ROMEO:", 600);
+    if (onnx_path) |p| try exportOnnx(par, gpa, init.io, model, text, p, out);
     try out.flush();
 }

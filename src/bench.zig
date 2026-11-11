@@ -287,7 +287,7 @@ fn gpuMatmul(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
             const t0 = Io.Clock.awake.now(io);
             for (0..20) |_| try dev.matmul(a, b, c, .{ .m = m, .n = n, .k = k }, .{ .trans_a = t[0], .trans_b = t[1] });
             try dev.cu.sync();
-            const ns: f64 = @floatFromInt(Io.Clock.awake.now(io).nanoseconds - t0.nanoseconds);
+            const ns = nanoseconds(io, t0);
             try out.print("{d:>10.2}", .{2.0 * @as(f64, @floatFromInt(m * n * k)) * 20 / ns / 1000});
         }
         try out.writeAll("\n");
@@ -356,7 +356,7 @@ fn cudnnConvolutions(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, dir: [:0]c
                     }
                 }
                 try dev.cu.sync();
-                const ns: f64 = @floatFromInt(Io.Clock.awake.now(io).nanoseconds - t0.nanoseconds);
+                const ns = nanoseconds(io, t0);
                 tflops[direction] = flops * 20 / ns / 1000;
             }
             try out.print("{s:<30}{s:<10}{d:>10.2}{d:>10.2}{d:>10.2}\n", .{ case.name, @tagName(data), tflops[0], tflops[1], tflops[2] });
@@ -406,7 +406,7 @@ fn implicitGemm(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
                 if (variant == 0) try dev.convImplicitForward(x_half, w_half, y, geo, false) else try dev.convImplicitWeightGrad(dy_t, x_half, dw, geo);
             }
             try dev.cu.sync();
-            const ns: f64 = @floatFromInt(Io.Clock.awake.now(io).nanoseconds - t0.nanoseconds);
+            const ns = nanoseconds(io, t0);
             tflops[variant] = flops * 20 / ns / 1000;
         }
         const positions_padded = std.mem.alignForward(usize, rows, 32);
@@ -420,7 +420,7 @@ fn implicitGemm(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
                 if (variant == 0) try dev.convTf32Forward(x, w, case.c_out, y, geo, false) else try dev.convTf32WeightGrad(dy_t32, x, dw, geo);
             }
             try dev.cu.sync();
-            const ns: f64 = @floatFromInt(Io.Clock.awake.now(io).nanoseconds - t0.nanoseconds);
+            const ns = nanoseconds(io, t0);
             tf32_rates[variant] = flops * 20 / ns / 1000;
         }
         try out.print("{s:<30}{d:>14.2}{d:>14.2}{d:>14.2}{d:>14.2}\n", .{ case.name, tflops[0], tflops[1], tf32_rates[0], tf32_rates[1] });
@@ -467,7 +467,7 @@ fn gpuTensorCore(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
             const t0 = Io.Clock.awake.now(io);
             for (0..20) |_| try dev.matmul(a, b, target, .{ .m = case.m, .n = case.n, .k = case.k }, case.opts);
             try dev.cu.sync();
-            const ns: f64 = @floatFromInt(Io.Clock.awake.now(io).nanoseconds - t0.nanoseconds);
+            const ns = nanoseconds(io, t0);
             tflops[variant] = flops * 20 / ns / 1000;
         }
 
@@ -479,7 +479,7 @@ fn gpuTensorCore(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
         const kernel_start = Io.Clock.awake.now(io);
         for (0..20) |_| try dev.matmulPacked(a_packed, b_packed, c16, .{ .m = case.m, .n = case.n, .k = case.k }, false, false);
         try dev.cu.sync();
-        const kernel_ns: f64 = @floatFromInt(Io.Clock.awake.now(io).nanoseconds - kernel_start.nanoseconds);
+        const kernel_ns = nanoseconds(io, kernel_start);
         const kernel_tflops = flops * 20 / kernel_ns / 1000;
         dev.step_used = mark;
 
@@ -500,8 +500,13 @@ fn gpuTensorCore(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
     }
     try out.writeAll("\n");
 }
+// Time since a clock reading, as a float.
+fn nanoseconds(io: Io, since: Io.Timestamp) f64 {
+    return @floatFromInt(Io.Clock.awake.now(io).nanoseconds - since.nanoseconds);
+}
+
 fn milliseconds(io: Io, since: Io.Timestamp) f64 {
-    return @as(f64, @floatFromInt(Io.Clock.awake.now(io).nanoseconds - since.nanoseconds)) / 1e6;
+    return nanoseconds(io, since) / 1e6;
 }
 
 fn cpuOps(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {

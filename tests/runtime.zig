@@ -156,16 +156,9 @@ test "a network traced on the gpu with bf16 activations exports to an f32 graph 
     try gpu.download(&want, logits.value.data);
 
     const state = nn.state(layers);
-    var weights: [state.len]onnx.Weight = undefined;
-    var copied: usize = 0;
-    defer for (weights[0..copied]) |w| gpa.free(w.data);
-    inline for (state, 0..) |slice, i| {
-        const on_host = try gpa.alloc(f32, slice.len);
-        weights[i] = .{ .id = @intFromPtr(slice.ptr), .data = on_host };
-        copied += 1;
-        try gpu.download(on_host, slice);
-    }
-    const bytes = try onnx.build(gpa, .{ .trace = &trace, .weights = &weights, .inputs = &.{onnx.View.of(image)}, .outputs = &.{onnx.View.of(logits)} });
+    const weights = try onnx.WeightSet(state.len).collect(gpa, .{ .gpu = gpu }, state);
+    defer weights.deinit(gpa);
+    const bytes = try onnx.build(gpa, .{ .trace = &trace, .weights = &weights.items, .inputs = &.{onnx.View.of(image)}, .outputs = &.{onnx.View.of(logits)} });
     defer gpa.free(bytes);
 
     var model = try Model.parse(gpa, bytes);

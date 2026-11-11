@@ -1,4 +1,3 @@
-const std = @import("std");
 const bf16 = @import("bf16.zig");
 
 pub const Op = enum { im2col, col2im, col2imHalf, maxPool, maxPoolBackward, avgPool, avgPoolBackward, maxPoolHalf, maxPoolBackwardHalf, avgPoolHalf, avgPoolBackwardHalf, groupedForward, groupedInputGrad, groupedWeightGrad };

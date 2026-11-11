@@ -1,4 +1,3 @@
-const std = @import("std");
 const bf16 = @import("bf16.zig");
 
 pub inline fn hash(seed: u64, t: usize) u64 {

@@ -1,4 +1,3 @@
-const std = @import("std");
 const bf16 = @import("bf16.zig");
 
 pub const eps: f32 = 1e-5;

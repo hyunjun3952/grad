@@ -155,7 +155,7 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
             var tape: Tape = .{ .gpa = arena.allocator(), .par = par };
             const x: Tensor(f32, &.{ Spec.eval_batch, pixels }) = .{ .data = images };
             const logits = try Spec.forward(model, &tape, try tape.constant(x));
-            if (par.gpu) |dev| try dev.download(host, logits.value.data) else @memcpy(host, logits.value.data);
+            try par.download(host, logits.value.data);
         }
 
         fn accuracy(gpa: Allocator, par: kernels.Parallel, model: Spec.Layers, data: Dataset, mirrored_too: bool) !f64 {
@@ -167,10 +167,10 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
             defer gpa.free(mirror_logits);
             const host_labels = try gpa.alloc(u8, data.count());
             defer gpa.free(host_labels);
-            if (par.gpu) |dev| try dev.download(host_labels, data.labels) else @memcpy(host_labels, data.labels);
+            try par.download(host_labels, data.labels);
 
-            const mirrored: []f32 = if (!mirrored_too) &.{} else if (par.gpu) |dev| try dev.alloc(f32, Spec.eval_batch * pixels) else try gpa.alloc(f32, Spec.eval_batch * pixels);
-            defer if (par.gpu == null) gpa.free(mirrored);
+            const mirrored: []f32 = if (mirrored_too) try par.alloc(f32, gpa, Spec.eval_batch * pixels) else &.{};
+            defer par.free(gpa, mirrored);
             var identity: []u32 = &.{};
             var scratch_labels: [2][]u8 = .{ &.{}, &.{} };
             if (mirrored_too and par.gpu != null) {
@@ -217,7 +217,7 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
             defer arena.deinit();
             const labels = try gpa.alloc(u8, data.count());
             defer gpa.free(labels);
-            if (par.gpu) |dev| try dev.download(labels, data.labels) else @memcpy(labels, data.labels);
+            try par.download(labels, data.labels);
             var row: [Spec.classes]f32 = undefined;
             for (0..@min(count, data.count())) |i| {
                 _ = arena.reset(.retain_capacity);
@@ -225,7 +225,7 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
                 var tape: Tape = .{ .gpa = arena.allocator(), .par = par };
                 const x: Tensor(f32, &.{ 1, pixels }) = .{ .data = data.images[i * pixels ..][0..pixels] };
                 const logits = try Spec.forward(model, &tape, try tape.constant(x));
-                if (par.gpu) |dev| try dev.download(&row, logits.value.data) else @memcpy(&row, logits.value.data);
+                try par.download(&row, logits.value.data);
                 var best: usize = 0;
                 var total: f32 = 0;
                 for (row, 0..) |s, j| {
@@ -252,24 +252,13 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
             const logits = try Spec.forward(model, &tape, input);
 
             const slices = nn.state(model);
-            var weights: [slices.len]onnx.Weight = undefined;
-            var copied: usize = 0;
-            defer for (weights[0..copied]) |w| gpa.free(w.data);
-            inline for (slices, 0..) |slice, i| {
-                const host = try gpa.alloc(f32, slice.len);
-                weights[i] = .{ .id = @intFromPtr(slice.ptr), .data = host };
-                copied += 1;
-                if (par.gpu) |dev| try dev.download(host, slice) else @memcpy(host, slice);
-            }
-            try onnx.save(gpa, io, path, .{ .trace = &trace, .weights = &weights, .inputs = &.{onnx.View.of(input)}, .outputs = &.{onnx.View.of(logits)} });
-        }
-
-        fn buffer(comptime T: type, gpa: Allocator, gpu: ?*Gpu, n: usize) ![]T {
-            return if (gpu) |dev| dev.alloc(T, n) else gpa.alloc(T, n);
+            const weights = try onnx.WeightSet(slices.len).collect(gpa, par, slices);
+            defer weights.deinit(gpa);
+            try onnx.save(gpa, io, path, .{ .trace = &trace, .weights = &weights.items, .inputs = &.{onnx.View.of(input)}, .outputs = &.{onnx.View.of(logits)} });
         }
 
         const Feed = struct {
-            gpu: ?*Gpu,
+            par: kernels.Parallel,
             host: Dataset,
             device: Dataset,
             order: []u32,
@@ -278,38 +267,38 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
             labels: []u8,
             other_labels: []u8,
 
-            fn init(gpa: Allocator, gpu: ?*Gpu, host: Dataset, device: Dataset) !Feed {
+            // NOTE: on the CPU the shuffled order is read in place, so order_device aliases order.
+            fn init(gpa: Allocator, par: kernels.Parallel, host: Dataset, device: Dataset) !Feed {
                 const order = try gpa.alloc(u32, host.count());
                 return .{
-                    .gpu = gpu,
+                    .par = par,
                     .host = host,
                     .device = device,
                     .order = order,
-                    .order_device = if (gpu) |dev| try dev.alloc(u32, order.len) else order,
-                    .batch = .{ .data = try buffer(f32, gpa, gpu, batch_size * pixels) },
-                    .labels = try buffer(u8, gpa, gpu, batch_size),
-                    .other_labels = try buffer(u8, gpa, gpu, batch_size),
+                    .order_device = if (par.gpu) |dev| try dev.alloc(u32, order.len) else order,
+                    .batch = .{ .data = try par.alloc(f32, gpa, batch_size * pixels) },
+                    .labels = try par.alloc(u8, gpa, batch_size),
+                    .other_labels = try par.alloc(u8, gpa, batch_size),
                 };
             }
 
             fn deinit(self: Feed, gpa: Allocator) void {
                 gpa.free(self.order);
-                if (self.gpu != null) return;
-                gpa.free(self.batch.data);
-                gpa.free(self.labels);
-                gpa.free(self.other_labels);
+                self.par.free(gpa, self.batch.data);
+                self.par.free(gpa, self.labels);
+                self.par.free(gpa, self.other_labels);
             }
 
             fn shuffle(self: Feed, epoch: usize) !void {
                 for (self.order, 0..) |*o, i| o.* = @intCast(i);
                 var prng = std.Random.DefaultPrng.init(1234 + epoch);
                 prng.random().shuffle(u32, self.order);
-                if (self.gpu) |dev| try dev.upload(self.order_device, self.order);
+                if (self.par.gpu) |dev| try dev.upload(self.order_device, self.order);
             }
 
             // Fills the batch with the slice number slice of the shuffled order; slices are batch_size rows long.
             fn fill(self: Feed, slice: usize, augment: augment_math.Config) !void {
-                if (self.gpu) |dev| return dev.gather(.{ .images = self.device.images, .labels = self.device.labels, .order = self.order_device }, .{ .batch = self.batch.data, .labels = self.labels, .other_labels = self.other_labels }, slice * batch_size, augment);
+                if (self.par.gpu) |dev| return dev.gather(.{ .images = self.device.images, .labels = self.device.labels, .order = self.order_device }, .{ .batch = self.batch.data, .labels = self.labels, .other_labels = self.other_labels }, slice * batch_size, augment);
                 const rows = self.order[slice * batch_size ..][0..batch_size];
                 for (rows, 0..) |idx, row| {
                     const partner = (row + 1) % batch_size;
@@ -401,7 +390,7 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
             const test_data = if (gpu) |dev| try test_set.toGpu(dev) else test_set;
             if (opts.load_path != null and index == 0) try out.print("loaded checkpoint after {d} epochs, test accuracy {d:.2}%\n", .{ start_epoch, try accuracy(gpa, par, model, test_data, false) });
 
-            const feed = try Feed.init(gpa, gpu, train, train_data);
+            const feed = try Feed.init(gpa, par, train, train_data);
             defer feed.deinit(gpa);
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();

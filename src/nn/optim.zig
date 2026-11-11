@@ -217,8 +217,8 @@ pub const Ema = struct {
         const shadow = try gpa.alloc([]f32, slices.len);
         errdefer gpa.free(shadow);
         const on_gpu = par.gpu != null;
-        const values = if (par.gpu) |dev| try dev.alloc(f32, total) else try gpa.alloc(f32, total);
-        errdefer if (!on_gpu) gpa.free(values);
+        const values = try par.alloc(f32, gpa, total);
+        errdefer par.free(gpa, values);
         var at: usize = 0;
         inline for (slices, 0..) |s, i| {
             live[i] = s;

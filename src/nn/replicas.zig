@@ -60,7 +60,7 @@ pub const Replicas = struct {
         inline for (params) |p| {
             const grad = p.grad.data;
             const mine = self.host[index][at..][0..grad.len];
-            if (par.gpu) |dev| try dev.download(mine, grad) else @memcpy(mine, grad);
+            try par.download(mine, grad);
             at += grad.len;
         }
         std.debug.assert(at == self.host[0].len);
@@ -79,7 +79,7 @@ pub const Replicas = struct {
         inline for (params) |p| {
             const grad = p.grad.data;
             const mean = self.host[0][at..][0..grad.len];
-            if (par.gpu) |dev| try dev.upload(grad, mean) else @memcpy(grad, mean);
+            try par.upload(grad, mean);
             at += grad.len;
         }
         // NOTE: the next call overwrites host[0], so no replica may still be reading it.

@@ -13,7 +13,6 @@ const softmax_math = @import("../gpu/math/softmax.zig");
 const layernorm_math = @import("../gpu/math/layernorm.zig");
 const drop = @import("../gpu/math/dropout.zig");
 const norm = @import("../gpu/math/norm.zig");
-const bf16_math = @import("../gpu/math/bf16.zig");
 const Tensor = tensor.Tensor;
 const trace_mod = @import("trace.zig");
 pub const Trace = trace_mod.Trace;

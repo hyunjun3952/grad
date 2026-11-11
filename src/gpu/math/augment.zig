@@ -1,4 +1,3 @@
-const std = @import("std");
 const drop = @import("dropout.zig");
 
 pub const Box = struct {

@@ -2,8 +2,6 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Gpu = @import("../gpu/gpu.zig").Gpu;
-const Linear = @import("nn.zig").Linear;
-const optim = @import("optim.zig");
 
 const magic: u32 = 0x32445247;
 

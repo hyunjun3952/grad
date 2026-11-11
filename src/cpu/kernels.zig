@@ -69,7 +69,33 @@ pub const TileConfig = struct {
     accumulate: bool = false,
 };
 
-pub const Parallel = struct { io: ?Io = null, threads: usize = 1, gpu: ?*Gpu = null };
+/// Where and how work runs: the I/O handle and thread count of the CPU worker pool, and the GPU when there is one.
+/// The memory helpers hide the difference between the two: on the CPU a buffer is an ordinary slice, on the GPU a device slice.
+pub const Parallel = struct {
+    io: ?Io = null,
+    threads: usize = 1,
+    gpu: ?*Gpu = null,
+
+    /// Allocates n elements where this Parallel computes: device memory (kept until the Gpu is destroyed) or memory from gpa.
+    pub fn alloc(self: Parallel, comptime T: type, gpa: std.mem.Allocator, n: usize) ![]T {
+        return if (self.gpu) |dev| dev.alloc(T, n) else gpa.alloc(T, n);
+    }
+
+    /// Releases what alloc returned; device memory belongs to the Gpu and is left alone.
+    pub fn free(self: Parallel, gpa: std.mem.Allocator, slice: anytype) void {
+        if (self.gpu == null) gpa.free(slice);
+    }
+
+    /// Copies a host slice into a buffer from alloc.
+    pub fn upload(self: Parallel, dst: anytype, src: anytype) !void {
+        if (self.gpu) |dev| try dev.upload(dst, src) else @memcpy(dst, src);
+    }
+
+    /// Copies a buffer from alloc into a host slice.
+    pub fn download(self: Parallel, dst: anytype, src: anytype) !void {
+        if (self.gpu) |dev| try dev.download(dst, src) else @memcpy(dst, src);
+    }
+};
 
 const min_flops_per_part = 2_000_000;
 const max_workers = 15;

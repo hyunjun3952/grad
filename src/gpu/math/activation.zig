@@ -1,4 +1,3 @@
-const std = @import("std");
 const builtin = @import("builtin");
 
 pub const Kind = enum(u32) { sigmoid, tanh, gelu };

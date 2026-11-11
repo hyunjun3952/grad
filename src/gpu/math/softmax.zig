@@ -1,4 +1,3 @@
-const std = @import("std");
 const activation = @import("activation.zig");
 const bf16 = @import("bf16.zig");
 

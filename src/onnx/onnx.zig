@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 const layernorm = @import("../gpu/math/layernorm.zig");
+const kernels = @import("../cpu/kernels.zig");
 const norm = @import("../gpu/math/norm.zig");
 const trace_mod = @import("../autograd/trace.zig");
 
@@ -14,6 +15,33 @@ pub const runtime = @import("runtime.zig");
 pub const Model = runtime.Model;
 
 pub const Weight = struct { id: usize, data: []const f32 };
+
+/// Host copies of the float slices of a model (from nn.state), named by the address of each slice, ready to be used as Graph.weights.
+/// The slices may live on the device of par; deinit frees the copies.
+pub fn WeightSet(comptime count: usize) type {
+    return struct {
+        const Self = @This();
+
+        items: [count]Weight = undefined,
+        copied: usize = 0,
+
+        pub fn collect(gpa: Allocator, par: kernels.Parallel, slices: anytype) !Self {
+            var set: Self = .{};
+            errdefer set.deinit(gpa);
+            inline for (slices, 0..) |slice, i| {
+                const host = try gpa.alloc(f32, slice.len);
+                set.items[i] = .{ .id = @intFromPtr(slice.ptr), .data = host };
+                set.copied += 1;
+                try par.download(host, slice);
+            }
+            return set;
+        }
+
+        pub fn deinit(self: Self, gpa: Allocator) void {
+            for (self.items[0..self.copied]) |w| gpa.free(w.data);
+        }
+    };
+}
 
 pub const Error = error{ UnknownTensor, UnsupportedGraph } || Allocator.Error;
 

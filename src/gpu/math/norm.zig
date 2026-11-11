@@ -82,23 +82,3 @@ pub fn stats(x: []const f32, st: Stats, c: usize, training: bool) void {
         st.running_var[ch] += momentum * (variance - st.running_var[ch]);
     }
 }
-
-pub fn gradSums(x: []const f32, dy: []const f32, p: Affine, mask: []const f32, out: GradOut) void {
-    const c = out.beta.len;
-    std.debug.assert(c <= max_channels);
-    var dbeta: [max_channels]f64 = @splat(0);
-    var dgamma: [max_channels]f64 = @splat(0);
-    for (0..x.len / c) |r| {
-        for (0..c) |ch| {
-            const g = if (mask.len != 0 and mask[r * c + ch] <= 0) 0 else dy[r * c + ch];
-            dbeta[ch] += g;
-            dgamma[ch] += g * ((x[r * c + ch] - p.mean[ch]) * p.inv_std[ch]);
-        }
-    }
-    for (0..c) |ch| {
-        out.sums[ch] = @floatCast(dbeta[ch]);
-        out.sums[c + ch] = @floatCast(dgamma[ch]);
-        out.beta[ch] += out.sums[ch];
-        out.gamma[ch] += out.sums[c + ch];
-    }
-}

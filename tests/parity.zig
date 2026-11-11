@@ -17,56 +17,6 @@ fn expectClose(want: []const f32, got: []const f32, tolerance: f32) !void {
     }
 }
 
-fn checkMatmul(gpu: *Gpu, m: usize, n: usize, k: usize, ta: bool, tb: bool, accumulate: bool, tensor: bool) !void {
-    const gpa = testing.allocator;
-    var prng = std.Random.DefaultPrng.init(m * 1000003 + n * 1009 + k);
-    const rng = prng.random();
-
-    const a = try gpa.alloc(f32, m * k);
-    defer gpa.free(a);
-    const b = try gpa.alloc(f32, k * n);
-    defer gpa.free(b);
-    const want = try gpa.alloc(f32, m * n);
-    defer gpa.free(want);
-    const got = try gpa.alloc(f32, m * n);
-    defer gpa.free(got);
-    for (a) |*x| x.* = rng.float(f32) - 0.5;
-    for (b) |*x| x.* = rng.float(f32) - 0.5;
-    gpu.tensor_cores = tensor;
-    gpu.tensor_core_min_work = 0;
-    if (tensor) {
-        for (a) |*x| x.* = bf16.decode(bf16.encode(x.*));
-        for (b) |*x| x.* = bf16.decode(bf16.encode(x.*));
-    }
-
-    const la = try gpa.alloc(f32, m * k);
-    defer gpa.free(la);
-    const lb = try gpa.alloc(f32, k * n);
-    defer gpa.free(lb);
-    for (0..m) |i| {
-        for (0..k) |p| la[i * k + p] = if (ta) a[p * m + i] else a[i * k + p];
-    }
-    for (0..k) |p| {
-        for (0..n) |j| lb[p * n + j] = if (tb) b[j * k + p] else b[p * n + j];
-    }
-    kernels.matmulNaive(f32, .{ .m = m, .k = k, .n = n, .a = la, .b = lb, .out = want });
-    @memset(got, 1);
-    if (accumulate) {
-        for (want) |*w| w.* += 1;
-    }
-
-    try gpu.resetStep();
-    const da = try gpu.scratch(f32, a.len);
-    const db = try gpu.scratch(f32, b.len);
-    const dc = try gpu.scratch(f32, got.len);
-    try gpu.upload(da, a);
-    try gpu.upload(db, b);
-    try gpu.upload(dc, got);
-    try gpu.matmul(da, db, dc, .{ .m = m, .n = n, .k = k }, .{ .trans_a = ta, .trans_b = tb, .accumulate = accumulate });
-    try gpu.download(got, dc);
-    try expectClose(want, got, 2e-4);
-}
-
 test "gpu matmul, f32 and bf16 tensor cores, matches the cpu reference for every transpose, shape and accumulate flag" {
     const gpu = try Gpu.forTest(64 << 20);
     defer gpu.deinit();
@@ -79,14 +29,14 @@ test "gpu matmul, f32 and bf16 tensor cores, matches the cpu reference for every
     for (shapes) |s| {
         for ([_][2]bool{ .{ false, false }, .{ true, false }, .{ false, true } }) |t| {
             for ([_]bool{ false, true }) |acc| {
-                try checkMatmul(gpu, s[0], s[1], s[2], t[0], t[1], acc, false);
-                try checkMatmul(gpu, s[0], s[1], s[2], t[0], t[1], acc, true);
+                try checkMatmul(gpu, 1, s[0], s[1], s[2], t[0], t[1], acc, false);
+                try checkMatmul(gpu, 1, s[0], s[1], s[2], t[0], t[1], acc, true);
             }
         }
     }
 }
 
-fn checkBatched(gpu: *Gpu, batch: usize, m: usize, n: usize, k: usize, ta: bool, tb: bool, accumulate: bool, tensor: bool) !void {
+fn checkMatmul(gpu: *Gpu, batch: usize, m: usize, n: usize, k: usize, ta: bool, tb: bool, accumulate: bool, tensor: bool) !void {
     const gpa = testing.allocator;
     var prng = std.Random.DefaultPrng.init(batch * 7919 + m * 1000003 + n * 1009 + k);
     const rng = prng.random();
@@ -152,8 +102,8 @@ test "gpu batched matmul matches one product per matrix for every transpose, til
     for (shapes) |s| {
         for ([_][2]bool{ .{ false, false }, .{ true, false }, .{ false, true } }) |t| {
             for ([_]bool{ false, true }) |acc| {
-                try checkBatched(gpu, s[0], s[1], s[2], s[3], t[0], t[1], acc, false);
-                try checkBatched(gpu, s[0], s[1], s[2], s[3], t[0], t[1], acc, true);
+                try checkMatmul(gpu, s[0], s[1], s[2], s[3], t[0], t[1], acc, false);
+                try checkMatmul(gpu, s[0], s[1], s[2], s[3], t[0], t[1], acc, true);
             }
         }
     }

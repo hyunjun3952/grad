@@ -8,7 +8,7 @@ The next tasks, most useful first. Keep this list current: when a task is finish
 
 ## Later
 
-- **Transformer step: small element-wise ops.** Layer norm now uses one warp per row (600 steps took 10.1 s instead of 11.2 to 13.4 s, same losses). What is left in `zig build transformer -- 100 --gpu --profile` (profiling inflates every call): addInPlace and elementwise together take about 19% in roughly 20000 small launches, from residual adds, bias adds and gradient accumulation. Fusing a bias add into the product that feeds it, or accumulating the gradients of a residual branch in place, would remove most of them.
+- **Transformer step: small element-wise ops.** `zig build transformer -- 100 --gpu --profile` still shows addInPlace and elementwise at about 19% in roughly 20000 small launches, most of them from the 55 Linear layers per step: the bias add after each product and, in the backward pass, the copy of the sum's gradient into the product's gradient. A Tape.linear op with the bias added inside the product (or in place) and a backward pass that writes the product gradient directly would remove about half of them; estimate only, not measured.
 - **Multi-GPU on real hardware.** `--replicas` is checked against single-replica training only on one GPU. On several GPUs, test it, then replace the host round trip with device-to-device copies (peer access or NCCL-style), and average batch-norm statistics across replicas.
 - **Skip the gradient zero-fill.** The first writer of a gradient buffer could store instead of accumulate; the zero arena is re-cleared every step.
 - **transposeHalf in the bf16 convolution weight gradient.** One pass that could be fused into the producer.
