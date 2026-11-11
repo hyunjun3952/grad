@@ -66,6 +66,10 @@ pub const PoolOpts = struct { kernel: usize = 2, stride: usize = 2, pad: usize =
 const ConvPath = enum { direct, packed_im2col, implicit, tf32, cudnn, grouped };
 const Packed = gpu_mod.Gpu.Packed;
 
+fn sliceOf(comptime Tn: type, data: anytype, index: usize) Tn {
+    return .{ .data = data[index * Tn.len ..][0..Tn.len] };
+}
+
 fn kernelSize(comptime In: type, comptime W: type, comptime groups: usize) usize {
     if (In.rank != 4 or W.rank != 2) @compileError("conv2d expects (n, h, w, c) input and (k*k*c/groups, out) weights");
     if (In.shape[3] % groups != 0 or W.shape[1] % groups != 0) @compileError("conv2d groups must divide the input and output channels");
@@ -279,6 +283,40 @@ pub const Tape = struct {
                 if (t.par.gpu) |dev| return dev.reluBackward(c.x.value.data, c.out.grad.data, c.x.grad.data);
                 for (c.x.grad.data, c.x.value.data, c.out.grad.data) |*gx, v, g| {
                     gx.* += if (v > 0) g else 0;
+                }
+            }
+        }.run);
+        return out;
+    }
+
+    pub fn batchedMatmul(self: *Tape, a: anytype, b: anytype, comptime trans_b: bool) Error!Var(Tensor(f32, &.{ @TypeOf(a.value).shape[0], @TypeOf(a.value).shape[1], if (trans_b) @TypeOf(b.value).shape[1] else @TypeOf(b.value).shape[2] })) {
+        const A = @TypeOf(a.value);
+        const B = @TypeOf(b.value);
+        comptime if (A.rank != 3 or B.rank != 3 or A.shape[0] != B.shape[0] or A.shape[2] != (if (trans_b) B.shape[2] else B.shape[1])) @compileError("batchedMatmul expects (batch, m, k) and (batch, k, n) tensors, or (batch, n, k) with trans_b");
+        const batch = A.shape[0];
+        const m = A.shape[1];
+        const k = A.shape[2];
+        const n = if (trans_b) B.shape[1] else B.shape[2];
+        const Am = Tensor(f32, &.{ m, k });
+        const Bm = Tensor(f32, if (trans_b) &.{ n, k } else &.{ k, n });
+        const Cm = Tensor(f32, &.{ m, n });
+        const C = Tensor(f32, &.{ batch, m, n });
+        const value = try self.newTensor(C);
+        for (0..batch) |i| try tensor.matmulInto(self.gpa, self.par, sliceOf(Am, a.value.data, i), sliceOf(Bm, b.value.data, i), sliceOf(Cm, value.data, i), .{ .trans_b = trans_b });
+        const out = try self.makeVar(value, a.needs_grad or b.needs_grad);
+        const Ctx = struct { a: @TypeOf(a), b: @TypeOf(b), out: @TypeOf(out) };
+        if (out.needs_grad) try self.recordBackward(Ctx{ .a = a, .b = b, .out = out }, struct {
+            fn run(t: *Tape, c: *const Ctx) Error!void {
+                for (0..batch) |i| {
+                    const dc = sliceOf(Cm, c.out.grad.data, i);
+                    if (c.a.needs_grad) try tensor.matmulInto(t.gpa, t.par, dc, sliceOf(Bm, c.b.value.data, i), sliceOf(Am, c.a.grad.data, i), .{ .trans_b = !trans_b, .accumulate = true });
+                    if (c.b.needs_grad) {
+                        if (trans_b) {
+                            try tensor.matmulInto(t.gpa, t.par, dc, sliceOf(Am, c.a.value.data, i), sliceOf(Bm, c.b.grad.data, i), .{ .trans_a = true, .accumulate = true });
+                        } else {
+                            try tensor.matmulInto(t.gpa, t.par, sliceOf(Am, c.a.value.data, i), dc, sliceOf(Bm, c.b.grad.data, i), .{ .trans_a = true, .accumulate = true });
+                        }
+                    }
                 }
             }
         }.run);
@@ -1095,6 +1133,29 @@ const LayerNormNet = struct {
     }
 };
 
+fn BatchedNet(comptime trans_b: bool) type {
+    return struct {
+        const A = Tensor(f32, &.{ 3, 4, 5 });
+        const B = Tensor(f32, if (trans_b) &.{ 3, 6, 5 } else &.{ 3, 5, 6 });
+        const Y = Tensor(f32, &.{ 12, 6 });
+        pub const Inputs = struct { a: A, b: B, y: Y };
+        pub const names = .{ "a", "b", "y" };
+        pub const labels: [12]u8 = @splat(0);
+        const Result = struct { loss: Var(Tensor(f32, &.{})), a: Var(A), b: Var(B), y: Var(Y) };
+
+        pub fn build(t: *Tape, p: Inputs, _: []const u8) !Result {
+            const a = try t.leaf(p.a);
+            const b = try t.leaf(p.b);
+            const y = try t.leaf(p.y);
+            return .{ .loss = try t.mse(reshape(try t.batchedMatmul(a, b, trans_b), &.{ 12, 6 }), y), .a = a, .b = b, .y = y };
+        }
+
+        pub fn acceptable(_: Allocator, _: Inputs) !bool {
+            return true;
+        }
+    };
+}
+
 fn SoftmaxNet(comptime period: usize) type {
     return struct {
         const X = Tensor(f32, &.{ 6, 3 });
@@ -1767,6 +1828,13 @@ test "embedding gathers rows by id and scatters the gradient back, repeated ids 
     try gpu.download(&grads, device_grad);
     try testing.expectEqualSlices(f32, &expected_grad, &grads);
 }
+test "batched matrix products, plain and with a transposed right operand, have correct gradients on the cpu and the gpu" {
+    inline for (.{ false, true }) |trans_b| {
+        try gradcheck.expectFiniteDifferences(BatchedNet(trans_b), 11, 1e-2, 5e-3);
+        try gradcheck.expectGpuMatchesCpu(BatchedNet(trans_b), 12, 1e-4);
+    }
+}
+
 test "label smoothing blends the target and its gradient with the uniform distribution" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
