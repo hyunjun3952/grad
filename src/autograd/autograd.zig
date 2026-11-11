@@ -172,24 +172,22 @@ pub const Tape = struct {
 
     /// Returns a new tensor of zeros that the tape does not own on the GPU (it comes from the zero arena).
     pub fn zeroedTensor(self: *Tape, comptime Tn: type) Error!Tn {
-        const zeroed: Tn = if (self.par.gpu) |dev| .{ .data = try dev.scratchZeroed(Tn.Elem, Tn.len) } else .{ .data = try self.gpa.alloc(Tn.Elem, Tn.len) };
-        if (self.par.gpu == null) @memset(zeroed.data, 0);
+        const zeroed = try self.zeros(Tn);
         if (self.trace) |t| try t.addConstant(zeroed, 0);
         return zeroed;
     }
 
+    // NOTE: gradient buffers must start at zero because every backward closure adds into them; on the GPU they come from the zero arena.
+    fn zeros(self: *Tape, comptime Tn: type) Error!Tn {
+        if (self.par.gpu) |dev| return .{ .data = try dev.scratchZeroed(Tn.Elem, Tn.len) };
+        const t = try self.newTensor(Tn);
+        @memset(t.data, 0);
+        return t;
+    }
+
     fn makeVar(self: *Tape, value: anytype, needs_grad: bool) Error!Var(@TypeOf(value)) {
-        const Tn = @TypeOf(value);
-        var grad: Tn = undefined;
-        if (needs_grad) {
-            if (self.par.gpu) |dev| {
-                grad = .{ .data = try dev.scratchZeroed(Tn.Elem, Tn.len) };
-            } else {
-                grad = try self.newTensor(Tn);
-                @memset(grad.data, 0);
-            }
-        }
-        return .{ .value = value, .grad = grad, .needs_grad = needs_grad };
+        if (!needs_grad) return .{ .value = value, .grad = undefined, .needs_grad = false };
+        return .{ .value = value, .grad = try self.zeros(@TypeOf(value)), .needs_grad = true };
     }
 
     /// Reads a one-element variable back to the host, synchronizing the device if needed.
@@ -375,13 +373,11 @@ pub const Tape = struct {
 
     /// Applies max(x, 0) element by element.
     pub fn relu(self: *Tape, x: anytype) Error!Var(@TypeOf(x.value)) {
-        var value: @TypeOf(x.value) = undefined;
+        const value = try self.newTensor(@TypeOf(x.value));
         if (self.par.gpu) |dev| {
-            value = try self.newTensor(@TypeOf(x.value));
             try dev.relu(x.value.data, value.data);
         } else {
             if (comptime @TypeOf(x.value).Elem != f32) return error.NoDevice;
-            value = try self.newTensor(@TypeOf(x.value));
             kernels.parallelFor(self.par, value.data.len, 1 << 15, PairJob{ .dst = value.data, .src = x.value.data }, reluRange);
         }
         const out = try self.makeVar(value, x.needs_grad);

@@ -228,24 +228,30 @@ export fn elementwiseHalf(a: [*]const u16, b: [*]const u16, out: [*]u16, args: g
     elementwiseOf(u16, a, b, out, args);
 }
 
-export fn relu(x: [*]const f32, out: [*]f32, n: u32) callconv(.nvptx_kernel) void {
+inline fn reluOf(comptime E: type, x: [*]const E, out: [*]E, n: u32) void {
     const t = globalIndex();
-    if (t < n) out[t] = @max(x[t], 0);
+    if (t < n) bf16.store(E, out, t, @max(bf16.load(E, x, t), 0));
+}
+
+export fn relu(x: [*]const f32, out: [*]f32, n: u32) callconv(.nvptx_kernel) void {
+    reluOf(f32, x, out, n);
 }
 
 export fn reluHalf(x: [*]const u16, out: [*]u16, n: u32) callconv(.nvptx_kernel) void {
+    reluOf(u16, x, out, n);
+}
+
+inline fn reluBackwardOf(comptime E: type, x: [*]const E, g_out: [*]const E, g_in: [*]E, n: u32) void {
     const t = globalIndex();
-    if (t < n) bf16.store(u16, out, t, @max(bf16.load(u16, x, t), 0));
+    if (t < n) bf16.store(E, g_in, t, bf16.load(E, g_in, t) + if (bf16.load(E, x, t) > 0) bf16.load(E, g_out, t) else 0);
 }
 
 export fn reluBackward(x: [*]const f32, g_out: [*]const f32, g_in: [*]f32, n: u32) callconv(.nvptx_kernel) void {
-    const t = globalIndex();
-    if (t < n) g_in[t] += if (x[t] > 0) g_out[t] else 0;
+    reluBackwardOf(f32, x, g_out, g_in, n);
 }
 
 export fn reluBackwardHalf(x: [*]const u16, g_out: [*]const u16, g_in: [*]u16, n: u32) callconv(.nvptx_kernel) void {
-    const t = globalIndex();
-    if (t < n) bf16.store(u16, g_in, t, bf16.load(u16, g_in, t) + if (bf16.load(u16, x, t) > 0) bf16.load(u16, g_out, t) else 0);
+    reluBackwardOf(u16, x, g_out, g_in, n);
 }
 
 export fn toHalf(x: [*]const f32, y: [*]u16, n: u32) callconv(.nvptx_kernel) void {
@@ -494,14 +500,17 @@ export fn addReluBackwardHalf(out: [*]const u16, g: [*]const u16, grad_a: [*]u16
     addReluBackwardOf(u16, out, g, grad_a, grad_b, n, flags);
 }
 
-export fn addInPlace(dst: [*]f32, src: [*]const f32, n: u32) callconv(.nvptx_kernel) void {
+inline fn addInPlaceOf(comptime E: type, dst: [*]E, src: [*]const E, n: u32) void {
     const t = globalIndex();
-    if (t < n) dst[t] += src[t];
+    if (t < n) bf16.store(E, dst, t, bf16.load(E, dst, t) + bf16.load(E, src, t));
+}
+
+export fn addInPlace(dst: [*]f32, src: [*]const f32, n: u32) callconv(.nvptx_kernel) void {
+    addInPlaceOf(f32, dst, src, n);
 }
 
 export fn addInPlaceHalf(dst: [*]u16, src: [*]const u16, n: u32) callconv(.nvptx_kernel) void {
-    const t = globalIndex();
-    if (t < n) bf16.store(u16, dst, t, bf16.load(u16, dst, t) + bf16.load(u16, src, t));
+    addInPlaceOf(u16, dst, src, n);
 }
 
 export fn sumTo(in: [*]const f32, out: [*]f32, args: ga.SumArgs) callconv(.nvptx_kernel) void {

@@ -146,6 +146,12 @@ fn isHalf(slice: anytype) bool {
     return @typeInfo(@TypeOf(slice)).pointer.child == u16;
 }
 
+// Picks the bf16 twin of a kernel (its name plus Half) when the slice holds bf16.
+fn variant(comptime base: Kernel, slice: anytype) Kernel {
+    if (!isHalf(slice)) return base;
+    return @field(Kernel, @tagName(base) ++ "Half");
+}
+
 fn toU32(x: usize) u32 {
     return @intCast(x);
 }
@@ -711,23 +717,23 @@ pub const Gpu = struct {
     }
     pub fn elementwise(self: *Gpu, op: BinaryOp, a: anytype, b: anytype, out: anytype, plan: BroadcastPlan) Error!void {
         const args = pack(ga.ElementwiseArgs, .{ .len = out.len, .multiply = op == .mul, .dims = plan.dims, .a_strides = plan.a_strides, .b_strides = plan.b_strides });
-        try self.launchFlat(if (isHalf(out)) .elementwiseHalf else .elementwise, out.len, .{ a, b, out, args });
+        try self.launchFlat(variant(.elementwise, out), out.len, .{ a, b, out, args });
     }
 
     pub fn relu(self: *Gpu, x: anytype, out: anytype) Error!void {
-        try self.launchFlat(if (isHalf(out)) .reluHalf else .relu, x.len, .{ x, out, x.len });
+        try self.launchFlat(variant(.relu, out), x.len, .{ x, out, x.len });
     }
 
     pub fn reluBackward(self: *Gpu, x: anytype, g_out: anytype, g_in: anytype) Error!void {
-        try self.launchFlat(if (isHalf(g_in)) .reluBackwardHalf else .reluBackward, x.len, .{ x, g_out, g_in, x.len });
+        try self.launchFlat(variant(.reluBackward, g_in), x.len, .{ x, g_out, g_in, x.len });
     }
 
     pub fn embeddingGather(self: *Gpu, table: []const f32, ids: []const u32, out: anytype) Error!void {
-        try self.launchFlat(if (isHalf(out)) .embeddingGatherHalf else .embeddingGather, out.len, .{ table, ids, out, ids.len, out.len / ids.len });
+        try self.launchFlat(variant(.embeddingGather, out), out.len, .{ table, ids, out, ids.len, out.len / ids.len });
     }
 
     pub fn embeddingScatter(self: *Gpu, dy: anytype, ids: []const u32, dtable: []f32) Error!void {
-        try self.launchFlat(if (isHalf(dy)) .embeddingScatterHalf else .embeddingScatter, dy.len, .{ dy, ids, dtable, ids.len, dy.len / ids.len });
+        try self.launchFlat(variant(.embeddingScatter, dy), dy.len, .{ dy, ids, dtable, ids.len, dy.len / ids.len });
     }
 
     /// The input and the statistics of a layer norm; the activations x may be f32 or bf16, the rest is f32.
@@ -736,14 +742,13 @@ pub const Gpu = struct {
     }
 
     pub fn layerNorm(self: *Gpu, p: anytype, beta: []const f32, y: anytype) Error!void {
-        try self.launchFlat(if (isHalf(y)) .layerNormRowsHalf else .layerNormRows, 32 * p.mean.len, .{ p.x, y, p.gamma, beta, p.mean, p.inv_std, p.mean.len, p.gamma.len });
+        try self.launchFlat(variant(.layerNormRows, y), 32 * p.mean.len, .{ p.x, y, p.gamma, beta, p.mean, p.inv_std, p.mean.len, p.gamma.len });
     }
 
     pub fn layerNormBackward(self: *Gpu, p: anytype, dy: anytype, dx: anytype, dgamma: ?[]f32, dbeta: ?[]f32) Error!void {
         const rows = p.mean.len;
         const cols = p.gamma.len;
-        const half = isHalf(p.x);
-        if (dx) |out| try self.launchFlat(if (half) .layerNormBackwardHalf else .layerNormBackward, 32 * rows, .{ p.x, dy, out, p.gamma, p.mean, p.inv_std, rows, cols });
+        if (dx) |out| try self.launchFlat(variant(.layerNormBackward, p.x), 32 * rows, .{ p.x, dy, out, p.gamma, p.mean, p.inv_std, rows, cols });
         if (dgamma) |g| {
             // The sums over the rows go through the column reduction, which spreads the rows over many blocks.
             const sums = try self.scratchZeroed(f32, 2 * cols);
@@ -776,11 +781,11 @@ pub const Gpu = struct {
     }
 
     pub fn softmax(self: *Gpu, x: anytype, y: anytype, cols: usize, period: usize) Error!void {
-        try self.launchFlat(if (isHalf(y)) .softmaxRowsHalf else .softmaxRows, 32 * (x.len / cols), .{ x, y, x.len / cols, cols, period });
+        try self.launchFlat(variant(.softmaxRows, y), 32 * (x.len / cols), .{ x, y, x.len / cols, cols, period });
     }
 
     pub fn softmaxBackward(self: *Gpu, y: anytype, dy: anytype, dx: anytype, cols: usize) Error!void {
-        try self.launchFlat(if (isHalf(dx)) .softmaxBackwardHalf else .softmaxBackward, 32 * (y.len / cols), .{ y, dy, dx, y.len / cols, cols });
+        try self.launchFlat(variant(.softmaxBackward, dx), 32 * (y.len / cols), .{ y, dy, dx, y.len / cols, cols });
     }
 
     pub fn toHalf(self: *Gpu, x: []const f32, y: []u16) Error!void {
@@ -800,11 +805,11 @@ pub const Gpu = struct {
     }
 
     pub fn activation(self: *Gpu, x: anytype, out: anytype, kind: Activation) Error!void {
-        try self.launchFlat(if (isHalf(out)) .activationHalf else .activation, x.len, .{ x, out, x.len, kind });
+        try self.launchFlat(variant(.activation, out), x.len, .{ x, out, x.len, kind });
     }
 
     pub fn activationBackward(self: *Gpu, x: anytype, y: anytype, g_out: anytype, g_in: anytype, kind: Activation) Error!void {
-        try self.launchFlat(if (isHalf(g_in)) .activationBackwardHalf else .activationBackward, x.len, .{ x, y, g_out, g_in, x.len, kind });
+        try self.launchFlat(variant(.activationBackward, g_in), x.len, .{ x, y, g_out, g_in, x.len, kind });
     }
 
     pub fn addRelu(self: *Gpu, a: anytype, b: anytype, out: anytype) Error!void {
@@ -821,7 +826,7 @@ pub const Gpu = struct {
     }
 
     pub fn addInPlace(self: *Gpu, dst: anytype, src: anytype) Error!void {
-        try self.launchFlat(if (isHalf(dst)) .addInPlaceHalf else .addInPlace, dst.len, .{ dst, src, dst.len });
+        try self.launchFlat(variant(.addInPlace, dst), dst.len, .{ dst, src, dst.len });
     }
 
     pub fn sumTo(self: *Gpu, in: anytype, out: anytype, plan: ReducePlan, accumulate: bool) Error!void {
@@ -909,7 +914,7 @@ pub const Gpu = struct {
         try self.launchFlat(if (E == u16) .batchNormGradInputHalf else .batchNormGradInput, l.len, .{ io, p, l });
     }
     pub fn dropout(self: *Gpu, src: anytype, dst: anytype, seed: u64, keep: f32, accumulate: bool) Error!void {
-        try self.launchFlat(if (isHalf(dst)) .dropoutHalf else .dropout, src.len, .{ src, dst, src.len, seed, keep, accumulate });
+        try self.launchFlat(variant(.dropout, dst), src.len, .{ src, dst, src.len, seed, keep, accumulate });
     }
 
     fn launchTable(self: *Gpu, kernel: Kernel, table: ga.TensorTable, args: anytype) Error!void {
