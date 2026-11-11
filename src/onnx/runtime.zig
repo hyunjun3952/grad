@@ -383,7 +383,7 @@ fn normalizeAxis(axis: i64, rank: usize) usize {
 }
 
 fn execute(a: Allocator, par: kernels.Parallel, node: Node, values: *std.StringHashMap(Array)) Error![]const Array {
-    const Kind = enum { Add, Sub, Mul, Div, Relu, Sigmoid, Tanh, Gelu, Sqrt, MatMul, Gemm, Conv, MaxPool, AveragePool, GlobalAveragePool, BatchNormalization, Flatten, Reshape, Transpose, Concat, Softmax, Identity, Dropout };
+    const Kind = enum { Add, Sub, Mul, Div, Relu, Sigmoid, Tanh, Gelu, Sqrt, MatMul, Gemm, Conv, MaxPool, AveragePool, GlobalAveragePool, BatchNormalization, Flatten, Reshape, Transpose, Concat, Softmax, Identity, Dropout, Gather, LayerNormalization };
     const kind = std.meta.stringToEnum(Kind, node.op) orelse return error.UnsupportedOp;
     const out = try a.alloc(Array, 1);
     out[0] = switch (kind) {
@@ -412,6 +412,8 @@ fn execute(a: Allocator, par: kernels.Parallel, node: Node, values: *std.StringH
         .Transpose => try transpose(a, node, try input(values, node, 0)),
         .Concat => try concat(a, node, values),
         .Softmax => try softmax(a, node, try input(values, node, 0)),
+        .Gather => try gather(a, node, try input(values, node, 0), try input(values, node, 1)),
+        .LayerNormalization => try layerNorm(a, node, try input(values, node, 0), try input(values, node, 1), maybeInput(values, node, 2)),
     };
     return out;
 }
@@ -738,6 +740,42 @@ pub fn softmax(a: Allocator, node: Node, x: Array) Error!Array {
             }
             for (0..size) |s| out.data[(o * size + s) * inner + i] /= total;
         }
+    }
+    return out;
+}
+
+// Picks rows of data along axis 0. NOTE: indices are held as f32 like every other array, which is exact below 2^24.
+fn gather(a: Allocator, node: Node, data: Array, indices: Array) Error!Array {
+    if (node.int("axis", 0) != 0 or data.dims.len < 1) return error.UnsupportedOp;
+    const inner = product(data.dims[1..]);
+    const dims = try a.alloc(usize, indices.dims.len + data.dims.len - 1);
+    @memcpy(dims[0..indices.dims.len], indices.dims);
+    @memcpy(dims[indices.dims.len..], data.dims[1..]);
+    const out: Array = .{ .dims = dims, .data = try a.alloc(f32, product(dims)) };
+    for (indices.data, 0..) |raw, i| {
+        const row: usize = @intFromFloat(raw);
+        if (row >= data.dims[0]) return error.ShapeMismatch;
+        @memcpy(out.data[i * inner ..][0..inner], data.data[row * inner ..][0..inner]);
+    }
+    return out;
+}
+
+// Normalizes over the last axis with the population variance, as the engine does.
+fn layerNorm(a: Allocator, node: Node, x: Array, scale: Array, bias: ?Array) Error!Array {
+    if (normalizeAxis(node.int("axis", -1), x.dims.len) != x.dims.len - 1) return error.UnsupportedOp;
+    const eps = node.float("epsilon", 1e-5);
+    const cols = x.dims[x.dims.len - 1];
+    if (scale.len() != cols) return error.ShapeMismatch;
+    const out = try make(a, x.dims);
+    for (0..x.len() / cols) |r| {
+        const row = x.data[r * cols ..][0..cols];
+        var mean: f32 = 0;
+        for (row) |v| mean += v;
+        mean /= @floatFromInt(cols);
+        var square: f32 = 0;
+        for (row) |v| square += (v - mean) * (v - mean);
+        const inverse = 1 / @sqrt(square / @as(f32, @floatFromInt(cols)) + eps);
+        for (out.data[r * cols ..][0..cols], row, 0..) |*o, v, j| o.* = scale.data[j] * (v - mean) * inverse + (if (bias) |b| b.data[j] else 0);
     }
     return out;
 }

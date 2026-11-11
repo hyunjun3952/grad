@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
+const layernorm = @import("../gpu/math/layernorm.zig");
 const norm = @import("../gpu/math/norm.zig");
 const trace_mod = @import("../autograd/trace.zig");
 
@@ -17,6 +18,7 @@ pub const Weight = struct { id: usize, data: []const f32 };
 pub const Error = error{ UnknownTensor, UnsupportedGraph } || Allocator.Error;
 
 const float_type = 1;
+const int32_type = 6;
 const int64_type = 7;
 const opset = 20;
 
@@ -36,6 +38,11 @@ const Proto = struct {
     fn int(self: *Proto, gpa: Allocator, field: u32, value: i64) !void {
         try self.tag(gpa, field, 0);
         try self.varint(gpa, @bitCast(value));
+    }
+
+    fn fixed32(self: *Proto, gpa: Allocator, field: u32, value: f32) !void {
+        try self.tag(gpa, field, 5);
+        try self.bytes.appendSlice(gpa, &std.mem.toBytes(@as(u32, @bitCast(value))));
     }
 
     fn bytesField(self: *Proto, gpa: Allocator, field: u32, payload: []const u8) !void {
@@ -97,7 +104,7 @@ const Builder = struct {
         return name;
     }
 
-    const Attribute = union(enum) { ints: struct { []const u8, []const i64 }, int: struct { []const u8, i64 }, text: struct { []const u8, []const u8 } };
+    const Attribute = union(enum) { ints: struct { []const u8, []const i64 }, int: struct { []const u8, i64 }, text: struct { []const u8, []const u8 }, float: struct { []const u8, f32 } };
 
     fn node(self: *Builder, op_type: []const u8, inputs: []const []const u8, output: []const u8, attributes: []const Attribute) !void {
         var n: Proto = .{};
@@ -118,6 +125,11 @@ const Builder = struct {
                     try a.bytesField(self.gpa, 1, pair[0]);
                     try a.int(self.gpa, 3, pair[1]);
                     try a.int(self.gpa, 20, 2);
+                },
+                .float => |pair| {
+                    try a.bytesField(self.gpa, 1, pair[0]);
+                    try a.fixed32(self.gpa, 2, pair[1]);
+                    try a.int(self.gpa, 20, 1);
                 },
                 .text => |pair| {
                     try a.bytesField(self.gpa, 1, pair[0]);
@@ -182,6 +194,42 @@ const Builder = struct {
             .add => try self.node("Add", &.{ try self.use(e.inputs[0]), try self.use(e.inputs[1]) }, out, &.{}),
             .mul => try self.node("Mul", &.{ try self.use(e.inputs[0]), try self.use(e.inputs[1]) }, out, &.{}),
             .matmul => try self.node("MatMul", &.{ try self.use(e.inputs[0]), try self.use(e.inputs[1]) }, out, &.{}),
+            .batched_matmul => {
+                var right = try self.use(e.inputs[1]);
+                if (e.trans_b) {
+                    const flipped = try self.fresh("flipped");
+                    try self.node("Transpose", &.{right}, flipped, &.{.{ .ints = .{ "perm", &.{ 0, 2, 1 } } }});
+                    right = flipped;
+                }
+                try self.node("MatMul", &.{ try self.use(e.inputs[0]), right }, out, &.{});
+            },
+            .embedding => try self.node("Gather", &.{ try self.use(e.inputs[0]), try self.use(e.inputs[1]) }, out, &.{.{ .int = .{ "axis", 0 } }}),
+            .layer_norm => try self.node("LayerNormalization", &.{ try self.use(e.inputs[0]), try self.use(e.inputs[1]), try self.use(e.inputs[2]) }, out, &.{
+                .{ .int = .{ "axis", -1 } },
+                .{ .float = .{ "epsilon", layernorm.eps } },
+            }),
+            .softmax => {
+                const x = try self.use(e.inputs[0]);
+                if (e.period == 0) {
+                    try self.node("Softmax", &.{x}, out, &.{.{ .int = .{ "axis", -1 } }});
+                } else {
+                    // NOTE: the engine lets row r see the first r % period + 1 columns, which is a causal mask once rows are grouped by sequence.
+                    const rows = e.output.dims[0];
+                    const cols = e.output.dims[1];
+                    const mask = try self.gpa.alloc(f32, e.period * cols);
+                    defer self.gpa.free(mask);
+                    for (0..e.period) |i| {
+                        for (0..cols) |j| mask[i * cols + j] = if (j <= i) 0 else -1e9;
+                    }
+                    const grouped = try self.fresh("grouped");
+                    try self.node("Reshape", &.{ x, try self.shapeConstant(&.{ rows / e.period, e.period, cols }) }, grouped, &.{});
+                    const masked = try self.fresh("masked");
+                    try self.node("Add", &.{ grouped, try self.floats("mask", &.{ e.period, cols }, mask) }, masked, &.{});
+                    const weights = try self.fresh("weights");
+                    try self.node("Softmax", &.{masked}, weights, &.{.{ .int = .{ "axis", -1 } }});
+                    try self.node("Reshape", &.{ weights, try self.shapeConstant(&.{ rows, cols }) }, out, &.{});
+                }
+            },
             .relu => try self.node("Relu", &.{try self.use(e.inputs[0])}, out, &.{}),
             .sigmoid => try self.node("Sigmoid", &.{try self.use(e.inputs[0])}, out, &.{}),
             .tanh => try self.node("Tanh", &.{try self.use(e.inputs[0])}, out, &.{}),
@@ -270,7 +318,7 @@ const Builder = struct {
         }
         var tensor_type: Proto = .{};
         defer tensor_type.bytes.deinit(self.gpa);
-        try tensor_type.int(self.gpa, 1, float_type);
+        try tensor_type.int(self.gpa, 1, if (view.integer) int32_type else float_type);
         try tensor_type.message(self.gpa, 2, &shape);
         var type_proto: Proto = .{};
         defer type_proto.bytes.deinit(self.gpa);

@@ -175,3 +175,56 @@ test "a network traced on the gpu with bf16 activations exports to an f32 graph 
     try testing.expectEqualSlices(usize, &.{ 1, 3 }, result.outputs[0].dims);
     for (want, result.outputs[0].data) |w, got| try testing.expectApproxEqAbs(w, got, 0.05 + 0.02 * @abs(w));
 }
+
+test "a causal transformer with token and position inputs survives export and import" {
+    const gpa = testing.allocator;
+    const vocab = 16;
+    const width = 8;
+    const steps = 4;
+    const rows = 2 * steps;
+    const Layers = struct { nn.Embedding(vocab, width), nn.Embedding(steps, width), nn.TransformerBlock(width, 2, steps), nn.LayerNorm(width), nn.Linear(width, vocab) };
+    var prng = std.Random.DefaultPrng.init(31);
+    const rng = prng.random();
+    const layers = try nn.initAll(Layers, gpa, rng);
+    defer nn.deinitAll(layers, gpa);
+    inline for (nn.state(layers)) |slice| {
+        for (slice) |*v| v.* += rng.floatNorm(f32) * 0.3;
+    }
+
+    var tokens: [rows]u32 = undefined;
+    var positions: [rows]u32 = undefined;
+    for (&tokens, &positions, 0..) |*t, *p, i| {
+        t.* = rng.uintLessThan(u32, vocab);
+        p.* = @intCast(i % steps);
+    }
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var trace: onnx.Trace = .{ .gpa = gpa };
+    defer trace.deinit();
+    var tape: autograd.Tape = .{ .gpa = arena.allocator(), .trace = &trace };
+    const token_table, const position_table, const block, const final_norm, const head = layers;
+    const embedded = try tape.add(try token_table.forward(&tape, rows, &tokens, f32), try position_table.forward(&tape, rows, &positions, f32));
+    const logits = try head.forward(&tape, try final_norm.forward(&tape, try block.forward(&tape, embedded)));
+
+    const state = nn.state(layers);
+    var weights: [state.len]onnx.Weight = undefined;
+    inline for (state, 0..) |slice, i| weights[i] = .{ .id = @intFromPtr(slice.ptr), .data = slice };
+    const bytes = try onnx.build(gpa, .{ .trace = &trace, .weights = &weights, .inputs = &.{ onnx.View.ofIds(&tokens), onnx.View.ofIds(&positions) }, .outputs = &.{onnx.View.of(logits)} });
+    defer gpa.free(bytes);
+
+    var model = try Model.parse(gpa, bytes);
+    defer model.deinit();
+    var token_values: [rows]f32 = undefined;
+    var position_values: [rows]f32 = undefined;
+    for (&token_values, &position_values, tokens, positions) |*tv, *pv, t, p| {
+        tv.* = @floatFromInt(t);
+        pv.* = @floatFromInt(p);
+    }
+    var result = try model.run(gpa, .{ .threads = 1 }, &.{
+        .{ .name = "input0", .dims = &.{rows}, .data = &token_values },
+        .{ .name = "input1", .dims = &.{rows}, .data = &position_values },
+    });
+    defer result.deinit();
+    try testing.expectEqualSlices(usize, &.{ rows, vocab }, result.outputs[0].dims);
+    for (logits.value.data, result.outputs[0].data) |want, got| try testing.expectApproxEqAbs(want, got, 1e-4);
+}

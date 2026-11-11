@@ -337,6 +337,7 @@ pub const Tape = struct {
         const value = try self.newTensor(C);
         try batchedInto(self.gpa, self.par, batch, Am, Bm, Cm, a.value.data, b.value.data, value.data, .{ .trans_b = trans_b });
         const out = try self.makeVar(value, a.needs_grad or b.needs_grad);
+        try self.note(.batched_matmul, .{ a, b }, out, .{ .trans_b = trans_b });
         const Ctx = struct { a: @TypeOf(a), b: @TypeOf(b), out: @TypeOf(out) };
         if (out.needs_grad) try self.recordBackward(Ctx{ .a = a, .b = b, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
@@ -366,6 +367,7 @@ pub const Tape = struct {
             for (ids, 0..) |id, i| @memcpy(value.data[i * width ..][0..width], table.value.data[@as(usize, id) * width ..][0..width]);
         }
         const out = try self.makeVar(value, table.needs_grad);
+        try self.note(.embedding, .{ table, trace_mod.View.ofIds(ids) }, out, .{});
         const Ctx = struct { table: @TypeOf(table), ids: []const u32, out: @TypeOf(out) };
         if (out.needs_grad) try self.recordBackward(Ctx{ .table = table, .ids = ids, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
@@ -399,6 +401,7 @@ pub const Tape = struct {
             }
         }
         const out = try self.makeVar(value, x.needs_grad or gamma.needs_grad or beta.needs_grad);
+        try self.note(.layer_norm, .{ x, gamma, beta }, out, .{});
         const Ctx = struct { x: @TypeOf(x), gamma: @TypeOf(gamma), beta: @TypeOf(beta), mean: Stats, inv_std: Stats, out: @TypeOf(out) };
         if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .gamma = gamma, .beta = beta, .mean = mean, .inv_std = inv_std, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
@@ -434,6 +437,7 @@ pub const Tape = struct {
             }.run);
         }
         const out = try self.makeVar(value, x.needs_grad);
+        try self.note(.softmax, .{x}, out, .{ .period = causal_period });
         const Ctx = struct { x: @TypeOf(x), out: @TypeOf(out) };
         if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {

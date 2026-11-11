@@ -24,7 +24,9 @@ const Net = struct {
 };
 // With -Dbf16=true the activations between the layers are bf16 (GPU only); parameters, sums and the loss stay f32.
 const Act = if (config.bf16) u16 else f32;
-const Logits = Tensor(Act, &.{ rows, vocab });
+fn Logits(comptime n: usize) type {
+    return Tensor(Act, &.{ n, vocab });
+}
 
 const Run = struct {
     gpu: ?*grad.gpu.Gpu,
@@ -43,10 +45,11 @@ const Run = struct {
     }
 };
 
-// Token and position embeddings are added, passed through two causal blocks, and projected to one score per character.
-fn forward(model: Net, tape: *Tape, tokens: []const u32, positions: []const u32) !Var(Logits) {
+// Token and position embeddings are added, passed through three causal blocks, and projected to one score per character.
+// n is the number of rows, a whole number of sequences of context characters.
+fn forward(model: Net, tape: *Tape, comptime n: usize, tokens: []const u32, positions: []const u32) !Var(Logits(n)) {
     const token_table, const position_table, const first, const second, const third, const final_norm, const head = model;
-    const embedded = try tape.add(try token_table.forward(tape, rows, tokens, Act), try position_table.forward(tape, rows, positions, Act));
+    const embedded = try tape.add(try token_table.forward(tape, n, tokens, Act), try position_table.forward(tape, n, positions, Act));
     const mixed = try third.forward(tape, try second.forward(tape, try first.forward(tape, embedded)));
     return head.forward(tape, try final_norm.forward(tape, mixed));
 }
@@ -107,7 +110,7 @@ fn generate(run: Run, gpa: std.mem.Allocator, model: Net, rng: std.Random, out: 
         }
         try run.put(tokens, host_tokens);
         var tape: Tape = .{ .gpa = arena.allocator(), .par = run.par };
-        const scores = try tape.cast(try forward(model, &tape, tokens, positions), f32);
+        const scores = try tape.cast(try forward(model, &tape, rows, tokens, positions), f32);
         try run.get(logits, scores.value.data);
         const next = sample(rng, logits[(filled - 1) * vocab ..][0..vocab], 0.8);
         try out.writeByte(next);
@@ -121,6 +124,53 @@ fn generate(run: Run, gpa: std.mem.Allocator, model: Net, rng: std.Random, out: 
     try out.writeByte('\n');
 }
 
+// Writes the model as ONNX for one sequence of context characters. The graph takes the character codes and the positions as
+// int32 inputs "input0" and "input1" and gives the scores of every position; it is traced with the first characters of text.
+fn exportOnnx(run: Run, gpa: std.mem.Allocator, io: std.Io, model: Net, text: []const u8, path: []const u8, out: *std.Io.Writer) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const tokens = try run.buffer(u32, gpa, context);
+    const positions = try run.buffer(u32, gpa, context);
+    defer if (run.gpu == null) {
+        gpa.free(tokens);
+        gpa.free(positions);
+    };
+    var host_tokens: [context]u32 = undefined;
+    var host_positions: [context]u32 = undefined;
+    for (&host_tokens, &host_positions, 0..) |*t, *p, i| {
+        t.* = text[i] & 0x7f;
+        p.* = @intCast(i);
+    }
+    try run.put(tokens, &host_tokens);
+    try run.put(positions, &host_positions);
+
+    if (run.gpu) |dev| try dev.resetStep();
+    var trace: grad.onnx.Trace = .{ .gpa = gpa };
+    defer trace.deinit();
+    var tape: Tape = .{ .gpa = arena.allocator(), .par = run.par, .trace = &trace };
+    const logits = try tape.cast(try forward(model, &tape, context, tokens, positions), f32);
+
+    const slices = nn.state(model);
+    var weights: [slices.len]grad.onnx.Weight = undefined;
+    var copied: usize = 0;
+    defer for (weights[0..copied]) |w| gpa.free(w.data);
+    inline for (slices, 0..) |slice, i| {
+        const host = try gpa.alloc(f32, slice.len);
+        weights[i] = .{ .id = @intFromPtr(slice.ptr), .data = host };
+        copied += 1;
+        try run.get(host, slice);
+    }
+    try grad.onnx.save(gpa, io, path, .{ .trace = &trace, .weights = &weights, .inputs = &.{ grad.onnx.View.ofIds(tokens), grad.onnx.View.ofIds(positions) }, .outputs = &.{grad.onnx.View.of(logits)} });
+
+    // The scores of the last position, for scripts/check-onnx.py to compare with.
+    const scores = try gpa.alloc(f32, context * vocab);
+    defer gpa.free(scores);
+    try run.get(scores, logits.value.data);
+    try out.print("exported {s}\nlogits of the last position:", .{path});
+    for (scores[(context - 1) * vocab ..]) |s| try out.print(" {d:.5}", .{s});
+    try out.writeByte('\n');
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     var buffer: [4096]u8 = undefined;
@@ -130,10 +180,13 @@ pub fn main(init: std.process.Init) !void {
     var iterations: usize = 1500;
     var use_gpu = false;
     var path: []const u8 = "data/text/shakespeare.txt";
+    var onnx_path: ?[]const u8 = null;
     var positional: usize = 0;
     for ((try init.minimal.args.toSlice(init.arena.allocator()))[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--gpu")) {
             use_gpu = true;
+        } else if (std.mem.startsWith(u8, arg, "--onnx=")) {
+            onnx_path = arg["--onnx=".len..];
         } else {
             if (positional == 0) iterations = try std.fmt.parseInt(usize, arg, 10) else path = arg;
             positional += 1;
@@ -195,7 +248,7 @@ pub fn main(init: std.process.Init) !void {
         if (gpu) |dev| try dev.resetStep();
         var tape: Tape = .{ .gpa = arena.allocator(), .par = run.par, .training = true };
         try grad.optim.zeroGrad(run.par, params);
-        const loss = try tape.crossEntropy(try forward(model, &tape, tokens, positions), targets);
+        const loss = try tape.crossEntropy(try forward(model, &tape, rows, tokens, positions), targets);
         try tape.backward(loss);
         adam.lr = grad.optim.cosineLr(0.003, iteration, iterations, 50);
         try adam.step(run.par, params);
@@ -211,5 +264,6 @@ pub fn main(init: std.process.Init) !void {
 
     try out.writeAll("\n--- sample ---\n");
     try generate(run, gpa, model, rng, out, "ROMEO:", 600);
+    if (onnx_path) |p| try exportOnnx(run, gpa, init.io, model, text, p, out);
     try out.flush();
 }

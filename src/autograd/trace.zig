@@ -4,12 +4,21 @@ const Allocator = std.mem.Allocator;
 pub const max_inputs = 5;
 pub const max_rank = 6;
 
-pub const Op = enum { add, mul, matmul, relu, sigmoid, tanh, gelu, conv, max_pool, avg_pool, batch_norm, batch_norm_relu, add_relu, cast };
+pub const Op = enum { add, mul, matmul, batched_matmul, embedding, layer_norm, softmax, relu, sigmoid, tanh, gelu, conv, max_pool, avg_pool, batch_norm, batch_norm_relu, add_relu, cast };
 
 pub const View = struct {
     id: usize,
     rank: usize,
     dims: [max_rank]usize,
+    // Integer tensors (token ids) are graph inputs of type int64; every other tensor is f32.
+    integer: bool = false,
+
+    /// Describes a slice of ids, which an embedding takes as a runtime input of the exported graph.
+    pub fn ofIds(ids: []const u32) View {
+        var dims: [max_rank]usize = @splat(1);
+        dims[0] = ids.len;
+        return .{ .id = @intFromPtr(ids.ptr), .rank = 1, .dims = dims, .integer = true };
+    }
 
     pub fn of(value: anytype) View {
         const Tn = @TypeOf(if (@hasField(@TypeOf(value), "value")) value.value else value);
@@ -30,7 +39,8 @@ pub const View = struct {
     }
 };
 
-pub const Attrs = struct { kernel: usize = 1, stride: usize = 1, pad: usize = 0, dilation: usize = 1, groups: usize = 1 };
+/// Extra properties of a traced op: window geometry for convolutions and pooling, the causal period of a softmax (zero for none), and the transposed second operand of a batched matmul.
+pub const Attrs = struct { kernel: usize = 1, stride: usize = 1, pad: usize = 0, dilation: usize = 1, groups: usize = 1, period: usize = 0, trans_b: bool = false };
 
 pub const Entry = struct {
     op: Op,
@@ -42,6 +52,8 @@ pub const Entry = struct {
     pad: usize = 0,
     dilation: usize = 1,
     groups: usize = 1,
+    period: usize = 0,
+    trans_b: bool = false,
 };
 
 pub const Constant = struct { view: View, value: f32 };
@@ -61,8 +73,8 @@ pub const Trace = struct {
     }
 
     pub fn add(self: *Trace, op: Op, inputs: anytype, output: anytype, attrs: Attrs) Allocator.Error!void {
-        var entry: Entry = .{ .op = op, .inputs = undefined, .count = inputs.len, .output = View.of(output), .kernel = attrs.kernel, .stride = attrs.stride, .pad = attrs.pad, .dilation = attrs.dilation, .groups = attrs.groups };
-        inline for (inputs, 0..) |input, i| entry.inputs[i] = View.of(input);
+        var entry: Entry = .{ .op = op, .inputs = undefined, .count = inputs.len, .output = View.of(output), .kernel = attrs.kernel, .stride = attrs.stride, .pad = attrs.pad, .dilation = attrs.dilation, .groups = attrs.groups, .period = attrs.period, .trans_b = attrs.trans_b };
+        inline for (inputs, 0..) |input, i| entry.inputs[i] = if (@TypeOf(input) == View) input else View.of(input);
         try self.entries.append(self.gpa, entry);
     }
 };

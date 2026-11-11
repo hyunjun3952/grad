@@ -5,7 +5,6 @@ The next tasks, most useful first. Keep this list current: when a task is finish
 ## Next
 
 - **Python wrapper.** A small C ABI over the trainer and the ONNX export (create model, train, predict, save), loaded from Python with ctypes. Decide first which part of the API is worth exposing; the shapes are compile-time, so the wrapper has to list the models it was built for.
-- **Export a Transformer to ONNX.** Trace layer norm, softmax (with the causal mask), embedding, batched matmul and dropout, and import them in the runtime. Without this only the convolutional and MLP models export.
 
 ## Later
 
