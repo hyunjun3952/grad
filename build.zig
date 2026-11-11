@@ -27,6 +27,7 @@ pub fn build(b: *std.Build) void {
     config.addOption(usize, "hidden", b.option(usize, "hidden", "mnist example: hidden units of the MLP (default: 128)") orelse 128);
     config.addOption(usize, "batch", b.option(usize, "batch", "mnist example: training batch size (default: 64)") orelse 64);
     config.addOption(bool, "cnn", b.option(bool, "cnn", "mnist example: train the convolutional network instead of the MLP") orelse false);
+    config.addOption(bool, "wide", b.option(bool, "wide", "cifar example: widths 64-192-384 instead of 64-128-256 (slower, more accurate)") orelse false);
 
     inline for (.{ "mnist", "cifar" }) |name| {
         const exe = b.addExecutable(.{
@@ -40,7 +41,7 @@ pub fn build(b: *std.Build) void {
                 },
             }),
         });
-        if (std.mem.eql(u8, name, "mnist")) exe.root_module.addOptions("config", config);
+        exe.root_module.addOptions("config", config);
         b.installArtifact(exe);
 
         const run_cmd = b.addRunArtifact(exe);

@@ -1,4 +1,6 @@
+const std = @import("std");
 const grad = @import("grad");
+const config = @import("config");
 
 const nn = grad.nn;
 const Tensor = grad.Tensor;
@@ -6,25 +8,28 @@ const Tape = grad.autograd.Tape;
 const Var = grad.autograd.Var;
 
 const categories = 10;
+const w1 = 64;
+const w2 = if (config.wide) 192 else 128;
+const w3 = if (config.wide) 384 else 256;
 const same = grad.autograd.ConvOpts{ .pad = 1 };
 
 const Network = struct {
-    nn.ConvBn(3, 64, 3, same),
-    nn.ConvBn(64, 64, 3, same),
-    nn.ConvBn(64, 64, 3, same),
-    nn.ConvBn(64, 64, 3, same),
-    nn.ConvBn(64, 64, 3, same),
-    nn.ConvBn(64, 128, 3, same),
-    nn.ConvBn(128, 128, 3, same),
-    nn.ConvBn(64, 128, 1, .{}),
-    nn.ConvBn(128, 128, 3, same),
-    nn.ConvBn(128, 128, 3, same),
-    nn.ConvBn(128, 256, 3, same),
-    nn.ConvBn(256, 256, 3, same),
-    nn.ConvBn(128, 256, 1, .{}),
-    nn.ConvBn(256, 256, 3, same),
-    nn.ConvBn(256, 256, 3, same),
-    nn.Linear(256, categories),
+    nn.ConvBn(3, w1, 3, same),
+    nn.ConvBn(w1, w1, 3, same),
+    nn.ConvBn(w1, w1, 3, same),
+    nn.ConvBn(w1, w1, 3, same),
+    nn.ConvBn(w1, w1, 3, same),
+    nn.ConvBn(w1, w2, 3, same),
+    nn.ConvBn(w2, w2, 3, same),
+    nn.ConvBn(w1, w2, 1, .{}),
+    nn.ConvBn(w2, w2, 3, same),
+    nn.ConvBn(w2, w2, 3, same),
+    nn.ConvBn(w2, w3, 3, same),
+    nn.ConvBn(w3, w3, 3, same),
+    nn.ConvBn(w2, w3, 1, .{}),
+    nn.ConvBn(w3, w3, 3, same),
+    nn.ConvBn(w3, w3, 3, same),
+    nn.Linear(w3, categories),
 };
 
 fn residual(tape: *Tape, first: anytype, second: anytype, x: anytype) grad.autograd.Error!@TypeOf(x) {
@@ -32,7 +37,7 @@ fn residual(tape: *Tape, first: anytype, second: anytype, x: anytype) grad.autog
 }
 
 const Cifar = struct {
-    pub const name = "CIFAR-10 ResNet-14 64-128-256";
+    pub const name = std.fmt.comptimePrint("CIFAR-10 ResNet-14 {d}-{d}-{d}", .{ w1, w2, w3 });
     pub const Layers = Network;
     pub const Loader = grad.cifar;
     pub const data_dir = "data/cifar";
@@ -56,7 +61,7 @@ const Cifar = struct {
         const down3 = try tape.addRelu(try b5.forward(tape, try a5.forwardRelu(tape, stage2)), try skip5.forward(tape, stage2));
         const stage3 = try tape.maxPool(try residual(tape, a6, b6, down3));
         const pooled = try tape.avgPool(try tape.avgPool(stage3));
-        return fc.forward(tape, try tape.dropout(grad.autograd.reshape(pooled, &.{ n, 256 }), 0.2));
+        return fc.forward(tape, try tape.dropout(grad.autograd.reshape(pooled, &.{ n, w3 }), 0.2));
     }
 };
 

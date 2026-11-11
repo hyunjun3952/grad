@@ -8,7 +8,8 @@ The goal is an engine that sits between "C with pointers" and "PyTorch": plain s
 | --- | --- | --- | --- |
 | MNIST | MLP 784-128-10 | 98.1% (10 epochs) | 0.19 s GPU, 0.26 s CPU (6 threads) |
 | MNIST | CNN conv5x16-conv5x32 + BatchNorm | 99.5% (30 epochs, light augmentation) | 0.9 s GPU, 19.5 s CPU |
-| CIFAR-10 | ResNet-14, widths 64-128-256 | 94.1% (50 epochs) to 94.9% (100 epochs); flip + shift + CutMix + label smoothing + EMA | 17.2 s GPU (bf16 tensor cores), 24.6 s (TF32), 52.8 s (strict f32) |
+| CIFAR-10 | ResNet-14, widths 64-128-256 | 94.1% (50 epochs) to 94.9% (100 epochs); flip + shift + CutMix + label smoothing + EMA, +0.4 with `--tta` | 17.2 s GPU (bf16 tensor cores), 24.6 s (TF32), 52.8 s (strict f32) |
+| CIFAR-10 | ResNet-14, widths 64-192-384 (`-Dwide=true`) | 94.8%, 95.3% with `--tta` (50 epochs, same recipe) | 24.7 s GPU (bf16 tensor cores) |
 
 Measured on an i5-8500 (6 cores) and an RTX 3060 12 GB. About 5,200 lines including 66 tests, with no comments except for explained magic numbers.
 
@@ -36,6 +37,7 @@ zig build mnist -- 5                                # MLP on the CPU
 zig build mnist -- 5 --gpu                          # MLP on the GPU
 zig build mnist -Dcnn=true -- 30 --gpu --shift=1 --rotate=8 --zoom=0.05
 zig build cifar -- 50 --gpu --flip --shift=4 --tensor-cores --smoothing=0.1
+zig build cifar -Dwide=true -- 50 --gpu --flip --shift=4 --cutmix=0.5 --tensor-cores --smoothing=0.1 --ema=0.999 --warmup=1 --tta
 ```
 
 Build options such as `-Dcnn=true -Dhidden=2048 -Dbatch=256` go before the `--`; the arguments after it belong to the program.
