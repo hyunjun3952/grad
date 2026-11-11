@@ -108,15 +108,15 @@ pub const Cudnn = struct {
         return error.CudnnFailed;
     }
 
-    fn fastest(self: *const Cudnn, results: []const Perf, count: usize, workspace_limit: usize) Error!Choice {
+    fn fastest(results: []const Perf, count: usize, workspace_limit: usize, deterministic: bool) Error!Choice {
+        const deterministic_algorithm = 1;
         for (results[0..count]) |r| {
-            if (r.status == 0 and r.memory <= workspace_limit) return .{ .algo = r.algo, .workspace = r.memory };
+            if (r.status == 0 and r.memory <= workspace_limit and (!deterministic or r.determinism == deterministic_algorithm)) return .{ .algo = r.algo, .workspace = r.memory };
         }
-        _ = self;
         return error.NoAlgorithm;
     }
 
-    pub fn plan(self: *Cudnn, g: Geometry, data: DataType, workspace_limit: usize) Error!Plan {
+    pub fn plan(self: *Cudnn, g: Geometry, data: DataType, workspace_limit: usize, deterministic: bool) Error!Plan {
         const api = self.api;
         const out_h: c_int = @intCast((g.h + 2 * g.pad - g.r) / g.stride + 1);
         const out_w: c_int = @intCast((g.w + 2 * g.pad - g.r) / g.stride + 1);
@@ -138,11 +138,11 @@ pub const Cudnn = struct {
         var results: [16]Perf = undefined;
         var count: c_int = 0;
         try self.check(api.cudnnFindConvolutionForwardAlgorithm(self.handle, p.x, p.filter, p.conv, p.y, results.len, &count, &results));
-        p.forward = try self.fastest(&results, @intCast(count), workspace_limit);
+        p.forward = try fastest(&results, @intCast(count), workspace_limit, deterministic);
         try self.check(api.cudnnFindConvolutionBackwardDataAlgorithm(self.handle, p.filter, p.y, p.conv, p.x, results.len, &count, &results));
-        p.backward_data = try self.fastest(&results, @intCast(count), workspace_limit);
+        p.backward_data = try fastest(&results, @intCast(count), workspace_limit, deterministic);
         try self.check(api.cudnnFindConvolutionBackwardFilterAlgorithm(self.handle, p.x, p.y, p.conv, p.filter, results.len, &count, &results));
-        p.backward_filter = try self.fastest(&results, @intCast(count), workspace_limit);
+        p.backward_filter = try fastest(&results, @intCast(count), workspace_limit, deterministic);
         return p;
     }
 

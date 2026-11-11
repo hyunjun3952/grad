@@ -2,18 +2,19 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const max_inputs = 5;
+pub const max_rank = 6;
 
 pub const Op = enum { add, mul, matmul, relu, sigmoid, tanh, gelu, conv, max_pool, avg_pool, batch_norm, batch_norm_relu, add_relu };
 
 pub const View = struct {
     id: usize,
     rank: usize,
-    dims: [4]usize,
+    dims: [max_rank]usize,
 
     pub fn of(value: anytype) View {
         const Tn = @TypeOf(if (@hasField(@TypeOf(value), "value")) value.value else value);
         const data = if (@hasField(@TypeOf(value), "value")) value.value.data else value.data;
-        var dims: [4]usize = @splat(1);
+        var dims: [max_rank]usize = @splat(1);
         inline for (Tn.shape, 0..) |d, i| dims[i] = d;
         return .{ .id = @intFromPtr(data.ptr), .rank = Tn.rank, .dims = dims };
     }
@@ -43,12 +44,20 @@ pub const Entry = struct {
     groups: usize = 1,
 };
 
+pub const Constant = struct { view: View, value: f32 };
+
 pub const Trace = struct {
     gpa: Allocator,
     entries: std.ArrayList(Entry) = .empty,
+    constants: std.ArrayList(Constant) = .empty,
 
     pub fn deinit(self: *Trace) void {
         self.entries.deinit(self.gpa);
+        self.constants.deinit(self.gpa);
+    }
+
+    pub fn addConstant(self: *Trace, tensor: anytype, value: f32) Allocator.Error!void {
+        try self.constants.append(self.gpa, .{ .view = View.of(tensor), .value = value });
     }
 
     pub fn add(self: *Trace, op: Op, inputs: anytype, output: anytype, attrs: Attrs) Allocator.Error!void {

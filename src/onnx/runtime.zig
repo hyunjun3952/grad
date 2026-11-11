@@ -732,7 +732,7 @@ test "an exported network, read back with runtime shapes, gives the same outputs
     const state = nn.state(layers);
     var weights: [state.len]onnx.Weight = undefined;
     inline for (state, 0..) |slice, i| weights[i] = .{ .id = @intFromPtr(slice.ptr), .data = slice };
-    const bytes = try onnx.build(gpa, &trace, &weights, onnx.View.of(image), onnx.View.of(logits));
+    const bytes = try onnx.build(gpa, &trace, &weights, &.{onnx.View.of(image)}, &.{onnx.View.of(logits)});
     defer gpa.free(bytes);
 
     var model = try Model.parse(gpa, bytes);
@@ -768,4 +768,47 @@ test "grouped and dilated convolutions, pooling, softmax and broadcasting follow
     const summed = try broadcast(a, .{ .dims = &.{ 2, 1 }, .data = @constCast(&[_]f32{ 10, 20 }) }, .{ .dims = &.{3}, .data = @constCast(&[_]f32{ 1, 2, 3 }) }, plus);
     try testing.expectEqualSlices(usize, &.{ 2, 3 }, summed.dims);
     try testing.expectEqualSlices(f32, &.{ 11, 12, 13, 21, 22, 23 }, summed.data);
+}
+
+test "a gru step with two inputs and two outputs survives export and import" {
+    const gpa = testing.allocator;
+    const Layers = struct { nn.Gru(3, 4), nn.Linear(4, 2) };
+    var prng = std.Random.DefaultPrng.init(23);
+    const rng = prng.random();
+    const layers = try nn.initAll(Layers, gpa, rng);
+    defer nn.deinitAll(layers, gpa);
+    inline for (nn.state(layers)) |slice| {
+        for (slice) |*v| v.* += rng.floatNorm(f32) * 0.3;
+    }
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var trace: onnx.Trace = .{ .gpa = gpa };
+    defer trace.deinit();
+    var tape: autograd.Tape = .{ .gpa = arena.allocator(), .trace = &trace };
+    const x = try tape.constant(try Tensor(f32, &.{ 2, 3 }).empty(arena.allocator()));
+    const h = try tape.constant(try Tensor(f32, &.{ 2, 4 }).empty(arena.allocator()));
+    for (x.value.data) |*v| v.* = rng.floatNorm(f32);
+    for (h.value.data) |*v| v.* = rng.floatNorm(f32) * 0.5;
+    const cell, const head = layers;
+    const next = try cell.forward(&tape, x, h);
+    const scores = try head.forward(&tape, next);
+
+    const state = nn.state(layers);
+    var weights: [state.len]onnx.Weight = undefined;
+    inline for (state, 0..) |slice, i| weights[i] = .{ .id = @intFromPtr(slice.ptr), .data = slice };
+    const bytes = try onnx.build(gpa, &trace, &weights, &.{ onnx.View.of(x), onnx.View.of(h) }, &.{ onnx.View.of(next), onnx.View.of(scores) });
+    defer gpa.free(bytes);
+
+    var model = try Model.parse(gpa, bytes);
+    defer model.deinit();
+    try testing.expectEqual(@as(usize, 2), model.inputs.len);
+    try testing.expectEqual(@as(usize, 2), model.outputs.len);
+    var result = try model.run(gpa, .{ .threads = 1 }, &.{
+        .{ .name = "input0", .dims = &.{ 2, 3 }, .data = x.value.data },
+        .{ .name = "input1", .dims = &.{ 2, 4 }, .data = h.value.data },
+    });
+    defer result.deinit();
+    for (next.value.data, result.outputs[0].data) |want, got| try testing.expectApproxEqAbs(want, got, 1e-5);
+    for (scores.value.data, result.outputs[1].data) |want, got| try testing.expectApproxEqAbs(want, got, 1e-5);
 }

@@ -50,6 +50,7 @@ const Options = struct {
     profile: bool = false,
     tensor_cores: bool = false,
     tf32: bool = false,
+    deterministic: bool = false,
     progress: bool = false,
     mirrored: bool = false,
     cudnn_dir: ?[:0]const u8 = null,
@@ -78,6 +79,8 @@ const Options = struct {
                 o.profile = true;
             } else if (std.mem.eql(u8, arg, "--progress")) {
                 o.progress = true;
+            } else if (std.mem.eql(u8, arg, "--deterministic")) {
+                o.deterministic = true;
             } else if (std.mem.eql(u8, arg, "--tf32")) {
                 o.tf32 = true;
             } else if (std.mem.eql(u8, arg, "--tensor-cores")) {
@@ -244,7 +247,7 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
                 copied += 1;
                 if (par.gpu) |dev| try dev.download(host, slice) else @memcpy(host, slice);
             }
-            try onnx.save(gpa, io, path, &trace, &weights, onnx.View.of(input), onnx.View.of(logits));
+            try onnx.save(gpa, io, path, &trace, &weights, &.{onnx.View.of(input)}, &.{onnx.View.of(logits)});
         }
 
         fn buffer(comptime T: type, gpa: Allocator, gpu: ?*Gpu, n: usize) ![]T {
@@ -341,6 +344,7 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
                 if (opts.profile) dev.startProfile(io);
                 dev.tensor_cores = opts.tensor_cores;
                 dev.tf32 = opts.tf32;
+                dev.deterministic = opts.deterministic;
                 if (opts.cudnn_dir) |dir| dev.enableCudnn(dir) catch |err| try out.print("cuDNN unavailable ({s}), using the built-in kernels\n", .{@errorName(err)});
             }
             const par: kernels.Parallel = .{ .io = io, .threads = std.Thread.getCpuCount() catch 1, .gpu = gpu };

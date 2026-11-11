@@ -315,7 +315,7 @@ fn cudnnConvolutions(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, dir: [:0]c
         for ([_]grad.gpu.cudnn.DataType{ .float, .bfloat16 }) |data| {
             const g = case.g;
             const size: usize = if (data == .float) 4 else 2;
-            const plan = try lib.plan(g, data, 1 << 30);
+            const plan = try lib.plan(g, data, 1 << 30, false);
             defer lib.destroyPlan(plan);
             const x = try dev.alloc(u8, g.n * g.h * g.w * g.c * size);
             const y = try dev.alloc(u8, g.n * g.h * g.w * g.k * size);

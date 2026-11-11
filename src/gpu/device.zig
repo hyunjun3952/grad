@@ -149,15 +149,16 @@ export fn elementwise(a: [*]const f32, b: [*]const f32, out: [*]f32, args: ga.El
     const t = globalIndex();
     if (t >= args.len) return;
     var rest = t;
-    const p3 = rest % args.dims[3];
-    rest /= args.dims[3];
-    const p2 = rest % args.dims[2];
-    rest /= args.dims[2];
-    const p1 = rest % args.dims[1];
-    const p0 = rest / args.dims[1];
-    const x = a[p0 * args.a_strides[0] + p1 * args.a_strides[1] + p2 * args.a_strides[2] + p3 * args.a_strides[3]];
-    const y = b[p0 * args.b_strides[0] + p1 * args.b_strides[1] + p2 * args.b_strides[2] + p3 * args.b_strides[3]];
-    out[t] = if (args.multiply != 0) x * y else x + y;
+    var from_a: usize = 0;
+    var from_b: usize = 0;
+    inline for (0..ga.max_rank) |step| {
+        const axis = ga.max_rank - 1 - step;
+        const position = rest % args.dims[axis];
+        rest /= args.dims[axis];
+        from_a += position * args.a_strides[axis];
+        from_b += position * args.b_strides[axis];
+    }
+    out[t] = if (args.multiply != 0) a[from_a] * b[from_b] else a[from_a] + b[from_b];
 }
 
 export fn relu(x: [*]const f32, out: [*]f32, n: u32) callconv(.nvptx_kernel) void {
@@ -201,14 +202,18 @@ export fn addInPlace(dst: [*]f32, src: [*]const f32, n: u32) callconv(.nvptx_ker
 export fn sumTo(in: [*]const f32, out: [*]f32, args: ga.SumArgs) callconv(.nvptx_kernel) void {
     const t: usize = @workGroupId(0);
     const tid: usize = @workItemId(0);
-    const d = [4]usize{ args.dims[0], args.dims[1], args.dims[2], args.dims[3] };
-    const s = [4]usize{ args.strides[0], args.strides[1], args.strides[2], args.strides[3] };
+    var d: [ga.max_rank]usize = undefined;
+    var s: [ga.max_rank]usize = undefined;
+    inline for (0..ga.max_rank) |i| {
+        d[i] = args.dims[i];
+        s[i] = args.strides[i];
+    }
     const rmask = args.mask;
 
     var base: usize = 0;
     var rest: usize = t;
-    inline for (0..4) |step| {
-        const axis = 3 - step;
+    inline for (0..ga.max_rank) |step| {
+        const axis = ga.max_rank - 1 - step;
         if ((rmask >> axis) & 1 == 0) {
             base += (rest % d[axis]) * s[axis];
             rest /= d[axis];
@@ -220,8 +225,8 @@ export fn sumTo(in: [*]const f32, out: [*]f32, args: ga.SumArgs) callconv(.nvptx
     while (q < args.reduce_count) : (q += threads) {
         var left = q;
         var at = base;
-        inline for (0..4) |step| {
-            const axis = 3 - step;
+        inline for (0..ga.max_rank) |step| {
+            const axis = ga.max_rank - 1 - step;
             if ((rmask >> axis) & 1 != 0) {
                 at += (left % d[axis]) * s[axis];
                 left /= d[axis];

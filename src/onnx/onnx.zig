@@ -56,6 +56,7 @@ const Builder = struct {
     names: std.heap.ArenaAllocator,
     graph: Proto = .{},
     weights: []const Weight,
+    constants: []const trace_mod.Constant,
     values: std.AutoHashMap(usize, Known),
     emitted: std.AutoHashMap(usize, []const u8),
     counter: usize = 0,
@@ -90,7 +91,7 @@ const Builder = struct {
 
     fn shapeConstant(self: *Builder, dims: []const usize) ![]const u8 {
         const name = try self.fresh("shape");
-        var values: [4]i64 = undefined;
+        var values: [trace_mod.max_rank]i64 = undefined;
         for (dims, 0..) |d, i| values[i] = @intCast(d);
         try self.tensor(name, &.{dims.len}, int64_type, std.mem.sliceAsBytes(values[0..dims.len]));
         return name;
@@ -138,10 +139,24 @@ const Builder = struct {
             return name;
         }
         if (self.emitted.get(view.id)) |name| return name;
+        for (self.constants) |constant| {
+            if (constant.view.id != view.id) continue;
+            const data = try self.gpa.alloc(f32, view.len());
+            defer self.gpa.free(data);
+            @memset(data, constant.value);
+            const name = try self.floats("constant", view.shape(), data);
+            try self.emitted.put(view.id, name);
+            return name;
+        }
         const data = self.weightOf(view.id) orelse return error.UnknownTensor;
         const name = try self.floats("weight", view.shape(), data);
         try self.emitted.put(view.id, name);
         return name;
+    }
+
+    fn boundary(self: *Builder, comptime prefix: []const u8, index: usize, count: usize) ![]const u8 {
+        if (count == 1) return prefix;
+        return std.fmt.allocPrint(self.names.allocator(), prefix ++ "{d}", .{index});
     }
 
     fn produce(self: *Builder, view: View, name: []const u8) !void {
@@ -265,11 +280,12 @@ const Builder = struct {
     }
 };
 
-pub fn build(gpa: Allocator, trace: *const Trace, weights: []const Weight, input: View, output: View) Error![]u8 {
+pub fn build(gpa: Allocator, trace: *const Trace, weights: []const Weight, inputs: []const View, outputs: []const View) Error![]u8 {
     var b: Builder = .{
         .gpa = gpa,
         .names = .init(gpa),
         .weights = weights,
+        .constants = trace.constants.items,
         .values = .init(gpa),
         .emitted = .init(gpa),
     };
@@ -279,13 +295,12 @@ pub fn build(gpa: Allocator, trace: *const Trace, weights: []const Weight, input
         b.emitted.deinit();
         b.graph.bytes.deinit(gpa);
     }
-    try b.produce(input, "input");
+    for (inputs, 0..) |input, i| try b.produce(input, try b.boundary("input", i, inputs.len));
     for (trace.entries.items) |e| try b.convert(e);
-    const last = try b.use(output);
-    try b.node("Identity", &.{last}, "output", &.{});
+    for (outputs, 0..) |output, i| try b.node("Identity", &.{try b.use(output)}, try b.boundary("output", i, outputs.len), &.{});
     try b.graph.bytesField(gpa, 2, "grad");
-    try b.valueInfo(11, "input", input);
-    try b.valueInfo(12, "output", output);
+    for (inputs, 0..) |input, i| try b.valueInfo(11, try b.boundary("input", i, inputs.len), input);
+    for (outputs, 0..) |output, i| try b.valueInfo(12, try b.boundary("output", i, outputs.len), output);
 
     var operator_set: Proto = .{};
     defer operator_set.bytes.deinit(gpa);
@@ -301,8 +316,8 @@ pub fn build(gpa: Allocator, trace: *const Trace, weights: []const Weight, input
     return model.bytes.toOwnedSlice(gpa);
 }
 
-pub fn save(gpa: Allocator, io: Io, path: []const u8, trace: *const Trace, weights: []const Weight, input: View, output: View) !void {
-    const bytes = try build(gpa, trace, weights, input, output);
+pub fn save(gpa: Allocator, io: Io, path: []const u8, trace: *const Trace, weights: []const Weight, inputs: []const View, outputs: []const View) !void {
+    const bytes = try build(gpa, trace, weights, inputs, outputs);
     defer gpa.free(bytes);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
 }
@@ -336,12 +351,12 @@ test "a traced network becomes an onnx model with its weights, layout changes an
         .{ .id = @intFromPtr(dense.value.data.ptr), .data = dense.value.data },
         .{ .id = @intFromPtr(bias.value.data.ptr), .data = bias.value.data },
     };
-    const bytes = try build(gpa, &trace, &weights, View.of(image), View.of(logits));
+    const bytes = try build(gpa, &trace, &weights, &.{View.of(image)}, &.{View.of(logits)});
     defer gpa.free(bytes);
 
     try testing.expectEqualSlices(u8, &.{ 0x08, 0x09 }, bytes[0..2]);
     for ([_][]const u8{ "Conv", "Gelu", "MaxPool", "MatMul", "Add", "Identity", "output", "input" }) |name| try testing.expect(countOf(bytes, name) >= 1);
     try testing.expectEqual(@as(usize, 2), countOf(bytes, "Reshape"));
     try testing.expectEqual(@as(usize, 4), countOf(bytes, "Transpose"));
-    try testing.expectError(error.UnknownTensor, build(gpa, &trace, weights[1..], View.of(image), View.of(logits)));
+    try testing.expectError(error.UnknownTensor, build(gpa, &trace, weights[1..], &.{View.of(image)}, &.{View.of(logits)}));
 }

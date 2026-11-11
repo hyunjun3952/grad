@@ -15,20 +15,20 @@ pub const Trace = trace_mod.Trace;
 
 pub const Error = gpu_mod.Error;
 
-fn padTo4(comptime dims: []const usize, comptime fill: u32) [4]u32 {
-    if (dims.len > 4) @compileError("gpu kernels support tensors of rank 4 or less");
-    var out: [4]u32 = @splat(fill);
-    for (dims, 0..) |d, i| out[4 - dims.len + i] = @intCast(d);
+fn padToRank(comptime dims: []const usize, comptime fill: u32) [ga.max_rank]u32 {
+    if (dims.len > ga.max_rank) @compileError("gpu kernels support tensors of rank 6 or less");
+    var out: [ga.max_rank]u32 = @splat(fill);
+    for (dims, 0..) |d, i| out[ga.max_rank - dims.len + i] = @intCast(d);
     return out;
 }
 
-fn rowMajorStrides4(comptime dims: []const usize) [4]u32 {
-    var out: [4]u32 = @splat(0);
+fn rowMajorStrides(comptime dims: []const usize) [ga.max_rank]u32 {
+    var out: [ga.max_rank]u32 = @splat(0);
     var acc: u32 = 1;
     var i: usize = dims.len;
     while (i > 0) {
         i -= 1;
-        out[4 - dims.len + i] = acc;
+        out[ga.max_rank - dims.len + i] = acc;
         acc *= @intCast(dims[i]);
     }
     return out;
@@ -36,7 +36,7 @@ fn rowMajorStrides4(comptime dims: []const usize) [4]u32 {
 
 fn reducedAxisMask(comptime target: []const usize) u32 {
     var mask: u32 = 0;
-    for (padTo4(target, 1), 0..) |d, axis| {
+    for (padToRank(target, 1), 0..) |d, axis| {
         if (d == 1) mask |= @as(u32, 1) << @intCast(axis);
     }
     return mask;
@@ -103,14 +103,15 @@ pub const Tape = struct {
     pub fn filledTensor(self: *Tape, comptime Tn: type, value: f32) Error!Tn {
         const filled = try self.newTensor(Tn);
         if (self.par.gpu) |dev| try dev.fill(filled.data, value) else @memset(filled.data, value);
+        if (self.trace) |t| try t.addConstant(filled, value);
         return filled;
     }
 
     pub fn zeroedTensor(self: *Tape, comptime Tn: type) Error!Tn {
-        if (self.par.gpu) |dev| return .{ .data = try dev.scratchZeroed(Tn.Elem, Tn.len) };
-        const tensor_zeroed = try Tn.empty(self.gpa);
-        @memset(tensor_zeroed.data, 0);
-        return tensor_zeroed;
+        const zeroed: Tn = if (self.par.gpu) |dev| .{ .data = try dev.scratchZeroed(Tn.Elem, Tn.len) } else .{ .data = try self.gpa.alloc(Tn.Elem, Tn.len) };
+        if (self.par.gpu == null) @memset(zeroed.data, 0);
+        if (self.trace) |t| try t.addConstant(zeroed, 0);
+        return zeroed;
     }
 
     fn makeVar(self: *Tape, value: anytype, needs_grad: bool) Error!Var(@TypeOf(value)) {
@@ -136,7 +137,7 @@ pub const Tape = struct {
         if (self.par.gpu) |dev| {
             const out = try self.newTensor(ops.BroadcastResult(@TypeOf(a), @TypeOf(b)));
             const bc = comptime ops.broadcast(@TypeOf(a).shape, @TypeOf(b).shape);
-            try dev.elementwise(op, a.data, b.data, out.data, .{ .dims = padTo4(&bc.dims, 1), .a_strides = padTo4(&bc.a, 0), .b_strides = padTo4(&bc.b, 0) });
+            try dev.elementwise(op, a.data, b.data, out.data, .{ .dims = padToRank(&bc.dims, 1), .a_strides = padToRank(&bc.a, 0), .b_strides = padToRank(&bc.b, 0) });
             return out;
         }
         return switch (op) {
@@ -175,7 +176,7 @@ pub const Tape = struct {
             if (comptime std.mem.eql(usize, D.shape, G.shape)) {
                 try dev.addInPlace(v.grad.data, g.data);
             } else {
-                try dev.sumTo(g.data, v.grad.data, .{ .dims = padTo4(G.shape, 1), .strides = rowMajorStrides4(G.shape), .mask = comptime reducedAxisMask(D.shape) }, true);
+                try dev.sumTo(g.data, v.grad.data, .{ .dims = padToRank(G.shape, 1), .strides = rowMajorStrides(G.shape), .mask = comptime reducedAxisMask(D.shape) }, true);
             }
             return;
         }
@@ -868,6 +869,31 @@ fn PoolCase(comptime opts: PoolOpts) type {
     };
 }
 
+const HighRankNet = struct {
+    const A = Tensor(f32, &.{ 2, 1, 3, 1, 2, 1 });
+    const B = Tensor(f32, &.{ 1, 2, 1, 2, 1, 3 });
+    const Y = Tensor(f32, &.{ 12, 12 });
+
+    pub const Inputs = struct { a: A, b: B, y: Y };
+    pub const names = .{ "a", "b", "y" };
+    pub const labels: [12]u8 = @splat(0);
+    const Result = struct { loss: Var(Tensor(f32, &.{})), a: Var(A), b: Var(B), y: Var(Y) };
+
+    pub fn build(t: *Tape, p: Inputs, _: []const u8) !Result {
+        const a = try t.leaf(p.a);
+        const b = try t.leaf(p.b);
+        const y = try t.leaf(p.y);
+        const sum = try t.add(a, b);
+        const product = try t.mul(a, b);
+        const mixed = try t.add(sum, product);
+        return .{ .loss = try t.mse(reshape(mixed, &.{ 12, 12 }), y), .a = a, .b = b, .y = y };
+    }
+
+    pub fn acceptable(_: Allocator, _: Inputs) !bool {
+        return true;
+    }
+};
+
 const SmoothedNet = struct {
     pub const Inputs = SmallNet.Inputs;
     pub const names = SmallNet.names;
@@ -1262,6 +1288,11 @@ test "pooling with other windows, strides and padding matches a brute-force refe
         try gradcheck.expectGpuMatchesCpu(PoolCase(opts), 6, 1e-5);
     }
 }
+test "broadcasting and its gradient reductions work for tensors of rank six on the cpu and the gpu" {
+    try gradcheck.expectFiniteDifferences(HighRankNet, 3, 1e-2, 3e-3);
+    try gradcheck.expectGpuMatchesCpu(HighRankNet, 4, 1e-5);
+}
+
 test "label smoothing blends the target and its gradient with the uniform distribution" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

@@ -22,9 +22,9 @@ pub const cudnn = @import("cudnn.zig");
 
 pub const MatmulShape = struct { m: usize, n: usize, k: usize };
 
-pub const BroadcastPlan = struct { dims: [4]u32, a_strides: [4]u32, b_strides: [4]u32 };
+pub const BroadcastPlan = struct { dims: [ga.max_rank]u32, a_strides: [ga.max_rank]u32, b_strides: [ga.max_rank]u32 };
 
-pub const ReducePlan = struct { dims: [4]u32, strides: [4]u32, mask: u32 };
+pub const ReducePlan = struct { dims: [ga.max_rank]u32, strides: [ga.max_rank]u32, mask: u32 };
 
 const Kernel = enum {
     sgemmNN,
@@ -148,6 +148,7 @@ pub const Gpu = struct {
     tensor_cores: bool = false,
     tf32: bool = false,
     tensor_core_min_work: usize = 1 << 22,
+    deterministic: bool = false,
     gpa: Allocator,
     cu: cuda.Cuda,
     fns: [kernel_count]cuda.Handle,
@@ -173,6 +174,7 @@ pub const Gpu = struct {
         self.tensor_cores = false;
         self.tf32 = false;
         self.tensor_core_min_work = 1 << 22;
+        self.deterministic = false;
         self.owned = .empty;
         self.cudnn_lib = null;
         self.cudnn_plans = .empty;
@@ -251,7 +253,7 @@ pub const Gpu = struct {
         for (self.cudnn_plans.items) |entry| {
             if (std.meta.eql(entry.geometry, geometry)) return entry.plan;
         }
-        const plan = try self.cudnn_lib.?.plan(geometry, .float, 512 << 20);
+        const plan = try self.cudnn_lib.?.plan(geometry, .float, 512 << 20, self.deterministic);
         try self.cudnn_plans.append(self.gpa, .{ .geometry = geometry, .plan = plan });
         if (plan.workspaceBytes() > self.cudnn_workspace_bytes) {
             if (self.cudnn_workspace != 0) self.cu.free(self.cudnn_workspace);
@@ -372,6 +374,10 @@ pub const Gpu = struct {
         try self.timerStop(@backingInt(kernel), started);
     }
 
+    fn splitCount(self: *const Gpu, wanted: usize) usize {
+        return if (self.deterministic) 1 else wanted;
+    }
+
     fn launchFlat(self: *Gpu, kernel: Kernel, items: usize, args: anytype) Error!void {
         try self.launch(kernel, .{ ceilDiv(items, 256), 1, 1 }, args);
     }
@@ -385,7 +391,7 @@ pub const Gpu = struct {
         const tile_m: usize = if (tile == 2) 32 else 128;
         const tile_n: usize = if (tile == 0) 128 else 32;
         const blocks = @as(usize, ceilDiv(shape.n, tile_n)) * ceilDiv(shape.m, tile_m);
-        const splits = @max(1, @min(shape.k / 256, (128 + blocks - 1) / blocks));
+        const splits = self.splitCount(@max(1, @min(shape.k / 256, (128 + blocks - 1) / blocks)));
         const chunk = std.mem.alignForward(usize, (shape.k + splits - 1) / splits, 8);
         if (splits > 1 and !opts.accumulate) try self.fill(out, 0);
         const kernel_shape = pack(ga.GemmShape, .{ .m = shape.m, .n = shape.n, .k = shape.k, .accumulate = opts.accumulate, .chunk = chunk });
@@ -449,7 +455,7 @@ pub const Gpu = struct {
         const tile_rows: usize = if (short) 64 else 128;
         const tile_cols: usize = if (short) 128 else 64;
         const blocks = @as(usize, ceilDiv(c_out, tile_rows)) * ceilDiv(taps, tile_cols);
-        const splits = @max(1, @min(positions_padded / 256, (128 + blocks - 1) / blocks));
+        const splits = self.splitCount(@max(1, @min(positions_padded / 256, (128 + blocks - 1) / blocks)));
         const chunk = std.mem.alignForward(usize, (positions_padded + splits - 1) / splits, 16);
         const kernel_shape = pack(ga.TensorShape, .{ .m = c_out, .n = taps, .k_padded = positions_padded, .n_padded = taps, .accumulate = true, .chunk = chunk, .transpose_out = true, .output_half = false });
         const kernel: Kernel = if (short) .convTf32WeightGradShort else .convTf32WeightGrad;
@@ -476,7 +482,7 @@ pub const Gpu = struct {
         const tile_cols: usize = if (short) 128 else 64;
         const n_padded = std.mem.alignForward(usize, taps, tile_cols);
         const blocks = ceilDiv(c_out, tile_rows) * (n_padded / tile_cols);
-        const splits = @max(1, @min(dy_t.cols_padded / 256, (128 + blocks - 1) / blocks));
+        const splits = self.splitCount(@max(1, @min(dy_t.cols_padded / 256, (128 + blocks - 1) / blocks)));
         const chunk = std.mem.alignForward(usize, (dy_t.cols_padded + splits - 1) / splits, 32);
         const kernel_shape = pack(ga.TensorShape, .{ .m = c_out, .n = taps, .k_padded = dy_t.cols_padded, .n_padded = n_padded, .accumulate = true, .chunk = chunk, .transpose_out = true, .output_half = false });
         const kernel: Kernel = if (short) .convGemmWeightGradShort else .convGemmWeightGrad;
@@ -487,7 +493,7 @@ pub const Gpu = struct {
         const half_out = @typeInfo(@TypeOf(out)).pointer.child == u16;
         std.debug.assert(a.cols_padded == b.rows_padded and a.rows_padded % 128 == 0 and b.cols_padded % 64 == 0 and a.cols_padded % 32 == 0);
         const blocks = (a.rows_padded / 128) * (b.cols_padded / 64);
-        const splits = @max(1, @min(a.cols_padded / 256, (128 + blocks - 1) / blocks));
+        const splits = self.splitCount(@max(1, @min(a.cols_padded / 256, (128 + blocks - 1) / blocks)));
         const chunk = std.mem.alignForward(usize, (a.cols_padded + splits - 1) / splits, 32);
         std.debug.assert(!half_out or (chunk >= a.cols_padded and !accumulate and !transpose_out));
         if (!half_out and chunk < a.cols_padded and !accumulate) try self.fill(out, 0);
@@ -538,7 +544,8 @@ pub const Gpu = struct {
     }
 
     pub fn sumTo(self: *Gpu, in: []const f32, out: []f32, plan: ReducePlan, accumulate: bool) Error!void {
-        if (plan.mask == 0b0111 and plan.strides[3] == 1 and plan.dims[3] == out.len) {
+        const last = ga.max_rank - 1;
+        if (plan.mask == (1 << last) - 1 and plan.strides[last] == 1 and plan.dims[last] == out.len) {
             if (!accumulate) try self.fill(out, 0);
             return self.columnSums(in, out);
         }
@@ -567,7 +574,7 @@ pub const Gpu = struct {
 
     fn columnReduce(self: *Gpu, a: []const f32, b: []const f32, mean: []const f32, inv_std: []const f32, mask: []const f32, out: []f32, kind: ColumnKind, scale: f32, channels: usize) Error!void {
         const rows = a.len / channels;
-        const blocks: u32 = @min(256, ceilDiv(rows, 8 * 16));
+        const blocks: u32 = if (self.deterministic) 1 else @min(256, ceilDiv(rows, 8 * 16));
         try self.launch(.columnReduce, .{ blocks, ceilDiv(channels, 32), 1 }, .{ a, b, mean, inv_std, mask, out, rows, channels, blocks * 8, kind, scale });
     }
 
@@ -667,4 +674,65 @@ test "device memory round trip, fill, and the step arena" {
     const s3 = try gpu.scratch(f32, 10);
     try testing.expectEqual(@intFromPtr(s1.ptr), @intFromPtr(s3.ptr));
     try testing.expectError(error.OutOfMemory, gpu.scratch(u8, 1 << 30));
+}
+
+test "deterministic mode gives bit-identical results on every run, for split-K products and batch-norm statistics" {
+    const gpu = try initForTest();
+    defer gpu.deinit();
+    gpu.tensor_core_min_work = 0;
+    gpu.deterministic = true;
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(17);
+    const rng = prng.random();
+
+    const m = 64;
+    const n = 64;
+    const k = 16384;
+    const a = try gpa.alloc(f32, m * k);
+    defer gpa.free(a);
+    const b = try gpa.alloc(f32, k * n);
+    defer gpa.free(b);
+    for (a) |*v| v.* = rng.floatNorm(f32);
+    for (b) |*v| v.* = rng.floatNorm(f32);
+    const da = try gpu.alloc(f32, a.len);
+    const db = try gpu.alloc(f32, b.len);
+    const dc = try gpu.alloc(f32, m * n);
+    try gpu.upload(da, a);
+    try gpu.upload(db, b);
+
+    const rows = 20000;
+    const channels = 48;
+    const x = try gpa.alloc(f32, rows * channels);
+    defer gpa.free(x);
+    for (x) |*v| v.* = rng.floatNorm(f32) * 3 + 1;
+    const dx = try gpu.alloc(f32, x.len);
+    try gpu.upload(dx, x);
+    const mean = try gpu.alloc(f32, channels);
+    const inv_std = try gpu.alloc(f32, channels);
+    const running_mean = try gpu.alloc(f32, channels);
+    const running_var = try gpu.alloc(f32, channels);
+    try gpu.fill(running_mean, 0);
+    try gpu.fill(running_var, 1);
+
+    var first_product: [m * n]f32 = undefined;
+    var first_stats: [2 * channels]f32 = undefined;
+    for (0..2) |tensor_cores| {
+        gpu.tensor_cores = tensor_cores == 1;
+        for (0..6) |run| {
+            try gpu.matmul(da, db, dc, .{ .m = m, .n = n, .k = k }, .{});
+            try gpu.batchNormStats(dx, mean, inv_std, running_mean, running_var, true);
+            var product: [m * n]f32 = undefined;
+            var stats: [2 * channels]f32 = undefined;
+            try gpu.download(&product, dc);
+            try gpu.download(stats[0..channels], mean);
+            try gpu.download(stats[channels..], inv_std);
+            if (run == 0) {
+                first_product = product;
+                first_stats = stats;
+            } else {
+                try testing.expectEqualSlices(f32, &first_product, &product);
+                try testing.expectEqualSlices(f32, &first_stats, &stats);
+            }
+        }
+    }
 }
