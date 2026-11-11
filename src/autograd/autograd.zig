@@ -854,9 +854,13 @@ pub const Tape = struct {
                     },
                     .direct => {
                         if (c.x.needs_grad) {
-                            const dcol = try t.newTensor(Col);
-                            try tensor.matmulInto(t.gpa, t.par, grad, c.w.value, dcol, .{ .trans_b = true });
-                            try t.convKernel(.col2im, .{ dcol.data, c.x.grad.data }, d);
+                            if (device == null) {
+                                try cpu.convInputGrad(t.gpa, t.par, grad.data, c.w.value.data, c.x.grad.data, d);
+                            } else {
+                                const dcol = try t.newTensor(Col);
+                                try tensor.matmulInto(t.gpa, t.par, grad, c.w.value, dcol, .{ .trans_b = true });
+                                try t.convKernel(.col2im, .{ dcol.data, c.x.grad.data }, d);
+                            }
                         }
                         if (c.w.needs_grad) {
                             if (device == null) {

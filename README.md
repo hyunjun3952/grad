@@ -113,7 +113,7 @@ zig build bench -- cudnn        # cuDNN convolutions on the CIFAR shapes (needs 
 | --- | --- | --- |
 | MNIST MLP 784-128-10, batch 64 | CPU, 6 threads | 0.29 s (0.32 s before the element-wise ops ran on the worker pool) |
 | | GPU | 0.21 s |
-| MNIST / Fashion-MNIST CNN | CPU, 6 threads | 10.9 s (11.8 s before the convolution built its im2col matrix in cache-sized chunks, 12.8 s before the element-wise ops ran on the worker pool and the example fused batch norm with ReLU; median of five alternating runs) |
+| MNIST / Fashion-MNIST CNN | CPU, 6 threads | 9.4 s (11.0 s before the convolution input gradient also ran in chunks of images, 11.8 s before the im2col matrix was built in cache-sized chunks, 12.8 s before the element-wise ops ran on the worker pool and the example fused batch norm with ReLU; median of five alternating runs) |
 | | GPU | 0.87 s |
 | CIFAR-10 ResNet-14 64-128-256, batch 64 | GPU, bf16 tensor cores (`--tensor-cores`) | **17.2 s** |
 | | GPU, TF32 tensor cores (`--tf32`) | 25.0 s |

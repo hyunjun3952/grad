@@ -1162,7 +1162,7 @@ test "cpu element-wise ops give identical results on the worker pool and on one 
     try testing.expectEqualSlices(f32, one_x, many_x);
     try testing.expectEqualSlices(f32, &one_b, &many_b);
 }
-fn chunkedConvolution(par: lib.kernels.Parallel, out_y: []f32, out_dw: []f32) !void {
+fn chunkedConvolution(par: lib.kernels.Parallel, out_y: []f32, out_dw: []f32, out_dx: []f32) !void {
     const n = 30;
     const size = 28;
     const c_out = 4;
@@ -1171,22 +1171,25 @@ fn chunkedConvolution(par: lib.kernels.Parallel, out_y: []f32, out_dw: []f32) !v
     var t: Tape = .{ .gpa = arena.allocator(), .par = par, .training = true };
     var prng = std.Random.DefaultPrng.init(37);
     const rng = prng.random();
-    const x = try t.constant(try Tensor(f32, &.{ n, size, size, 1 }).empty(t.gpa));
+    const x = try t.leaf(try Tensor(f32, &.{ n, size, size, 1 }).empty(t.gpa));
     const w = try t.leaf(try Tensor(f32, &.{ 25, c_out }).empty(t.gpa));
     const target = try t.constant(try Tensor(f32, &.{ n, size * size * c_out }).empty(t.gpa));
     for (x.value.data) |*v| v.* = rng.floatNorm(f32);
     for (w.value.data) |*v| v.* = rng.floatNorm(f32);
     for (target.value.data) |*v| v.* = rng.floatNorm(f32);
     @memset(w.grad.data, 0);
+    @memset(x.grad.data, 0);
     const y = try t.conv2d(x, w, .{ .pad = 2 });
     const loss = try t.mse(reshape(y, &.{ n, size * size * c_out }), target);
     try t.backward(loss);
     @memcpy(out_y, y.value.data);
     @memcpy(out_dw, w.grad.data);
+    @memcpy(out_dx, x.grad.data);
 
     // Direct reference in double precision: y = sum x * w over the 5 x 5 window, dw = sum x * dy with dy = 2 (y - target) / count.
     const count: f64 = @floatFromInt(y.value.data.len);
     var want_dw: [25 * c_out]f64 = @splat(0);
+    var want_dx: [n * size * size]f64 = @splat(0);
     for (0..n) |b| {
         for (0..size) |oy| {
             for (0..size) |ox| {
@@ -1206,22 +1209,27 @@ fn chunkedConvolution(par: lib.kernels.Parallel, out_y: []f32, out_dw: []f32) !v
                         const px = ox + j % 5;
                         if (py < 2 or px < 2 or py - 2 >= size or px - 2 >= size) continue;
                         want_dw[j * c_out + oc] += @as(f64, x.value.data[(b * size + py - 2) * size + px - 2]) * dy;
+                        want_dx[(b * size + py - 2) * size + px - 2] += @as(f64, w.value.data[j * c_out + oc]) * dy;
                     }
                 }
             }
         }
     }
     for (want_dw, w.grad.data) |want, got| try testing.expectApproxEqAbs(@as(f32, @floatCast(want)), got, 1e-5);
+    for (want_dx, x.grad.data) |want, got| try testing.expectApproxEqAbs(@as(f32, @floatCast(want)), got, 1e-5);
 }
 
-test "a cpu convolution built in chunks of rows matches a direct reference, outputs and weight gradient, on one thread and on the pool" {
+test "a cpu convolution built in chunks of rows matches a direct reference, outputs and both gradients, on one thread and on the pool" {
     // 30 x 28 x 28 = 23520 positions of a 5 x 5 window: more than one chunk of the im2col matrix, with a shorter last chunk.
     var one_y: [30 * 28 * 28 * 4]f32 = undefined;
     var many_y: [30 * 28 * 28 * 4]f32 = undefined;
     var one_dw: [100]f32 = undefined;
     var many_dw: [100]f32 = undefined;
-    try chunkedConvolution(.{}, &one_y, &one_dw);
-    try chunkedConvolution(.{ .io = testing.io, .threads = 4 }, &many_y, &many_dw);
+    var one_dx: [30 * 28 * 28]f32 = undefined;
+    var many_dx: [30 * 28 * 28]f32 = undefined;
+    try chunkedConvolution(.{}, &one_y, &one_dw, &one_dx);
+    try chunkedConvolution(.{ .io = testing.io, .threads = 4 }, &many_y, &many_dw, &many_dx);
+    try testing.expectEqualSlices(f32, &one_dx, &many_dx);
     try testing.expectEqualSlices(f32, &one_y, &many_y);
     for (one_dw, many_dw) |a, b| try testing.expectApproxEqAbs(a, b, 1e-5);
 }

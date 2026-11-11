@@ -88,6 +88,29 @@ pub fn convForward(gpa: std.mem.Allocator, par: kernels.Parallel, x: []const f32
     }
 }
 
+/// Adds the input gradient of a convolution to dx: grad * w^T is formed and scattered back (col2im) for a few images at a
+/// time, which is exact because images do not overlap. w is (k*k*c) x c_out, grad is positions x c_out.
+pub fn convInputGrad(gpa: std.mem.Allocator, par: kernels.Parallel, grad: []const f32, w: []const f32, dx: []f32, d: cv.Dims) !void {
+    const kc = @as(usize, d.k) * d.k * d.c;
+    const per_image = cv.outHeight(d) * cv.outWidth(d);
+    const images = @min(@as(usize, d.n), @max(1, chunk_bytes / (per_image * kc * @sizeOf(f32))));
+    const cfg: kernels.TileConfig = .{ .trans_b = true };
+    const dcol = try gpa.alloc(f32, images * per_image * kc);
+    defer gpa.free(dcol);
+    const work = try gpa.alloc(f32, kernels.matmulTiledWorkLen(f32, cfg, par, images * per_image, d.c_out, kc));
+    defer gpa.free(work);
+    var first: usize = 0;
+    while (first < d.n) : (first += images) {
+        const count = @min(images, d.n - first);
+        const rows = count * per_image;
+        kernels.matmulTiled(f32, cfg, par, .{ .m = rows, .k = d.c_out, .n = kc, .a = grad[first * per_image * d.c_out ..][0 .. rows * d.c_out], .b = w, .out = dcol[0 .. rows * kc] }, work);
+        var part = d;
+        part.n = @intCast(count);
+        const pixels = count * @as(usize, d.h) * d.w * d.c;
+        col2im(par, dcol[0 .. rows * kc], dx[first * @as(usize, d.h) * d.w * d.c ..][0..pixels], part);
+    }
+}
+
 /// Adds the weight gradient im2col(x)^T * grad to dw, rebuilding the im2col matrix chunk by chunk. grad is positions x c_out.
 pub fn convWeightGrad(gpa: std.mem.Allocator, par: kernels.Parallel, x: []const f32, grad: []const f32, dw: []f32, d: cv.Dims) !void {
     const kc = @as(usize, d.k) * d.k * d.c;
