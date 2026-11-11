@@ -228,6 +228,7 @@ pub const Gpu = struct {
     cudnn_workspace_bytes: usize,
     graphs: std.ArrayList(cuda.Handle),
     capturing: bool,
+    multiprocessors: usize,
 
     const PlanEntry = struct { geometry: cudnn.Geometry, plan: cudnn.Plan };
 
@@ -255,6 +256,7 @@ pub const Gpu = struct {
         self.capturing = false;
         self.cu = try cuda.Cuda.open(config.device);
         errdefer self.cu.close();
+        self.multiprocessors = try self.cu.multiprocessorCount();
 
         const module = try self.cu.loadModule(gpa, ptx);
         inline for (0..kernel_count) |i| {
@@ -532,7 +534,7 @@ pub const Gpu = struct {
             for (0..shape.batch) |i| try self.matmulTensor(a[i * shape.m * shape.k ..][0 .. shape.m * shape.k], b[i * shape.k * shape.n ..][0 .. shape.k * shape.n], out[i * shape.m * shape.n ..][0 .. shape.m * shape.n], each, opts);
             return;
         }
-        const tile: usize = if (shape.n <= 32 and shape.m <= 64) 2 else if (shape.n <= 32) 1 else 0;
+        const tile = self.gemmTile(shape);
         const transpose: usize = if (opts.trans_a) 2 else if (opts.trans_b) 1 else 0;
         const kernel: Kernel = @fromBackingInt(@backingInt(Kernel.sgemmNN) + @as(u5, @intCast(tile * 3 + transpose)));
         const tile_m: usize = if (tile == 2) 32 else 128;
@@ -543,6 +545,17 @@ pub const Gpu = struct {
         if (splits > 1 and !opts.accumulate) try self.fill(out, 0);
         const kernel_shape = pack(ga.GemmShape, .{ .m = shape.m, .n = shape.n, .k = shape.k, .accumulate = opts.accumulate, .chunk = chunk, .batch = if (batched) shape.batch else 0, .stride_a = shape.m * shape.k, .stride_b = shape.k * shape.n, .stride_c = shape.m * shape.n });
         try self.launch(kernel, .{ ceilDiv(shape.n, tile_n), ceilDiv(shape.m, tile_m), if (batched) toU32(shape.batch) else ceilDiv(shape.k, chunk) }, .{ a, b, out, kernel_shape });
+    }
+
+    // Picks the f32 tile: 0 is 128 x 128, 1 is 128 x 32 (narrow products), 2 is 32 x 32 (small ones).
+    // NOTE: a small product (a GRU step has 32 rows, its weight gradients a K of 32) gets only a handful of 128 x 128
+    // blocks, and splitting K cannot help when K is short. Such a product takes the 32 x 32 tile when even the largest
+    // split leaves multiprocessors idle; otherwise the big tile with split K measured faster.
+    fn gemmTile(self: *const Gpu, shape: MatmulShape) usize {
+        if (shape.n <= 32) return if (shape.m <= 64) 2 else 1;
+        const big_blocks = shape.batch * ceilDiv(shape.m, 128) * ceilDiv(shape.n, 128);
+        const most_splits = if (shape.batch > 1) 1 else self.splitCount(@max(1, shape.k / 256));
+        return if (big_blocks * most_splits < self.multiprocessors) 2 else 0;
     }
 
     /// A bf16 matrix padded to whole tiles, ready for the tensor core kernels.
@@ -763,11 +776,11 @@ pub const Gpu = struct {
     }
 
     pub fn softmax(self: *Gpu, x: anytype, y: anytype, cols: usize, period: usize) Error!void {
-        try self.launchFlat(if (isHalf(y)) .softmaxRowsHalf else .softmaxRows, x.len / cols, .{ x, y, x.len / cols, cols, period });
+        try self.launchFlat(if (isHalf(y)) .softmaxRowsHalf else .softmaxRows, 32 * (x.len / cols), .{ x, y, x.len / cols, cols, period });
     }
 
     pub fn softmaxBackward(self: *Gpu, y: anytype, dy: anytype, dx: anytype, cols: usize) Error!void {
-        try self.launchFlat(if (isHalf(dx)) .softmaxBackwardHalf else .softmaxBackward, y.len / cols, .{ y, dy, dx, y.len / cols, cols });
+        try self.launchFlat(if (isHalf(dx)) .softmaxBackwardHalf else .softmaxBackward, 32 * (y.len / cols), .{ y, dy, dx, y.len / cols, cols });
     }
 
     pub fn toHalf(self: *Gpu, x: []const f32, y: []u16) Error!void {
@@ -825,8 +838,8 @@ pub const Gpu = struct {
     pub fn crossEntropy(self: *Gpu, logits: []const f32, logp: []f32, labels: []const u8, loss: []f32, cols: usize, smoothing: f32) Error!void {
         const rows = labels.len;
         const row_loss = try self.scratch(f32, rows);
-        try self.launchFlat(.crossEntropyRows, rows, .{ logits, logp, labels, row_loss, rows, cols, smoothing });
-        try self.launchFlat(.crossEntropyMean, 1, .{ row_loss, loss, rows });
+        try self.launchFlat(.crossEntropyRows, 32 * rows, .{ logits, logp, labels, row_loss, rows, cols, smoothing });
+        try self.launchFlat(.crossEntropyMean, 256, .{ row_loss, loss, rows });
     }
 
     pub fn crossEntropyBackward(self: *Gpu, logp: []const f32, labels: []const u8, grad: []f32, loss_grad: []const f32, cols: usize, smoothing: f32) Error!void {

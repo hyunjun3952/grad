@@ -210,6 +210,8 @@ pub fn main(init: std.process.Init) !void {
     try out.print("character-level Transformer, {d} blocks, width {d}, {d} heads, context {d}, {d} characters of text, {s}\n", .{ 3, width, heads, context, text.len, if (gpu != null) "GPU" else "CPU" });
     try out.flush();
 
+    // NOTE: the training time excludes start-up and the sample, so runs can be compared; the loss read-back each step synchronizes the device.
+    const started = std.Io.Clock.awake.now(init.io);
     var running: f64 = 0;
     for (0..iterations) |iteration| {
         for (0..batch) |row| {
@@ -240,6 +242,8 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    const seconds = @as(f64, @floatFromInt(std.Io.Clock.awake.now(init.io).nanoseconds - started.nanoseconds)) / 1e9;
+    try out.print("training took {d:.2} s\n", .{seconds});
     if (gpu) |dev| try dev.printProfile(out);
     try out.writeAll("\n--- sample ---\n");
     try generate(par, gpa, model, rng, out, "ROMEO:", 600);

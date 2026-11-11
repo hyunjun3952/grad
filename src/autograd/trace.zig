@@ -4,7 +4,7 @@ const Allocator = std.mem.Allocator;
 pub const max_inputs = 5;
 pub const max_rank = 6;
 
-pub const Op = enum { gru_update, gru_reset_h, gru_next, add, mul, matmul, batched_matmul, embedding, layer_norm, softmax, relu, sigmoid, tanh, gelu, conv, max_pool, avg_pool, batch_norm, batch_norm_relu, add_relu, cast };
+pub const Op = enum { gru_update, gru_reset_h, gru_next, linear, add, mul, matmul, batched_matmul, embedding, layer_norm, softmax, relu, sigmoid, tanh, gelu, conv, max_pool, avg_pool, batch_norm, batch_norm_relu, add_relu, cast };
 
 pub const View = struct {
     id: usize,

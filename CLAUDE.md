@@ -25,6 +25,7 @@ zig build -Dtarget=x86_64-linux-gnu --prefix zig-out-linux   # Linux compile che
 - Datasets and cuDNN come from `scripts/fetch-data.ps1` and `scripts/fetch-cudnn.ps1` into `data/` (gitignored). `scripts/check-onnx.py` needs `pip install numpy onnx`.
 - Do not rebuild (`zig build cifar`, `zig build`) while a long run is using `zig-out\bin\*.exe`: Windows locks the executable. Copy the exe elsewhere before a long background run. `zig build test` does not touch it.
 - When timing GPU work, do not run anything else on the GPU at the same time; epoch times drift by 5 to 10% between sessions, so compare within one session.
+- Compare two builds with `scripts/compare.ps1` (alternating runs after a warm-up, min and median) on the time a program prints (`training took`, the epoch time), not on whole-process time; that keeps five rounds within about 1%. Its parameter is `-ProgramArgs`: a parameter named `Args` collides with PowerShell's automatic variable and silently passes nothing.
 
 ## Architecture (the parts that need several files to understand)
 

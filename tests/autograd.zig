@@ -358,6 +358,32 @@ fn LayerNormNet(comptime rows: usize, comptime cols: usize) type {
     };
 }
 
+// A fully connected layer in one op, wide enough that the GPU product takes its larger tiles too.
+fn LinearNet(comptime rows: usize, comptime n_in: usize, comptime n_out: usize) type {
+    return struct {
+        const X = Tensor(f32, &.{ rows, n_in });
+        const W = Tensor(f32, &.{ n_in, n_out });
+        const B = Tensor(f32, &.{n_out});
+        const Y = Tensor(f32, &.{ rows, n_out });
+
+        pub const Inputs = struct { x: X, w: W, b: B, y: Y };
+        pub const names = .{ "x", "w", "b", "y" };
+        pub const labels: [rows]u8 = @splat(0);
+        const Result = struct { loss: Var(Tensor(f32, &.{})), x: Var(X), w: Var(W), b: Var(B), y: Var(Y) };
+
+        pub fn build(t: *Tape, p: Inputs, _: []const u8) !Result {
+            const x = try t.leaf(p.x);
+            const w = try t.leaf(p.w);
+            const b = try t.leaf(p.b);
+            const y = try t.leaf(p.y);
+            return .{ .loss = try t.mse(try t.linear(x, w, b), y), .x = x, .w = w, .b = b, .y = y };
+        }
+
+        pub fn acceptable(_: Allocator, _: Inputs) !bool {
+            return true;
+        }
+    };
+}
 // Both halves of a GRU step chained: every input of gruGates and gruNext receives a gradient, and the update gate feeds both.
 const GruOpsNet = struct {
     const Wide = Tensor(f32, &.{ 3, 15 });
@@ -411,12 +437,12 @@ fn BatchedNet(comptime trans_b: bool) type {
     };
 }
 
-fn SoftmaxNet(comptime period: usize) type {
+fn SoftmaxNet(comptime period: usize, comptime rows: usize, comptime cols: usize) type {
     return struct {
-        const X = Tensor(f32, &.{ 6, 3 });
+        const X = Tensor(f32, &.{ rows, cols });
         pub const Inputs = struct { x: X, y: X };
         pub const names = .{ "x", "y" };
-        pub const labels: [6]u8 = @splat(0);
+        pub const labels: [rows]u8 = @splat(0);
         const Result = struct { loss: Var(Tensor(f32, &.{})), x: Var(X), y: Var(X) };
 
         pub fn build(t: *Tape, p: Inputs, _: []const u8) !Result {
@@ -430,6 +456,29 @@ fn SoftmaxNet(comptime period: usize) type {
         }
     };
 }
+
+// Rows wider than a warp and not a multiple of its width, and more rows than a block has threads, with label smoothing.
+const WideCrossEntropyNet = struct {
+    const X = Tensor(f32, &.{ 300, 200 });
+    pub const Inputs = struct { x: X };
+    pub const names = .{"x"};
+    pub const labels: [300]u8 = blk: {
+        var values: [300]u8 = undefined;
+        for (&values, 0..) |*v, i| v.* = @intCast(i * 7 % 200);
+        break :blk values;
+    };
+    pub const smoothing: f32 = 0.1;
+    const Result = struct { loss: Var(Tensor(f32, &.{})), x: Var(X) };
+
+    pub fn build(t: *Tape, p: Inputs, label_slice: []const u8) !Result {
+        const x = try t.leaf(p.x);
+        return .{ .loss = try t.crossEntropy(x, label_slice), .x = x };
+    }
+
+    pub fn acceptable(_: Allocator, _: Inputs) !bool {
+        return true;
+    }
+};
 
 const SmoothedNet = struct {
     pub const Inputs = SmallNet.Inputs;
@@ -1034,11 +1083,20 @@ test "softmax rows, with and without a causal mask, have correct values and grad
     const p = try t.softmax(x, 3);
     try testing.expectEqualSlices(f32, &.{ 1, 0, 0, 0.5, 0.5, 0, 0.09003057, 0.24472848, 0.66524094 }, p.value.data);
     inline for (.{ 0, 3 }) |period| {
-        try gradcheck.expectFiniteDifferences(SoftmaxNet(period), 7, 1e-2, 3e-3);
-        try gradcheck.expectGpuMatchesCpu(SoftmaxNet(period), 8, 1e-5);
+        try gradcheck.expectFiniteDifferences(SoftmaxNet(period, 6, 3), 7, 1e-2, 3e-3);
+        try gradcheck.expectGpuMatchesCpu(SoftmaxNet(period, 6, 3), 8, 1e-5);
     }
+    // Rows wider than a warp, one of them causal with a period shorter than the row (the rest of the row is masked).
+    try gradcheck.expectGpuMatchesCpu(SoftmaxNet(0, 37, 200), 15, 1e-5);
+    try gradcheck.expectGpuMatchesCpu(SoftmaxNet(40, 40, 200), 16, 1e-5);
+    try gradcheck.expectGpuMatchesCpu(WideCrossEntropyNet, 17, 1e-4);
 }
 
+test "linear has correct gradients for the input, the weights and the bias, on the cpu and the gpu" {
+    try gradcheck.expectFiniteDifferences(LinearNet(4, 3, 5), 18, 1e-2, 3e-3);
+    try gradcheck.expectGpuMatchesCpu(LinearNet(4, 3, 5), 19, 1e-5);
+    try gradcheck.expectGpuMatchesCpu(LinearNet(130, 70, 150), 20, 1e-4);
+}
 test "the fused gru ops have correct gradients for every input, on the cpu and the gpu" {
     try gradcheck.expectFiniteDifferences(GruOpsNet, 11, 1e-2, 5e-3);
     try gradcheck.expectGpuMatchesCpu(GruOpsNet, 12, 1e-5);

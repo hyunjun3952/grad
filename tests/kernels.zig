@@ -67,16 +67,46 @@ fn expectSameResult(comptime T: type, par: Parallel, m: usize, k: usize, n: usiz
     try expectTiledCombos(T, dflt, par, problem, .{ at, bt }, want, work_dflt);
 }
 
-test "parallel tiled matmul matches in both split directions" {
+test "parallel tiled matmul matches in every split direction" {
     const par: Parallel = .{ .io = std.testing.io, .threads = 4 };
     const by_rows = splitFor(f32, .{}, par, 200, 193, 197);
     const by_cols = splitFor(f32, .{}, par, 150, 200, 260);
-    try std.testing.expect(by_rows.by_rows and by_rows.parts > 1);
-    try std.testing.expect(!by_cols.by_rows and by_cols.parts > 1);
+    // Few outputs and a long K, the shape of a convolution weight gradient: the parts split K.
+    const by_depth = splitFor(f32, .{}, par, 12, 40000, 10);
+    try std.testing.expect(by_rows.axis == .rows and by_rows.parts > 1);
+    try std.testing.expect(by_cols.axis == .cols and by_cols.parts > 1);
+    try std.testing.expect(by_depth.axis == .depth and by_depth.parts > 1);
 
     try expectSameResult(f32, par, 200, 193, 197);
     try expectSameResult(f32, par, 150, 200, 260);
     try expectSameResult(f64, par, 120, 150, 140);
+    try expectSameResult(f32, par, 12, 40000, 10);
+    try expectSameResult(f64, par, 6, 200001, 4);
+}
+
+test "a product split along K adds to the output when accumulate is set" {
+    const gpa = std.testing.allocator;
+    const par: Parallel = .{ .io = std.testing.io, .threads = 4 };
+    const m = 12;
+    const k = 40000;
+    const n = 10;
+    const a = try gpa.alloc(f32, m * k);
+    defer gpa.free(a);
+    const b = try gpa.alloc(f32, k * n);
+    defer gpa.free(b);
+    for (a, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 7)) - 3;
+    for (b, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 5)) - 2;
+    var want: [m * n]f32 = undefined;
+    matmulNaive(f32, .{ .m = m, .k = k, .n = n, .a = a, .b = b, .out = &want });
+    for (&want) |*w| w.* += 1;
+
+    const cfg: TileConfig = .{ .accumulate = true };
+    try std.testing.expect(splitFor(f32, cfg, par, m, k, n).axis == .depth);
+    const work = try gpa.alloc(f32, matmulTiledWorkLen(f32, cfg, par, m, k, n));
+    defer gpa.free(work);
+    var got: [m * n]f32 = @splat(1);
+    matmulTiled(f32, cfg, par, .{ .m = m, .k = k, .n = n, .a = a, .b = b, .out = &got }, work);
+    try std.testing.expectEqualSlices(f32, &want, &got);
 }
 
 test "flushDenormals makes subnormal results zero on the calling thread only" {

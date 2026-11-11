@@ -1,3 +1,4 @@
+const std = @import("std");
 const act = @import("math/activation.zig");
 const aug = @import("math/augment.zig");
 const bf16 = @import("math/bf16.zig");
@@ -49,6 +50,25 @@ inline fn warpSum(value: f32) f32 {
     return total;
 }
 
+// The largest value across the 32 lanes of a warp; every lane gets it. All lanes of the warp must call it together.
+inline fn warpMax(value: f32) f32 {
+    var best = value;
+    inline for (.{ 16, 8, 4, 2, 1 }) |offset| {
+        const other = asm volatile ("shfl.sync.bfly.b32 %[out], %[in], %[offset], 0x1f, 0xffffffff;"
+            : [out] "=r" (-> u32),
+            : [in] "r" (@as(u32, @bitCast(best))),
+              [offset] "r" (@as(u32, offset)),
+        );
+        best = @max(best, @as(f32, @bitCast(other)));
+    }
+    return best;
+}
+
+// The row a warp works on when a kernel runs one warp per row (eight rows per block of 256 threads), and the lane within it.
+inline fn warpRow() struct { row: usize, lane: usize } {
+    const tid: usize = @workItemId(0);
+    return .{ .row = @as(usize, @workGroupId(0)) * 8 + tid / 32, .lane = tid % 32 };
+}
 // Waits until every thread of the block has reached this point.
 inline fn barrier() void {
     asm volatile ("bar.sync 0;" ::: .{ .memory = true });
@@ -360,11 +380,24 @@ export fn embeddingScatterHalf(dy: [*]const u16, ids: [*]const u32, dtable: [*]f
     embeddingScatterOf(u16, dy, ids, dtable, n, width);
 }
 
+// NOTE: one warp per row, like layer norm. The masked columns past the causal limit are written as zero.
 inline fn softmaxRowsOf(comptime E: type, x: [*]const E, y: [*]E, rows: u32, cols: u32, period: u32) void {
-    const r = globalIndex();
-    if (r < rows) soft.forwardRow(E, x + r * cols, y + r * cols, cols, soft.limitOf(r, cols, period));
+    const at = warpRow();
+    if (at.row >= rows) return;
+    const xr = x + at.row * cols;
+    const yr = y + at.row * cols;
+    const limit = soft.limitOf(at.row, cols, period);
+    var largest: f32 = -std.math.inf(f32);
+    var j = at.lane;
+    while (j < limit) : (j += 32) largest = @max(largest, bf16.load(E, xr, j));
+    largest = warpMax(largest);
+    var total: f32 = 0;
+    j = at.lane;
+    while (j < limit) : (j += 32) total += act.exponential(bf16.load(E, xr, j) - largest);
+    const inverse = 1 / warpSum(total);
+    j = at.lane;
+    while (j < cols) : (j += 32) bf16.store(E, yr, j, if (j < limit) act.exponential(bf16.load(E, xr, j) - largest) * inverse else 0);
 }
-
 export fn softmaxRows(x: [*]const f32, y: [*]f32, rows: u32, cols: u32, period: u32) callconv(.nvptx_kernel) void {
     softmaxRowsOf(f32, x, y, rows, cols, period);
 }
@@ -374,10 +407,16 @@ export fn softmaxRowsHalf(x: [*]const u16, y: [*]u16, rows: u32, cols: u32, peri
 }
 
 inline fn softmaxBackwardOf(comptime E: type, y: [*]const E, dy: [*]const E, dx: [*]E, rows: u32, cols: u32) void {
-    const r = globalIndex();
-    if (r < rows) soft.backwardRow(E, y + r * cols, dy + r * cols, dx + r * cols, cols);
+    const at = warpRow();
+    if (at.row >= rows) return;
+    const base = at.row * cols;
+    var dot: f32 = 0;
+    var j = at.lane;
+    while (j < cols) : (j += 32) dot += bf16.load(E, y + base, j) * bf16.load(E, dy + base, j);
+    dot = warpSum(dot);
+    j = at.lane;
+    while (j < cols) : (j += 32) bf16.store(E, dx + base, j, bf16.load(E, dx + base, j) + bf16.load(E, y + base, j) * (bf16.load(E, dy + base, j) - dot));
 }
-
 export fn softmaxBackward(y: [*]const f32, dy: [*]const f32, dx: [*]f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
     softmaxBackwardOf(f32, y, dy, dx, rows, cols);
 }
@@ -660,34 +699,38 @@ export fn batchNormGradInputHalf(io: nm.GradIo(u16), p: nm.Affine, l: nm.Layout)
 
 // ***** losses *****
 
+// One warp per row: the log-probabilities of the row and its loss, with label smoothing.
 export fn crossEntropyRows(x: [*]const f32, logp: [*]f32, labels: [*]const u8, row_loss: [*]f32, rows: u32, cols: u32, smoothing: f32) callconv(.nvptx_kernel) void {
-    const r = globalIndex();
-    if (r >= rows) return;
-    const base = r * cols;
-    var mx = x[base];
-    var j: usize = 1;
-    while (j < cols) : (j += 1) mx = @max(mx, x[base + j]);
+    const at = warpRow();
+    if (at.row >= rows) return;
+    const base = at.row * cols;
+    var largest: f32 = -std.math.inf(f32);
+    var j = at.lane;
+    while (j < cols) : (j += 32) largest = @max(largest, x[base + j]);
+    largest = warpMax(largest);
     var total: f32 = 0;
-    j = 0;
-    while (j < cols) : (j += 1) total += expf(x[base + j] - mx);
-    const shift = mx + logf(total);
+    j = at.lane;
+    while (j < cols) : (j += 32) total += expf(x[base + j] - largest);
+    const shift = largest + logf(warpSum(total));
     var logp_sum: f32 = 0;
-    j = 0;
-    while (j < cols) : (j += 1) {
+    j = at.lane;
+    while (j < cols) : (j += 32) {
         logp[base + j] = x[base + j] - shift;
         logp_sum += logp[base + j];
     }
-    row_loss[r] = -(1 - smoothing) * logp[base + labels[r]] - smoothing / @as(f32, @floatFromInt(cols)) * logp_sum;
+    logp_sum = warpSum(logp_sum);
+    if (at.lane == 0) row_loss[at.row] = -(1 - smoothing) * (x[base + labels[at.row]] - shift) - smoothing / @as(f32, @floatFromInt(cols)) * logp_sum;
 }
 
+// One block of 256 threads sums the row losses.
 export fn crossEntropyMean(row_loss: [*]const f32, out: [*]f32, rows: u32) callconv(.nvptx_kernel) void {
-    if (globalIndex() != 0) return;
+    const tid: usize = @workItemId(0);
     var total: f32 = 0;
-    var r: usize = 0;
-    while (r < rows) : (r += 1) total += row_loss[r];
-    out[0] = total / @as(f32, @floatFromInt(rows));
+    var r = tid;
+    while (r < rows) : (r += threads) total += row_loss[r];
+    const sum = blockSum(total, tid);
+    if (tid == 0) out[0] = sum / @as(f32, @floatFromInt(rows));
 }
-
 export fn crossEntropyBackward(logp: [*]const f32, labels: [*]const u8, grad: [*]f32, loss_grad: [*]const f32, rows: u32, cols: u32, smoothing: f32) callconv(.nvptx_kernel) void {
     const t = globalIndex();
     if (t >= @as(usize, rows) * cols) return;

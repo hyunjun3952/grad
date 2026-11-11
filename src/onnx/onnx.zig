@@ -236,6 +236,11 @@ const Builder = struct {
             .add => try self.node("Add", &.{ try self.use(e.inputs[0]), try self.use(e.inputs[1]) }, out, &.{}),
             .mul => try self.node("Mul", &.{ try self.use(e.inputs[0]), try self.use(e.inputs[1]) }, out, &.{}),
             .matmul => try self.node("MatMul", &.{ try self.use(e.inputs[0]), try self.use(e.inputs[1]) }, out, &.{}),
+            .linear => {
+                const product = try self.fresh("product");
+                try self.node("MatMul", &.{ try self.use(e.inputs[0]), try self.use(e.inputs[1]) }, product, &.{});
+                try self.node("Add", &.{ product, try self.use(e.inputs[2]) }, out, &.{});
+            },
             .gru_update, .gru_reset_h => {
                 // NOTE: the fused kernel is written out as the gate arithmetic it replaces, so any ONNX runtime can read it.
                 const hidden = e.output.dims[1];

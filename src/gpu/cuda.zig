@@ -10,6 +10,7 @@ const Api = struct {
     cuInit: *const fn (flags: c_uint) callconv(.c) Status,
     cuDeviceGet: *const fn (device: *c_int, ordinal: c_int) callconv(.c) Status,
     cuDeviceGetCount: *const fn (count: *c_int) callconv(.c) Status,
+    cuDeviceGetAttribute: *const fn (value: *c_int, attribute: c_int, device: c_int) callconv(.c) Status,
     cuDevicePrimaryCtxRetain: *const fn (ctx: *Handle, device: c_int) callconv(.c) Status,
     cuCtxSetCurrent: *const fn (ctx: Handle) callconv(.c) Status,
     cuCtxSynchronize: *const fn () callconv(.c) Status,
@@ -85,6 +86,14 @@ pub const Cuda = struct {
         if (api.cuInit(0) != 0) return 0;
         var count: c_int = 0;
         if (api.cuDeviceGetCount(&count) != 0) return 0;
+        return @intCast(count);
+    }
+
+    /// Returns the number of streaming multiprocessors of the device.
+    pub fn multiprocessorCount(self: *const Cuda) !usize {
+        const multiprocessor_count_attribute = 16;
+        var count: c_int = 0;
+        try self.check(self.api.cuDeviceGetAttribute(&count, multiprocessor_count_attribute, self.device));
         return @intCast(count);
     }
 

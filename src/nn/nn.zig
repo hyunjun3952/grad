@@ -68,6 +68,7 @@ pub fn Linear(comptime n_in: usize, comptime n_out: usize) type {
         }
 
         pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(Tensor(@TypeOf(x.value).Elem, &.{ @TypeOf(x.value).shape[0], n_out })) {
+            if (@TypeOf(x.value).Elem == f32) return tape.linear(x, self.w, self.b);
             // NOTE: for bf16 activations the f32 weights are rounded inside the product and the bias is rounded here.
             return tape.add(try tape.matmul(x, self.w), try tape.cast(self.b, @TypeOf(x.value).Elem));
         }

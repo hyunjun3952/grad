@@ -294,6 +294,37 @@ pub const Tape = struct {
         return out;
     }
 
+    /// Multiplies x (rows, n_in) by w (n_in, n_out) and adds the bias b (n_out) to every row: the body of a fully connected layer.
+    /// NOTE: one op instead of matmul followed by add: the bias goes into the product in place and the backward pass writes
+    /// the gradients of x and w straight from the output gradient, which saves a buffer and a launch per layer and step.
+    pub fn linear(self: *Tape, x: anytype, w: anytype, b: anytype) Error!Var(tensor.MatmulResult(@TypeOf(x.value), @TypeOf(w.value), .{})) {
+        const Out = tensor.MatmulResult(@TypeOf(x.value), @TypeOf(w.value), .{});
+        const B = @TypeOf(b.value);
+        comptime if (Out.Elem != f32 or B.Elem != f32 or B.rank != 1 or B.shape[0] != Out.shape[1]) @compileError("linear takes f32 activations and an f32 bias with one value per output column");
+        const value = try self.newTensor(Out);
+        try tensor.matmulInto(self.gpa, self.par, x.value, w.value, value, .{});
+        if (self.par.gpu) |dev| {
+            const bc = comptime ops.broadcast(Out.shape, B.shape);
+            // Reading and writing the same element is safe, so the sum is formed in the product's own buffer.
+            try dev.elementwise(.add, value.data, b.value.data, value.data, .{ .dims = padToRank(&bc.dims, 1), .a_strides = padToRank(&bc.a, 0), .b_strides = padToRank(&bc.b, 0) });
+        } else {
+            for (0..Out.shape[0]) |r| {
+                for (value.data[r * B.len ..][0..B.len], b.value.data) |*v, bias| v.* += bias;
+            }
+        }
+        const out = try self.makeVar(value, x.needs_grad or w.needs_grad or b.needs_grad);
+        try self.note(.linear, .{ x, w, b }, out, .{});
+        const Ctx = struct { x: @TypeOf(x), w: @TypeOf(w), b: @TypeOf(b), out: @TypeOf(out) };
+        if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .w = w, .b = b, .out = out }, struct {
+            fn run(t: *Tape, c: *const Ctx) Error!void {
+                if (c.x.needs_grad) try tensor.matmulInto(t.gpa, t.par, c.out.grad, c.w.value, c.x.grad, .{ .trans_b = true, .accumulate = true });
+                if (c.w.needs_grad) try tensor.matmulInto(t.gpa, t.par, c.x.value, c.out.grad, c.w.grad, .{ .trans_a = true, .accumulate = true });
+                try t.accumulateGrad(c.b, c.out.grad);
+            }
+        }.run);
+        return out;
+    }
+
     /// Applies max(x, 0) element by element.
     pub fn relu(self: *Tape, x: anytype) Error!Var(@TypeOf(x.value)) {
         var value: @TypeOf(x.value) = undefined;

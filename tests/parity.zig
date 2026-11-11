@@ -25,6 +25,9 @@ test "gpu matmul, f32 and bf16 tensor cores, matches the cpu reference for every
         .{ 1, 1, 1 },      .{ 5, 7, 3 },       .{ 64, 64, 16 },   .{ 65, 70, 17 },
         .{ 130, 33, 200 }, .{ 784, 128, 64 },  .{ 64, 10, 128 },  .{ 200, 300, 784 },
         .{ 25, 16, 4000 }, .{ 400, 32, 4099 }, .{ 512, 64, 576 }, .{ 300, 130, 96 },
+        // Few rows or few columns: these go to the smaller tiles chosen by block count (a GRU step has 32 rows).
+        .{ 32, 768, 128 }, .{ 32, 512, 256 },  .{ 32, 256, 768 }, .{ 256, 768, 32 },
+        .{ 100, 600, 40 },
     };
     for (shapes) |s| {
         for ([_][2]bool{ .{ false, false }, .{ true, false }, .{ false, true } }) |t| {

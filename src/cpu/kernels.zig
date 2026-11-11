@@ -191,7 +191,7 @@ fn tiledDims(comptime T: type, comptime cfg: TileConfig, k: usize, n: usize) Til
     };
 }
 
-const Split = struct { by_rows: bool, parts: usize, chunk: usize };
+const Split = struct { axis: enum { rows, cols, depth }, parts: usize, chunk: usize };
 
 pub fn parallelFor(par: Parallel, len: usize, min_chunk: usize, ctx: anytype, comptime body: fn (@TypeOf(ctx), usize, usize) void) void {
     const parts = if (par.io == null) 1 else @max(1, @min(par.threads, max_workers + 1, len / min_chunk));
@@ -240,14 +240,21 @@ pub fn splitFor(comptime T: type, comptime cfg: TileConfig, par: Parallel, m: us
     const tiles = ((if (by_rows) m else n) + unit - 1) / unit;
     const by_work = 2 * m * k * n / min_flops_per_part;
     const want = if (par.io == null) 1 else @max(1, @min(par.threads, max_workers + 1, by_work));
+    // NOTE: a product with fewer output tiles than threads and a long K (the weight gradient of a convolution, such as
+    // 25 x 16 outputs summed over 36864 positions) would leave threads idle and pack all of B in every part, so it is
+    // split along K instead; each part sums its range into its own buffer and the buffers are added in order.
+    if (tiles < want and k >= want * cfg.kc) {
+        const per = roundUp((k + want - 1) / want, cfg.kc);
+        return .{ .axis = .depth, .chunk = per, .parts = (k + per - 1) / per };
+    }
     const per = (tiles + want - 1) / want;
-    return .{ .by_rows = by_rows, .chunk = per * unit, .parts = (tiles + per - 1) / per };
+    return .{ .axis = if (by_rows) .rows else .cols, .chunk = per * unit, .parts = (tiles + per - 1) / per };
 }
 
 fn partWorkLen(comptime T: type, comptime cfg: TileConfig, s: Split, m: usize, k: usize, n: usize) usize {
-    _ = m;
-    const d = tiledDims(T, cfg, k, if (s.by_rows) n else @min(n, s.chunk));
-    return d.kc * d.nc;
+    const d = tiledDims(T, cfg, k, if (s.axis == .cols) @min(n, s.chunk) else n);
+    // A part of a K split also needs its own output.
+    return d.kc * d.nc + if (s.axis == .depth) m * n else 0;
 }
 
 pub fn matmulTiledWorkLen(comptime T: type, comptime cfg: TileConfig, par: Parallel, m: usize, k: usize, n: usize) usize {
@@ -322,7 +329,8 @@ pub fn matmulTiled(comptime T: type, comptime cfg: TileConfig, par: Parallel, p:
     const s = splitFor(T, cfg, par, p.m, p.k, p.n);
     const part_len = partWorkLen(T, cfg, s, p.m, p.k, p.n);
     std.debug.assert(work.len >= s.parts * part_len);
-    if (s.parts == 1) return matmulTiledRange(T, cfg, p, .{ 0, p.m }, .{ 0, p.n }, work);
+    const whole: Range = .{ .rows = .{ 0, p.m }, .cols = .{ 0, p.n }, .depth = .{ 0, p.k } };
+    if (s.parts == 1) return matmulTiledRange(T, cfg, p, whole, work);
 
     const Ctx = struct { s: Split, part_len: usize, p: Problem(T), work: []T };
     const Task = struct {
@@ -330,21 +338,43 @@ pub fn matmulTiled(comptime T: type, comptime cfg: TileConfig, par: Parallel, p:
             const c: *const Ctx = @ptrCast(@alignCast(raw));
             const lo = part * c.s.chunk;
             const w = c.work[part * c.part_len ..][0..c.part_len];
-            if (c.s.by_rows) {
-                matmulTiledRange(T, cfg, c.p, .{ lo, @min(lo + c.s.chunk, c.p.m) }, .{ 0, c.p.n }, w);
-            } else {
-                matmulTiledRange(T, cfg, c.p, .{ 0, c.p.m }, .{ lo, @min(lo + c.s.chunk, c.p.n) }, w);
+            var range: Range = .{ .rows = .{ 0, c.p.m }, .cols = .{ 0, c.p.n }, .depth = .{ 0, c.p.k } };
+            switch (c.s.axis) {
+                .rows => range.rows = .{ lo, @min(lo + c.s.chunk, c.p.m) },
+                .cols => range.cols = .{ lo, @min(lo + c.s.chunk, c.p.n) },
+                .depth => range.depth = .{ lo, @min(lo + c.s.chunk, c.p.k) },
             }
+            if (c.s.axis != .depth or part == 0) return matmulTiledRange(T, cfg, c.p, range, w);
+            // Later parts of a K split write a private output that starts at zero; the caller adds them in order.
+            const fresh = comptime blk: {
+                var copy = cfg;
+                copy.accumulate = false;
+                break :blk copy;
+            };
+            var own = c.p;
+            own.out = w[w.len - c.p.m * c.p.n ..];
+            matmulTiledRange(T, fresh, own, range, w);
         }
     };
     const ctx: Ctx = .{ .s = s, .part_len = part_len, .p = p, .work = work };
     parallelRun(par, s.parts, &ctx, Task.run);
+    if (s.axis == .depth) {
+        const out = p.out[0 .. p.m * p.n];
+        for (1..s.parts) |part| {
+            const own = work[(part + 1) * part_len - p.m * p.n ..][0 .. p.m * p.n];
+            for (out, own) |*o, v| o.* += v;
+        }
+    }
 }
 
-fn matmulTiledRange(comptime T: type, comptime cfg: TileConfig, p: Problem(T), rows: [2]usize, cols: [2]usize, work: []T) void {
+// The rows, columns and K range one part of a split product computes.
+const Range = struct { rows: [2]usize, cols: [2]usize, depth: [2]usize };
+
+fn matmulTiledRange(comptime T: type, comptime cfg: TileConfig, p: Problem(T), range: Range, work: []T) void {
     const m, const k, const n, const a, const out = .{ p.m, p.k, p.n, p.a, p.out };
-    const r0, const r1 = rows;
-    const c0, const c1 = cols;
+    const r0, const r1 = range.rows;
+    const c0, const c1 = range.cols;
+    const k0, const k1 = range.depth;
     const MR = cfg.mr;
     const NV = cfg.nv;
     const MC = cfg.mc;
@@ -369,9 +399,9 @@ fn matmulTiledRange(comptime T: type, comptime cfg: TileConfig, p: Problem(T), r
     var jc: usize = c0;
     while (jc < c1) : (jc += NC) {
         const nc = @min(NC, c1 - jc);
-        var pc: usize = 0;
-        while (pc < k) : (pc += KC) {
-            const kc = @min(KC, k - pc);
+        var pc: usize = k0;
+        while (pc < k1) : (pc += KC) {
+            const kc = @min(KC, k1 - pc);
             packB(T, NR, cfg.trans_b, p, .{ .pc = pc, .jc = jc, .kc = kc, .nc = nc }, b_pack);
 
             var ic: usize = r0;
