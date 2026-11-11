@@ -163,7 +163,7 @@ pub fn Conv2d(comptime c_in: usize, comptime c_out: usize, comptime k: usize, co
             return .{ .inner = try self.inner.toGpu(gpu) };
         }
 
-        pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(Tensor(f32, &.{ @TypeOf(x.value).shape[0], (@TypeOf(x.value).shape[1] + 2 * opts.pad - k) / opts.stride + 1, (@TypeOf(x.value).shape[2] + 2 * opts.pad - k) / opts.stride + 1, c_out })) {
+        pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(Tensor(@TypeOf(x.value).Elem, &.{ @TypeOf(x.value).shape[0], (@TypeOf(x.value).shape[1] + 2 * opts.pad - k) / opts.stride + 1, (@TypeOf(x.value).shape[2] + 2 * opts.pad - k) / opts.stride + 1, c_out })) {
             return tape.add(try tape.conv2d(x, self.inner.w, opts), self.inner.b);
         }
 
@@ -202,11 +202,11 @@ pub fn ConvBn(comptime c_in: usize, comptime c_out: usize, comptime k: usize, co
             return .{ .conv = try self.conv.toGpu(gpu), .norm = try self.norm.toGpu(gpu) };
         }
 
-        pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(Tensor(f32, &.{ @TypeOf(x.value).shape[0], (@TypeOf(x.value).shape[1] + 2 * opts.pad - k) / opts.stride + 1, (@TypeOf(x.value).shape[2] + 2 * opts.pad - k) / opts.stride + 1, c_out })) {
+        pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(Tensor(@TypeOf(x.value).Elem, &.{ @TypeOf(x.value).shape[0], (@TypeOf(x.value).shape[1] + 2 * opts.pad - k) / opts.stride + 1, (@TypeOf(x.value).shape[2] + 2 * opts.pad - k) / opts.stride + 1, c_out })) {
             return self.norm.forward(tape, try tape.conv2d(x, self.conv.inner.w, opts));
         }
 
-        pub fn forwardRelu(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(Tensor(f32, &.{ @TypeOf(x.value).shape[0], (@TypeOf(x.value).shape[1] + 2 * opts.pad - k) / opts.stride + 1, (@TypeOf(x.value).shape[2] + 2 * opts.pad - k) / opts.stride + 1, c_out })) {
+        pub fn forwardRelu(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(Tensor(@TypeOf(x.value).Elem, &.{ @TypeOf(x.value).shape[0], (@TypeOf(x.value).shape[1] + 2 * opts.pad - k) / opts.stride + 1, (@TypeOf(x.value).shape[2] + 2 * opts.pad - k) / opts.stride + 1, c_out })) {
             return self.norm.forwardRelu(tape, try tape.conv2d(x, self.conv.inner.w, opts));
         }
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const bf16 = @import("bf16.zig");
 
 pub const eps: f32 = 1e-5;
 pub const momentum: f32 = 0.1;
@@ -7,21 +8,23 @@ pub const max_channels = 256;
 pub const Affine = extern struct { mean: [*]const f32, inv_std: [*]const f32, gamma: [*]const f32, beta: [*]const f32 };
 pub const Stats = extern struct { mean: [*]f32, inv_std: [*]f32, running_mean: [*]f32, running_var: [*]f32 };
 pub const Layout = extern struct { len: u32, channels: u32, flag: u32 };
-pub const GradIo = extern struct { x: [*]const f32, dy: [*]const f32, dx: [*]f32, sums: [*]const f32, mask: [*]const f32 };
+pub fn GradIo(comptime E: type) type {
+    return extern struct { x: [*]const E, dy: [*]const E, dx: [*]E, sums: [*]const f32, mask: [*]const E };
+}
 pub const GradOut = struct { sums: []f32, gamma: []f32, beta: []f32 };
 
-pub inline fn apply(t: usize, x: [*]const f32, y: [*]f32, p: Affine, l: Layout) void {
+pub inline fn apply(comptime E: type, t: usize, x: [*]const E, y: [*]E, p: Affine, l: Layout) void {
     const ch = t % l.channels;
-    const v = p.gamma[ch] * (x[t] - p.mean[ch]) * p.inv_std[ch] + p.beta[ch];
-    y[t] = if (l.flag != 0) @max(v, 0) else v;
+    const v = p.gamma[ch] * (bf16.load(E, x, t) - p.mean[ch]) * p.inv_std[ch] + p.beta[ch];
+    bf16.store(E, y, t, if (l.flag != 0) @max(v, 0) else v);
 }
 
-pub inline fn gradInput(t: usize, io: GradIo, p: Affine, l: Layout) void {
+pub inline fn gradInput(comptime E: type, t: usize, io: GradIo(E), p: Affine, l: Layout) void {
     const ch = t % l.channels;
     const n: f32 = @floatFromInt(l.len / l.channels);
-    const x_hat = (io.x[t] - p.mean[ch]) * p.inv_std[ch];
-    const g = if (l.flag != 0 and io.mask[t] <= 0) 0 else io.dy[t];
-    io.dx[t] += p.gamma[ch] * p.inv_std[ch] / n * (n * g - io.sums[ch] - x_hat * io.sums[l.channels + ch]);
+    const x_hat = (bf16.load(E, io.x, t) - p.mean[ch]) * p.inv_std[ch];
+    const g = if (l.flag != 0 and bf16.load(E, io.mask, t) <= 0) 0 else bf16.load(E, io.dy, t);
+    bf16.store(E, io.dx, t, bf16.load(E, io.dx, t) + p.gamma[ch] * p.inv_std[ch] / n * (n * g - io.sums[ch] - x_hat * io.sums[l.channels + ch]));
 }
 
 pub fn stats(x: []const f32, st: Stats, c: usize, training: bool) void {

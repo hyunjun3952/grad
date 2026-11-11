@@ -7,6 +7,7 @@ const Tensor = grad.Tensor;
 const Tape = grad.autograd.Tape;
 const Var = grad.autograd.Var;
 
+const Act = if (config.bf16) u16 else f32;
 const categories = if (config.cifar100) 100 else 10;
 const w1 = 64;
 const w2 = if (config.wide) 192 else 128;
@@ -56,13 +57,14 @@ const Cifar = struct {
         const n = @TypeOf(x.value).shape[0];
         const image = grad.autograd.reshape(x, &.{ n, 32, 32, 3 });
 
-        const stage1 = try tape.maxPool(try residual(tape, a2, b2, try residual(tape, a1, b1, try stem.forwardRelu(tape, image))), .{});
+        const start = try tape.cast(try stem.forwardRelu(tape, image), Act);
+        const stage1 = try tape.maxPool(try residual(tape, a2, b2, try residual(tape, a1, b1, start)), .{});
         const down2 = try tape.addRelu(try b3.forward(tape, try a3.forwardRelu(tape, stage1)), try skip3.forward(tape, stage1));
         const stage2 = try tape.maxPool(try residual(tape, a4, b4, down2), .{});
         const down3 = try tape.addRelu(try b5.forward(tape, try a5.forwardRelu(tape, stage2)), try skip5.forward(tape, stage2));
         const stage3 = try tape.maxPool(try residual(tape, a6, b6, down3), .{});
         const pooled = try tape.avgPool(try tape.avgPool(stage3, .{}), .{});
-        return fc.forward(tape, try tape.dropout(grad.autograd.reshape(pooled, &.{ n, w3 }), 0.2));
+        return fc.forward(tape, try tape.dropout(grad.autograd.reshape(try tape.cast(pooled, f32), &.{ n, w3 }), 0.2));
     }
 };
 

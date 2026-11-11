@@ -1,7 +1,7 @@
 const std = @import("std");
 const bf16 = @import("bf16.zig");
 
-pub const Op = enum { im2col, col2im, col2imHalf, maxPool, maxPoolBackward, avgPool, avgPoolBackward, groupedForward, groupedInputGrad, groupedWeightGrad };
+pub const Op = enum { im2col, col2im, col2imHalf, maxPool, maxPoolBackward, avgPool, avgPoolBackward, maxPoolHalf, maxPoolBackwardHalf, avgPoolHalf, avgPoolBackwardHalf, groupedForward, groupedInputGrad, groupedWeightGrad };
 
 const Index = u32;
 
@@ -19,9 +19,9 @@ pub fn workItems(op: Op, d: Dims) usize {
     return switch (op) {
         .im2col => @as(usize, d.n) * outHeight(d) * outWidth(d) * d.k * d.k * d.c,
         .col2im, .col2imHalf => @as(usize, d.n) * d.h * d.w * d.c,
-        .maxPool, .avgPool => @as(usize, d.n) * outHeight(d) * outWidth(d) * d.c,
-        .maxPoolBackward => if (d.stride >= d.k) @as(usize, d.n) * outHeight(d) * outWidth(d) * d.c else @as(usize, d.n) * d.h * d.w * d.c,
-        .avgPoolBackward => @as(usize, d.n) * d.h * d.w * d.c,
+        .maxPool, .avgPool, .maxPoolHalf, .avgPoolHalf => @as(usize, d.n) * outHeight(d) * outWidth(d) * d.c,
+        .maxPoolBackward, .maxPoolBackwardHalf => if (d.stride >= d.k) @as(usize, d.n) * outHeight(d) * outWidth(d) * d.c else @as(usize, d.n) * d.h * d.w * d.c,
+        .avgPoolBackward, .avgPoolBackwardHalf => @as(usize, d.n) * d.h * d.w * d.c,
         .groupedForward => @as(usize, d.n) * outHeight(d) * outWidth(d) * d.c_out,
         .groupedInputGrad => @as(usize, d.n) * d.h * d.w * d.c,
         .groupedWeightGrad => @as(usize, d.k) * d.k * (d.c / d.groups) * d.c_out,
@@ -121,7 +121,7 @@ inline fn inputIndex(n: Index, y: Index, x: Index, ch: Index, d: Dims) Index {
     return ((n * d.h + y) * d.w + x) * d.c + ch;
 }
 
-inline fn firstMax(x: [*]const f32, w: Window, d: Dims) Index {
+inline fn firstMax(comptime E: type, x: [*]const E, w: Window, d: Dims) Index {
     const b = boundsOf(w, d);
     var best = inputIndex(w.n, b.y0, b.x0, w.ch, d);
     var y = b.y0;
@@ -129,7 +129,7 @@ inline fn firstMax(x: [*]const f32, w: Window, d: Dims) Index {
         var xx = b.x0;
         while (xx < b.x1) : (xx += 1) {
             const at = inputIndex(w.n, y, xx, w.ch, d);
-            if (x[at] > x[best]) best = at;
+            if (bf16.load(E, x, at) > bf16.load(E, x, best)) best = at;
         }
     }
     return best;
@@ -140,20 +140,20 @@ inline fn windowCount(w: Window, d: Dims) f32 {
     return @floatFromInt((b.y1 - b.y0) * (b.x1 - b.x0));
 }
 
-pub inline fn avgPool(t: Index, x: [*]const f32, out: [*]f32, d: Dims) void {
+inline fn avgPoolOf(comptime E: type, t: Index, x: [*]const E, out: [*]E, d: Dims) void {
     const w = windowOf(t, d);
     const b = boundsOf(w, d);
     var total: f32 = 0;
     var y = b.y0;
     while (y < b.y1) : (y += 1) {
         var xx = b.x0;
-        while (xx < b.x1) : (xx += 1) total += x[inputIndex(w.n, y, xx, w.ch, d)];
+        while (xx < b.x1) : (xx += 1) total += bf16.load(E, x, inputIndex(w.n, y, xx, w.ch, d));
     }
-    out[t] = total / windowCount(w, d);
+    bf16.store(E, out, t, total / windowCount(w, d));
 }
 
-pub inline fn maxPool(t: Index, x: [*]const f32, out: [*]f32, index: [*]u32, d: Dims) void {
-    const winner = firstMax(x, windowOf(t, d), d);
+inline fn maxPoolOf(comptime E: type, t: Index, x: [*]const E, out: [*]E, index: [*]u32, d: Dims) void {
+    const winner = firstMax(E, x, windowOf(t, d), d);
     out[t] = x[winner];
     index[t] = winner;
 }
@@ -163,7 +163,7 @@ inline fn firstWindow(position: Index, d: Dims) Index {
     return if (shifted > d.k) (shifted - d.k + d.stride - 1) / d.stride else 0;
 }
 
-inline fn pooledGradient(comptime winner: bool, t: Index, index: [*]const u32, gout: [*]const f32, d: Dims) f32 {
+inline fn pooledGradient(comptime E: type, comptime winner: bool, t: Index, index: [*]const u32, gout: [*]const E, d: Dims) f32 {
     const ch = t % d.c;
     const xx = t / d.c % d.w;
     const yy = t / d.c / d.w % d.h;
@@ -179,25 +179,57 @@ inline fn pooledGradient(comptime winner: bool, t: Index, index: [*]const u32, g
         while (ox <= last_x) : (ox += 1) {
             const at = ((n * oh + oy) * ow + ox) * d.c + ch;
             if (winner) {
-                if (index[at] == t) total += gout[at];
+                if (index[at] == t) total += bf16.load(E, gout, at);
             } else {
-                total += gout[at] / windowCount(.{ .n = n, .oy = oy, .ox = ox, .ch = ch }, d);
+                total += bf16.load(E, gout, at) / windowCount(.{ .n = n, .oy = oy, .ox = ox, .ch = ch }, d);
             }
         }
     }
     return total;
 }
 
+inline fn avgPoolBackwardOf(comptime E: type, t: Index, gout: [*]const E, gin: [*]E, d: Dims) void {
+    bf16.store(E, gin, t, bf16.load(E, gin, t) + pooledGradient(E, false, t, undefined, gout, d));
+}
+
+inline fn maxPoolBackwardOf(comptime E: type, t: Index, index: [*]const u32, gout: [*]const E, gin: [*]E, d: Dims) void {
+    if (d.stride >= d.k) {
+        bf16.store(E, gin, index[t], bf16.load(E, gin, index[t]) + bf16.load(E, gout, t));
+        return;
+    }
+    bf16.store(E, gin, t, bf16.load(E, gin, t) + pooledGradient(E, true, t, index, gout, d));
+}
+
+pub inline fn avgPool(t: Index, x: [*]const f32, out: [*]f32, d: Dims) void {
+    avgPoolOf(f32, t, x, out, d);
+}
+
+pub inline fn avgPoolHalf(t: Index, x: [*]const u16, out: [*]u16, d: Dims) void {
+    avgPoolOf(u16, t, x, out, d);
+}
+
+pub inline fn maxPool(t: Index, x: [*]const f32, out: [*]f32, index: [*]u32, d: Dims) void {
+    maxPoolOf(f32, t, x, out, index, d);
+}
+
+pub inline fn maxPoolHalf(t: Index, x: [*]const u16, out: [*]u16, index: [*]u32, d: Dims) void {
+    maxPoolOf(u16, t, x, out, index, d);
+}
+
 pub inline fn avgPoolBackward(t: Index, gout: [*]const f32, gin: [*]f32, d: Dims) void {
-    gin[t] += pooledGradient(false, t, undefined, gout, d);
+    avgPoolBackwardOf(f32, t, gout, gin, d);
+}
+
+pub inline fn avgPoolBackwardHalf(t: Index, gout: [*]const u16, gin: [*]u16, d: Dims) void {
+    avgPoolBackwardOf(u16, t, gout, gin, d);
 }
 
 pub inline fn maxPoolBackward(t: Index, index: [*]const u32, gout: [*]const f32, gin: [*]f32, d: Dims) void {
-    if (d.stride >= d.k) {
-        gin[index[t]] += gout[t];
-        return;
-    }
-    gin[t] += pooledGradient(true, t, index, gout, d);
+    maxPoolBackwardOf(f32, t, index, gout, gin, d);
+}
+
+pub inline fn maxPoolBackwardHalf(t: Index, index: [*]const u32, gout: [*]const u16, gin: [*]u16, d: Dims) void {
+    maxPoolBackwardOf(u16, t, index, gout, gin, d);
 }
 pub inline fn groupedForward(t: Index, x: [*]const f32, w: [*]const f32, out: [*]f32, d: Dims) void {
     const ow = outWidth(d);

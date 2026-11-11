@@ -10,6 +10,7 @@ const cpu = @import("../cpu/ops.zig");
 const activation_math = @import("../gpu/math/activation.zig");
 const drop = @import("../gpu/math/dropout.zig");
 const norm = @import("../gpu/math/norm.zig");
+const bf16_math = @import("../gpu/math/bf16.zig");
 const Tensor = tensor.Tensor;
 const trace_mod = @import("trace.zig");
 pub const Trace = trace_mod.Trace;
@@ -53,7 +54,7 @@ pub fn reshape(x: anytype, comptime shape: []const usize) Var(Tensor(@TypeOf(x.v
     return .{ .value = .{ .data = x.value.data }, .grad = .{ .data = x.grad.data }, .needs_grad = x.needs_grad };
 }
 
-fn batchNormGradIo(k: anytype, sums: []const f32, comptime fuse_relu: bool) norm.GradIo {
+fn batchNormGradIo(comptime E: type, k: anytype, sums: []const f32, comptime fuse_relu: bool) norm.GradIo(E) {
     return .{ .x = k.x.value.data.ptr, .dy = k.out.grad.data.ptr, .dx = k.x.grad.data.ptr, .sums = sums.ptr, .mask = if (fuse_relu) k.out.value.data.ptr else k.out.grad.data.ptr };
 }
 
@@ -74,12 +75,12 @@ fn kernelSize(comptime In: type, comptime W: type, comptime groups: usize) usize
 
 fn ConvOut(comptime In: type, comptime W: type, comptime opts: ConvOpts) type {
     const span = opts.dilation * (kernelSize(In, W, opts.groups) - 1) + 1;
-    return Tensor(f32, &.{ In.shape[0], (In.shape[1] + 2 * opts.pad - span) / opts.stride + 1, (In.shape[2] + 2 * opts.pad - span) / opts.stride + 1, W.shape[1] });
+    return Tensor(In.Elem, &.{ In.shape[0], (In.shape[1] + 2 * opts.pad - span) / opts.stride + 1, (In.shape[2] + 2 * opts.pad - span) / opts.stride + 1, W.shape[1] });
 }
 
 fn PoolOut(comptime In: type, comptime opts: PoolOpts) type {
     if (In.rank != 4) @compileError("pooling expects (n, h, w, c) input");
-    return Tensor(f32, &.{ In.shape[0], (In.shape[1] + 2 * opts.pad - opts.kernel) / opts.stride + 1, (In.shape[2] + 2 * opts.pad - opts.kernel) / opts.stride + 1, In.shape[3] });
+    return Tensor(In.Elem, &.{ In.shape[0], (In.shape[1] + 2 * opts.pad - opts.kernel) / opts.stride + 1, (In.shape[2] + 2 * opts.pad - opts.kernel) / opts.stride + 1, In.shape[3] });
 }
 
 const Node = struct {
@@ -212,15 +213,16 @@ pub const Tape = struct {
         const value = try self.newTensor(T);
         if (self.par.gpu) |dev| {
             try dev.addRelu(a.value.data, b.value.data, value.data);
-        } else {
+        } else if (T.Elem == f32) {
             for (value.data, a.value.data, b.value.data) |*o, x, y| o.* = @max(x + y, 0);
-        }
+        } else return error.NoDevice;
         const out = try self.makeVar(value, a.needs_grad or b.needs_grad);
         try self.note(.add_relu, .{ a, b }, out, .{});
         const Ctx = struct { a: @TypeOf(a), b: @TypeOf(b), out: @TypeOf(out) };
         if (out.needs_grad) try self.recordBackward(Ctx{ .a = a, .b = b, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
                 if (t.par.gpu) |dev| return dev.addReluBackward(c.out.value.data, c.out.grad.data, c.a.grad.data, c.b.grad.data, c.a.needs_grad, c.b.needs_grad);
+                if (comptime T.Elem != f32) return error.NoDevice;
                 for (c.out.value.data, c.out.grad.data, 0..) |o, g, i| {
                     const v = if (o > 0) g else 0;
                     if (c.a.needs_grad) c.a.grad.data[i] += v;
@@ -276,6 +278,24 @@ pub const Tape = struct {
                 for (c.x.grad.data, c.x.value.data, c.out.grad.data) |*gx, v, g| {
                     gx.* += if (v > 0) g else 0;
                 }
+            }
+        }.run);
+        return out;
+    }
+
+    pub fn cast(self: *Tape, x: anytype, comptime To: type) Error!Var(Tensor(To, @TypeOf(x.value).shape)) {
+        const X = @TypeOf(x.value);
+        if (X.Elem == To) return x;
+        comptime if (!((X.Elem == f32 and To == u16) or (X.Elem == u16 and To == f32))) @compileError("cast converts between f32 and bf16 (stored as u16)");
+        const dev = self.par.gpu orelse return error.NoDevice;
+        const value = try self.newTensor(Tensor(To, X.shape));
+        if (To == u16) try dev.toHalf(x.value.data, value.data) else try dev.fromHalf(x.value.data, value.data);
+        const out = try self.makeVar(value, x.needs_grad);
+        const Ctx = struct { x: @TypeOf(x), out: @TypeOf(out) };
+        if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .out = out }, struct {
+            fn run(t: *Tape, c: *const Ctx) Error!void {
+                const g = t.par.gpu.?;
+                if (To == u16) try g.addFromHalf(c.out.grad.data, c.x.grad.data) else try g.addToHalf(c.out.grad.data, c.x.grad.data);
             }
         }.run);
         return out;
@@ -342,10 +362,10 @@ pub const Tape = struct {
         if (self.par.gpu) |dev| {
             try dev.batchNormStats(x.value.data, st, c, self.training);
             try dev.batchNormApply(x.value.data, value.data, affine, layout);
-        } else {
+        } else if (In.Elem == f32) {
             cpu.normStats(self.par, x.value.data, st, c, self.training);
             cpu.normApply(self.par, x.value.data, value.data, affine, layout);
-        }
+        } else return error.NoDevice;
         const out = try self.makeVar(value, x.needs_grad or gamma.needs_grad or beta.needs_grad);
         try self.note(if (fuse_relu) .batch_norm_relu else .batch_norm, .{ x, gamma, beta, running.mean, running.variance }, out, .{});
 
@@ -353,14 +373,14 @@ pub const Tape = struct {
         if (out.needs_grad and self.training) try self.recordBackward(Ctx{ .x = x, .gamma = gamma, .beta = beta, .affine = affine, .out = out }, struct {
             fn run(t: *Tape, k: *const Ctx) Error!void {
                 const sums = try t.zeroedTensor(Tensor(f32, &.{2 * c}));
-                const mask: []const f32 = if (fuse_relu) k.out.value.data else &.{};
+                const mask: []const In.Elem = if (fuse_relu) k.out.value.data else &.{};
                 const grads: norm.GradOut = .{ .sums = sums.data, .gamma = k.gamma.grad.data, .beta = k.beta.grad.data };
                 if (t.par.gpu) |dev| {
                     try dev.batchNormGradSums(k.x.value.data, k.out.grad.data, k.affine, mask, grads);
-                    if (k.x.needs_grad) try dev.batchNormGradInput(batchNormGradIo(k, sums.data, fuse_relu), k.affine, layout);
-                } else {
+                    if (k.x.needs_grad) try dev.batchNormGradInput(batchNormGradIo(In.Elem, k, sums.data, fuse_relu), k.affine, layout);
+                } else if (In.Elem == f32) {
                     cpu.normGradSums(t.par, k.x.value.data, k.out.grad.data, k.affine, mask, grads);
-                    if (k.x.needs_grad) cpu.normGradInput(t.par, batchNormGradIo(k, sums.data, fuse_relu), k.affine, layout);
+                    if (k.x.needs_grad) cpu.normGradInput(t.par, batchNormGradIo(In.Elem, k, sums.data, fuse_relu), k.affine, layout);
                 }
             }
         }.run);
@@ -371,13 +391,13 @@ pub const Tape = struct {
         const In = @TypeOf(x.value);
         const d: conv.Dims = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = In.shape[3], .k = opts.kernel, .stride = opts.stride, .pad = opts.pad };
         const value = try self.newTensor(PoolOut(In, opts));
-        try self.convKernel(.avgPool, .{ x.value.data, value.data }, d);
+        try self.convKernel(if (In.Elem == u16) .avgPoolHalf else .avgPool, .{ x.value.data, value.data }, d);
         const out = try self.makeVar(value, x.needs_grad);
         try self.note(.avg_pool, .{x}, out, .{ .kernel = opts.kernel, .stride = opts.stride, .pad = opts.pad });
         const Ctx = struct { x: @TypeOf(x), out: @TypeOf(out) };
         if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .out = out }, struct {
             fn run(t: *Tape, k: *const Ctx) Error!void {
-                try t.convKernel(.avgPoolBackward, .{ k.out.grad.data, k.x.grad.data }, d);
+                try t.convKernel(if (In.Elem == u16) .avgPoolBackwardHalf else .avgPoolBackward, .{ k.out.grad.data, k.x.grad.data }, d);
             }
         }.run);
         return out;
@@ -392,8 +412,49 @@ pub const Tape = struct {
         }
         kernels.parallelEach(self.par, conv.workItems(op, d), @field(conv, @tagName(op)), slices ++ .{d});
     }
+    fn convHalf(self: *Tape, x: anytype, w: anytype, comptime opts: ConvOpts) Error!Var(ConvOut(@TypeOf(x.value), @TypeOf(w.value), opts)) {
+        const In = @TypeOf(x.value);
+        const Out = ConvOut(In, @TypeOf(w.value), opts);
+        const k = comptime kernelSize(In, @TypeOf(w.value), opts.groups);
+        const c_in = In.shape[3];
+        const c_out = Out.shape[3];
+        comptime if (opts.stride != 1 or opts.groups != 1 or opts.dilation != 1 or c_in % 64 != 0 or c_out % 32 != 0) @compileError("bf16 activations need stride-1 convolutions with a multiple of 64 input and of 32 output channels; cast to f32 around other layers");
+        const dev = self.par.gpu orelse return error.NoDevice;
+        const rows = Out.len / c_out;
+        const kc = k * k * c_in;
+        const geometry: ga.ConvGeometry = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = c_in, .k = k, .stride = 1, .pad = opts.pad, .out_h = Out.shape[1], .out_w = Out.shape[2], .positions = rows, .c_out = c_out };
+        const reverse: ga.ConvGeometry = .{ .n = In.shape[0], .h = Out.shape[1], .w = Out.shape[2], .c = c_out, .k = k, .stride = 1, .pad = k - 1 - opts.pad, .out_h = In.shape[1], .out_w = In.shape[2], .positions = In.len / c_in, .c_out = c_in };
+
+        const value = try self.newTensor(Out);
+        {
+            const mark = dev.step_used;
+            defer dev.step_used = mark;
+            const w_half = try dev.packMatrix(w.value.data, kc, c_out, kc, std.mem.alignForward(usize, c_out, 64), false);
+            try dev.convImplicitForward(x.value.data, w_half, value.data, geometry, false);
+        }
+        const out = try self.makeVar(value, x.needs_grad or w.needs_grad);
+        const Ctx = struct { x: @TypeOf(x), w: @TypeOf(w), out: @TypeOf(out) };
+        if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .w = w, .out = out }, struct {
+            fn run(t: *Tape, c: *const Ctx) Error!void {
+                const g = t.par.gpu.?;
+                const mark = g.step_used;
+                defer g.step_used = mark;
+                if (c.x.needs_grad) {
+                    const rotated = try g.packRotatedWeights(c.w.value.data, k, c_in, c_out);
+                    try g.convImplicitForward(c.out.grad.data, rotated, c.x.grad.data, reverse, true);
+                }
+                if (c.w.needs_grad) {
+                    const grad_t = try g.packMatrix(c.out.grad.data, c_out, rows, std.mem.alignForward(usize, c_out, 128), std.mem.alignForward(usize, rows, 32), true);
+                    try g.convImplicitWeightGrad(grad_t, c.x.value.data, c.w.grad.data, geometry);
+                }
+            }
+        }.run);
+        return out;
+    }
+
     pub fn conv2d(self: *Tape, x: anytype, w: anytype, comptime opts: ConvOpts) Error!Var(ConvOut(@TypeOf(x.value), @TypeOf(w.value), opts)) {
         const In = @TypeOf(x.value);
+        if (comptime In.Elem == u16) return self.convHalf(x, w, opts);
         const Out = ConvOut(In, @TypeOf(w.value), opts);
         const k = comptime kernelSize(In, @TypeOf(w.value), opts.groups);
         const c_in = In.shape[3];
@@ -527,13 +588,13 @@ pub const Tape = struct {
         const d: conv.Dims = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = In.shape[3], .k = opts.kernel, .stride = opts.stride, .pad = opts.pad };
         const value = try self.newTensor(PoolOut(In, opts));
         const index = if (self.par.gpu) |dev| try dev.scratch(u32, value.data.len) else try self.gpa.alloc(u32, value.data.len);
-        try self.convKernel(.maxPool, .{ x.value.data, value.data, index }, d);
+        try self.convKernel(if (In.Elem == u16) .maxPoolHalf else .maxPool, .{ x.value.data, value.data, index }, d);
         const out = try self.makeVar(value, x.needs_grad);
         try self.note(.max_pool, .{x}, out, .{ .kernel = opts.kernel, .stride = opts.stride, .pad = opts.pad });
         const Ctx = struct { x: @TypeOf(x), out: @TypeOf(out), index: []u32 };
         if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .out = out, .index = index }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
-                try t.convKernel(.maxPoolBackward, .{ c.index, c.out.grad.data, c.x.grad.data }, d);
+                try t.convKernel(if (In.Elem == u16) .maxPoolBackwardHalf else .maxPoolBackward, .{ c.index, c.out.grad.data, c.x.grad.data }, d);
             }
         }.run);
         return out;
@@ -1321,6 +1382,205 @@ test "pooling with other windows, strides and padding matches a brute-force refe
 test "broadcasting and its gradient reductions work for tensors of rank six on the cpu and the gpu" {
     try gradcheck.expectFiniteDifferences(HighRankNet, 3, 1e-2, 3e-3);
     try gradcheck.expectGpuMatchesCpu(HighRankNet, 4, 1e-5);
+}
+
+test "casting to bf16 and back rounds the values and passes the gradient through" {
+    const gpu = try gpu_mod.Gpu.forTest(1 << 20);
+    defer gpu.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const X = Tensor(f32, &.{ 2, 4 });
+    const values = [_]f32{ 1, 1.00195312, -2.5, 3.14159265, 0.1, 1000.5, -0.0078125, 65 };
+    const device_x = try gpu.alloc(f32, X.len);
+    const device_grad = try gpu.alloc(f32, X.len);
+    try gpu.upload(device_x, &values);
+    try gpu.fill(device_grad, 0);
+
+    var t: Tape = .{ .gpa = arena.allocator(), .par = .{ .gpu = gpu } };
+    const x: Var(X) = .{ .value = .{ .data = device_x }, .grad = .{ .data = device_grad }, .needs_grad = true };
+    const half = try t.cast(x, u16);
+    const back = try t.cast(half, f32);
+    var host: [8]f32 = undefined;
+    try gpu.download(&host, back.value.data);
+    for (values, host) |want, got| try testing.expectEqual(bf16_math.decode(bf16_math.encode(want)), got);
+
+    try gpu.fill(back.grad.data, 2);
+    for (0..2) |i| {
+        const node = t.nodes.items[1 - i];
+        try node.run(&t, node.ctx);
+    }
+    try gpu.download(&host, device_grad);
+    for (host) |g| try testing.expectEqual(@as(f32, 2), g);
+}
+
+fn runBatchNorm(comptime half: bool, gpu: *gpu_mod.Gpu, x_values: []const f32, dy_values: []const f32, out_values: []f32, dx_values: []f32, running: []f32) !void {
+    const X = Tensor(f32, &.{ 600, 16 });
+    const Channels = Tensor(f32, &.{16});
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try gpu.resetStep();
+    var t: Tape = .{ .gpa = arena.allocator(), .par = .{ .gpu = gpu }, .training = true };
+    const x = try t.leaf(X{ .data = try gpu.alloc(f32, X.len) });
+    try gpu.upload(x.value.data, x_values);
+    try gpu.fill(x.grad.data, 0);
+    const gamma = try t.leaf(Channels{ .data = try gpu.alloc(f32, 16) });
+    const beta = try t.leaf(Channels{ .data = try gpu.alloc(f32, 16) });
+    try gpu.fill(gamma.value.data, 1.5);
+    try gpu.fill(beta.value.data, 0.25);
+    try gpu.fill(gamma.grad.data, 0);
+    try gpu.fill(beta.grad.data, 0);
+    const mean = Channels{ .data = try gpu.alloc(f32, 16) };
+    const variance = Channels{ .data = try gpu.alloc(f32, 16) };
+    try gpu.fill(mean.data, 0);
+    try gpu.fill(variance.data, 1);
+
+    const input = if (half) try t.cast(x, u16) else x;
+    const out = try t.batchNormRelu(input, gamma, beta, .{ .mean = mean, .variance = variance });
+    const back = try t.cast(out, f32);
+    try gpu.download(out_values, back.value.data);
+    try gpu.upload(back.grad.data, dy_values);
+    var at = t.nodes.items.len;
+    while (at > 0) {
+        at -= 1;
+        try t.nodes.items[at].run(&t, t.nodes.items[at].ctx);
+    }
+    try gpu.download(dx_values, x.grad.data);
+    try gpu.download(running[0..16], mean.data);
+    try gpu.download(running[16..], variance.data);
+}
+
+test "batch norm on bf16 activations matches the f32 path within bf16 rounding, forward, backward and running statistics" {
+    const gpu = try gpu_mod.Gpu.forTest(8 << 20);
+    defer gpu.deinit();
+    var prng = std.Random.DefaultPrng.init(31);
+    const rng = prng.random();
+    var x: [600 * 16]f32 = undefined;
+    var dy: [600 * 16]f32 = undefined;
+    for (&x) |*v| v.* = rng.floatNorm(f32) * 2 + 0.5;
+    for (&dy) |*v| v.* = rng.floatNorm(f32);
+    var wide_out: [600 * 16]f32 = undefined;
+    var half_out: [600 * 16]f32 = undefined;
+    var wide_dx: [600 * 16]f32 = undefined;
+    var half_dx: [600 * 16]f32 = undefined;
+    var wide_running: [32]f32 = undefined;
+    var half_running: [32]f32 = undefined;
+    try runBatchNorm(false, gpu, &x, &dy, &wide_out, &wide_dx, &wide_running);
+    try runBatchNorm(true, gpu, &x, &dy, &half_out, &half_dx, &half_running);
+    for (wide_out, half_out) |want, got| try testing.expectApproxEqAbs(want, got, 0.04 + 0.01 * @abs(want));
+    var flipped: usize = 0;
+    for (wide_dx, half_dx) |want, got| {
+        if (@abs(want - got) > 0.03 + 0.02 * @abs(want)) flipped += 1;
+    }
+    try testing.expect(flipped <= 3);
+    for (wide_running, half_running) |want, got| try testing.expectApproxEqAbs(want, got, 0.02 + 0.01 * @abs(want));
+}
+
+fn runHalfChain(comptime half: bool, gpu: *gpu_mod.Gpu, a_values: []const f32, b_values: []const f32, g_values: []const f32, out: []f32, grad_a: []f32, grad_b: []f32) !void {
+    const X = Tensor(f32, &.{ 2, 8, 8, 4 });
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try gpu.resetStep();
+    var t: Tape = .{ .gpa = arena.allocator(), .par = .{ .gpu = gpu }, .training = true };
+    const a = try t.leaf(X{ .data = try gpu.alloc(f32, X.len) });
+    const b = try t.leaf(X{ .data = try gpu.alloc(f32, X.len) });
+    try gpu.upload(a.value.data, a_values);
+    try gpu.upload(b.value.data, b_values);
+    try gpu.fill(a.grad.data, 0);
+    try gpu.fill(b.grad.data, 0);
+    const lhs = if (half) try t.cast(a, u16) else a;
+    const rhs = if (half) try t.cast(b, u16) else b;
+    const merged = try t.addRelu(lhs, rhs);
+    const pooled = try t.avgPool(try t.maxPool(merged, .{}), .{});
+    const result = try t.cast(pooled, f32);
+    try gpu.download(out, result.value.data);
+    try gpu.upload(result.grad.data, g_values);
+    var at = t.nodes.items.len;
+    while (at > 0) {
+        at -= 1;
+        try t.nodes.items[at].run(&t, t.nodes.items[at].ctx);
+    }
+    try gpu.download(grad_a, a.grad.data);
+    try gpu.download(grad_b, b.grad.data);
+}
+
+test "addRelu, max pooling and average pooling on bf16 activations match the f32 path within bf16 rounding" {
+    const gpu = try gpu_mod.Gpu.forTest(8 << 20);
+    defer gpu.deinit();
+    var prng = std.Random.DefaultPrng.init(33);
+    const rng = prng.random();
+    var a: [2 * 8 * 8 * 4]f32 = undefined;
+    var b: [2 * 8 * 8 * 4]f32 = undefined;
+    var g: [2 * 2 * 2 * 4]f32 = undefined;
+    for (&a) |*v| v.* = rng.floatNorm(f32);
+    for (&b) |*v| v.* = rng.floatNorm(f32);
+    for (&g) |*v| v.* = rng.floatNorm(f32);
+    var wide: [g.len]f32 = undefined;
+    var half: [g.len]f32 = undefined;
+    var wide_a: [a.len]f32 = undefined;
+    var wide_b: [a.len]f32 = undefined;
+    var half_a: [a.len]f32 = undefined;
+    var half_b: [a.len]f32 = undefined;
+    try runHalfChain(false, gpu, &a, &b, &g, &wide, &wide_a, &wide_b);
+    try runHalfChain(true, gpu, &a, &b, &g, &half, &half_a, &half_b);
+    for (wide, half) |want, got| try testing.expectApproxEqAbs(want, got, 0.03 + 0.01 * @abs(want));
+    var flipped: usize = 0;
+    for (wide_a, half_a, wide_b, half_b) |wa, ha, wb, hb| {
+        if (@abs(wa - ha) > 0.01 + 0.02 * @abs(wa)) flipped += 1;
+        if (@abs(wb - hb) > 0.01 + 0.02 * @abs(wb)) flipped += 1;
+    }
+    try testing.expect(flipped <= 8);
+}
+
+fn runConvChain(comptime half: bool, gpu: *gpu_mod.Gpu, x_values: []const f32, w_values: []const f32, g_values: []const f32, out: []f32, grad_x: []f32, grad_w: []f32) !void {
+    const X = Tensor(f32, &.{ 2, 8, 8, 64 });
+    const W = Tensor(f32, &.{ 576, 32 });
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try gpu.resetStep();
+    var t: Tape = .{ .gpa = arena.allocator(), .par = .{ .gpu = gpu }, .training = true };
+    const x = try t.leaf(X{ .data = try gpu.alloc(f32, X.len) });
+    const w = try t.leaf(W{ .data = try gpu.alloc(f32, W.len) });
+    try gpu.upload(x.value.data, x_values);
+    try gpu.upload(w.value.data, w_values);
+    try gpu.fill(x.grad.data, 0);
+    try gpu.fill(w.grad.data, 0);
+    const input = if (half) try t.cast(x, u16) else x;
+    const y = try t.cast(try t.conv2d(input, w, .{ .pad = 1 }), f32);
+    try gpu.download(out, y.value.data);
+    try gpu.upload(y.grad.data, g_values);
+    var at = t.nodes.items.len;
+    while (at > 0) {
+        at -= 1;
+        try t.nodes.items[at].run(&t, t.nodes.items[at].ctx);
+    }
+    try gpu.download(grad_x, x.grad.data);
+    try gpu.download(grad_w, w.grad.data);
+}
+
+test "a convolution on bf16 activations agrees with the f32 convolution within bf16 rounding, outputs and both gradients" {
+    const gpu = try gpu_mod.Gpu.forTest(32 << 20);
+    defer gpu.deinit();
+    var prng = std.Random.DefaultPrng.init(37);
+    const rng = prng.random();
+    const x = try testing.allocator.alloc(f32, 2 * 8 * 8 * 64);
+    defer testing.allocator.free(x);
+    const w = try testing.allocator.alloc(f32, 576 * 32);
+    defer testing.allocator.free(w);
+    const g = try testing.allocator.alloc(f32, 2 * 8 * 8 * 32);
+    defer testing.allocator.free(g);
+    for (x) |*v| v.* = rng.floatNorm(f32);
+    for (w) |*v| v.* = rng.floatNorm(f32) * 0.05;
+    for (g) |*v| v.* = rng.floatNorm(f32);
+    const outputs = try testing.allocator.alloc(f32, 4 * g.len + 2 * x.len + 2 * w.len);
+    defer testing.allocator.free(outputs);
+    const wide_y, const half_y = .{ outputs[0..g.len], outputs[g.len..][0..g.len] };
+    const wide_dx, const half_dx = .{ outputs[2 * g.len ..][0..x.len], outputs[2 * g.len + x.len ..][0..x.len] };
+    const wide_dw, const half_dw = .{ outputs[2 * g.len + 2 * x.len ..][0..w.len], outputs[2 * g.len + 2 * x.len + w.len ..][0..w.len] };
+    try runConvChain(false, gpu, x, w, g, wide_y, wide_dx, wide_dw);
+    try runConvChain(true, gpu, x, w, g, half_y, half_dx, half_dw);
+    for (wide_y, half_y) |want, got| try testing.expectApproxEqAbs(want, got, 0.08 + 0.02 * @abs(want));
+    for (wide_dx, half_dx) |want, got| try testing.expectApproxEqAbs(want, got, 0.25 + 0.03 * @abs(want));
+    for (wide_dw, half_dw) |want, got| try testing.expectApproxEqAbs(want, got, 0.6 + 0.03 * @abs(want));
 }
 
 test "label smoothing blends the target and its gradient with the uniform distribution" {

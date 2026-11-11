@@ -8,7 +8,7 @@ const norm = @import("math/norm.zig");
 
 const ptx = @embedFile("kernels_ptx");
 
-pub const Error = Allocator.Error || error{ DriverNotFound, MissingSymbol, CudaFailed, CudnnNotFound, CudnnFailed, NoAlgorithm };
+pub const Error = Allocator.Error || error{ NoDevice, DriverNotFound, MissingSymbol, CudaFailed, CudnnNotFound, CudnnFailed, NoAlgorithm };
 
 pub const BinaryOp = enum { add, mul };
 
@@ -59,6 +59,11 @@ const Kernel = enum {
     elementwise,
     relu,
     reluBackward,
+    transposeHalf,
+    toHalf,
+    fromHalf,
+    addFromHalf,
+    addToHalf,
     activation,
     activationBackward,
     addRelu,
@@ -82,8 +87,17 @@ const Kernel = enum {
     maxPoolBackward,
     avgPool,
     avgPoolBackward,
+    maxPoolHalf,
+    maxPoolBackwardHalf,
+    avgPoolHalf,
+    avgPoolBackwardHalf,
+    addReluHalf,
+    addReluBackwardHalf,
     dropout,
     columnReduce,
+    columnReduceHalf,
+    batchNormApplyHalf,
+    batchNormGradInputHalf,
     columnCombine,
     splitCombine,
     batchNormFinish,
@@ -416,11 +430,11 @@ pub const Gpu = struct {
         return self.tensor_cores and m * n * k >= self.tensor_core_min_work;
     }
 
-    pub fn packMatrix(self: *Gpu, src: []const f32, rows: usize, cols: usize, rows_padded: usize, cols_padded: usize, transpose: bool) Error!Packed {
+    pub fn packMatrix(self: *Gpu, src: anytype, rows: usize, cols: usize, rows_padded: usize, cols_padded: usize, transpose: bool) Error!Packed {
         const dst = try self.scratch(u16, rows_padded * cols_padded);
         const args = pack(ga.PackArgs, .{ .rows = rows, .cols = cols, .rows_padded = rows_padded, .cols_padded = cols_padded, .src_stride = if (transpose) rows else cols, .transpose = transpose });
         if (transpose) {
-            try self.launch(.packHalfTransposed, .{ toU32(cols_padded / 32), toU32(rows_padded / 32), 1 }, .{ src, dst, args });
+            try self.launch(if (@typeInfo(@TypeOf(src)).pointer.child == u16) .transposeHalf else .packHalfTransposed, .{ toU32(cols_padded / 32), toU32(rows_padded / 32), 1 }, .{ src, dst, args });
         } else {
             try self.launchFlat(.packHalf, rows_padded * cols_padded, .{ src, dst, args });
         }
@@ -491,10 +505,11 @@ pub const Gpu = struct {
         return .{ .data = dst, .rows_padded = rows, .cols_padded = cols_padded };
     }
 
-    pub fn convImplicitForward(self: *Gpu, x_half: []const u16, w: Packed, out: []f32, geo: ga.ConvGeometry, accumulate: bool) Error!void {
+    pub fn convImplicitForward(self: *Gpu, x_half: []const u16, w: Packed, out: anytype, geo: ga.ConvGeometry, accumulate: bool) Error!void {
+        const half_out = @typeInfo(@TypeOf(out)).pointer.child == u16;
         const c_out: usize = geo.c_out;
         const m = @as(usize, geo.n) * geo.out_h * geo.out_w;
-        const kernel_shape = pack(ga.TensorShape, .{ .m = m, .n = c_out, .k_padded = w.rows_padded, .n_padded = w.cols_padded, .accumulate = accumulate, .chunk = w.rows_padded, .transpose_out = false, .output_half = false, .split_stride = 0 });
+        const kernel_shape = pack(ga.TensorShape, .{ .m = m, .n = c_out, .k_padded = w.rows_padded, .n_padded = w.cols_padded, .accumulate = accumulate, .chunk = w.rows_padded, .transpose_out = false, .output_half = half_out, .split_stride = 0 });
         const wide = c_out % 128 == 0 and ceilDiv(m, 128) * (c_out / 128) >= 96;
         try self.launch(if (wide) .convGemmForwardWide else .convGemmForward, .{ ceilDiv(c_out, if (wide) 128 else 64), ceilDiv(m, 128), 1 }, .{ x_half, w.data, out, kernel_shape, geo });
     }
@@ -570,6 +585,22 @@ pub const Gpu = struct {
         try self.launchFlat(.reluBackward, x.len, .{ x, g_out, g_in, x.len });
     }
 
+    pub fn toHalf(self: *Gpu, x: []const f32, y: []u16) Error!void {
+        try self.launchFlat(.toHalf, x.len, .{ x, y, x.len });
+    }
+
+    pub fn fromHalf(self: *Gpu, x: []const u16, y: []f32) Error!void {
+        try self.launchFlat(.fromHalf, x.len, .{ x, y, x.len });
+    }
+
+    pub fn addFromHalf(self: *Gpu, x: []const u16, y: []f32) Error!void {
+        try self.launchFlat(.addFromHalf, x.len, .{ x, y, x.len });
+    }
+
+    pub fn addToHalf(self: *Gpu, x: []const f32, y: []u16) Error!void {
+        try self.launchFlat(.addToHalf, x.len, .{ x, y, x.len });
+    }
+
     pub fn activation(self: *Gpu, x: []const f32, out: []f32, kind: Activation) Error!void {
         try self.launchFlat(.activation, x.len, .{ x, out, x.len, kind });
     }
@@ -578,13 +609,15 @@ pub const Gpu = struct {
         try self.launchFlat(.activationBackward, x.len, .{ x, y, g_out, g_in, x.len, kind });
     }
 
-    pub fn addRelu(self: *Gpu, a: []const f32, b: []const f32, out: []f32) Error!void {
-        try self.launchFlat(.addRelu, out.len, .{ a, b, out, out.len });
+    pub fn addRelu(self: *Gpu, a: anytype, b: anytype, out: anytype) Error!void {
+        const E = @typeInfo(@TypeOf(out)).pointer.child;
+        try self.launchFlat(if (E == u16) .addReluHalf else .addRelu, out.len, .{ a, b, out, out.len });
     }
 
-    pub fn addReluBackward(self: *Gpu, out: []const f32, g: []const f32, grad_a: []f32, grad_b: []f32, a_needs_grad: bool, b_needs_grad: bool) Error!void {
+    pub fn addReluBackward(self: *Gpu, out: anytype, g: anytype, grad_a: anytype, grad_b: anytype, a_needs_grad: bool, b_needs_grad: bool) Error!void {
+        const E = @typeInfo(@TypeOf(out)).pointer.child;
         const flags: u32 = @as(u32, @intFromBool(a_needs_grad)) | @as(u32, @intFromBool(b_needs_grad)) << 1;
-        try self.launchFlat(.addReluBackward, out.len, .{ out, g, grad_a, grad_b, out.len, flags });
+        try self.launchFlat(if (E == u16) .addReluBackwardHalf else .addReluBackward, out.len, .{ out, g, grad_a, grad_b, out.len, flags });
     }
 
     pub fn addInPlace(self: *Gpu, dst: []f32, src: []const f32) Error!void {
@@ -620,7 +653,7 @@ pub const Gpu = struct {
 
     const ColumnKind = enum(u32) { sum, gradient_sums, shifted_moments, masked_gradient_sums };
 
-    fn columnReduce(self: *Gpu, args: ga.ColumnArgs) Error!void {
+    fn columnReduce(self: *Gpu, comptime E: type, args: ga.ColumnArgs) Error!void {
         const blocks: u32 = @min(256, ceilDiv(args.rows, 8 * 16));
         var launched = args;
         launched.row_stride = blocks * 8;
@@ -629,43 +662,55 @@ pub const Gpu = struct {
         defer self.step_used = mark;
         const partial: []f32 = if (self.deterministic) try self.scratch(f32, @as(usize, blocks) * 2 * args.channels) else &.{};
         launched.partial = partial.ptr;
-        try self.launch(.columnReduce, .{ blocks, ceilDiv(args.channels, 32), 1 }, .{launched});
+        try self.launch(if (E == u16) .columnReduceHalf else .columnReduce, .{ blocks, ceilDiv(args.channels, 32), 1 }, .{launched});
         if (self.deterministic) {
             const width = args.channels * @as(usize, if (args.kind == 0) 1 else 2);
             try self.launchFlat(.columnCombine, width, .{ partial, args.out[0..width], blocks, width, 2 * args.channels });
         }
     }
 
-    fn columns(a: []const f32, out: []f32, kind: ColumnKind) ga.ColumnArgs {
-        return .{ .a = a.ptr, .b = a.ptr, .mean = a.ptr, .inv_std = a.ptr, .mask = a.ptr, .out = out.ptr, .rows = @intCast(a.len / (if (kind == .sum) out.len else out.len / 2)), .channels = @intCast(if (kind == .sum) out.len else out.len / 2), .partial = out.ptr, .ordered = 0, .row_stride = 0, .kind = @backingInt(kind), .scale = 1 };
+    fn columns(a: anytype, out: []f32, kind: ColumnKind) ga.ColumnArgs {
+        const channels = if (kind == .sum) out.len else out.len / 2;
+        return .{ .a = @ptrCast(@alignCast(a.ptr)), .b = @ptrCast(@alignCast(a.ptr)), .mean = out.ptr, .inv_std = out.ptr, .mask = @ptrCast(@alignCast(a.ptr)), .out = out.ptr, .partial = out.ptr, .ordered = 0, .rows = @intCast(a.len / channels), .channels = @intCast(channels), .row_stride = 0, .kind = @backingInt(kind), .scale = 1 };
     }
 
     pub fn columnSums(self: *Gpu, in: []const f32, out: []f32) Error!void {
-        try self.columnReduce(columns(in, out, .sum));
+        try self.columnReduce(f32, columns(in, out, .sum));
     }
 
-    pub fn batchNormStats(self: *Gpu, x: []const f32, st: norm.Stats, c: usize, training: bool) Error!void {
+    pub fn batchNormStats(self: *Gpu, x: anytype, st: norm.Stats, c: usize, training: bool) Error!void {
+        const E = @typeInfo(@TypeOf(x)).pointer.child;
         const sums = try self.scratchZeroed(f32, 2 * c);
-        if (training) try self.columnReduce(columns(x, sums, .shifted_moments));
-        try self.launchFlat(.batchNormFinish, c, .{ sums, x[0..c], st, norm.Layout{ .len = @intCast(x.len), .channels = @intCast(c), .flag = @intFromBool(training) } });
+        const shift: []const f32 = if (E == f32) x[0..c] else blk: {
+            const first_row = try self.scratch(f32, c);
+            try self.fromHalf(x[0..c], first_row);
+            break :blk first_row;
+        };
+        var args = columns(x, sums, .shifted_moments);
+        args.mean = shift.ptr;
+        if (training) try self.columnReduce(E, args);
+        try self.launchFlat(.batchNormFinish, c, .{ sums, shift, st, norm.Layout{ .len = @intCast(x.len), .channels = @intCast(c), .flag = @intFromBool(training) } });
     }
 
-    pub fn batchNormApply(self: *Gpu, x: []const f32, y: []f32, p: norm.Affine, l: norm.Layout) Error!void {
-        try self.launchFlat(.batchNormApply, x.len, .{ x, y, p, l });
+    pub fn batchNormApply(self: *Gpu, x: anytype, y: anytype, p: norm.Affine, l: norm.Layout) Error!void {
+        const E = @typeInfo(@TypeOf(x)).pointer.child;
+        try self.launchFlat(if (E == u16) .batchNormApplyHalf else .batchNormApply, x.len, .{ x, y, p, l });
     }
 
-    pub fn batchNormGradSums(self: *Gpu, x: []const f32, dy: []const f32, p: norm.Affine, mask: []const f32, out: norm.GradOut) Error!void {
+    pub fn batchNormGradSums(self: *Gpu, x: anytype, dy: anytype, p: norm.Affine, mask: anytype, out: norm.GradOut) Error!void {
+        const E = @typeInfo(@TypeOf(x)).pointer.child;
         var args = columns(dy, out.sums, if (mask.len != 0) .masked_gradient_sums else .gradient_sums);
-        args.b = x.ptr;
+        args.b = @ptrCast(@alignCast(x.ptr));
         args.mean = p.mean;
         args.inv_std = p.inv_std;
-        if (mask.len != 0) args.mask = mask.ptr;
-        try self.columnReduce(args);
+        if (mask.len != 0) args.mask = @ptrCast(@alignCast(mask.ptr));
+        try self.columnReduce(E, args);
         try self.launchFlat(.batchNormGradFinish, out.beta.len, .{ out.sums, out.gamma, out.beta, out.beta.len });
     }
 
-    pub fn batchNormGradInput(self: *Gpu, io: norm.GradIo, p: norm.Affine, l: norm.Layout) Error!void {
-        try self.launchFlat(.batchNormGradInput, l.len, .{ io, p, l });
+    pub fn batchNormGradInput(self: *Gpu, io: anytype, p: norm.Affine, l: norm.Layout) Error!void {
+        const E = @typeInfo(@TypeOf(io.x)).pointer.child;
+        try self.launchFlat(if (E == u16) .batchNormGradInputHalf else .batchNormGradInput, l.len, .{ io, p, l });
     }
     pub fn dropout(self: *Gpu, src: []const f32, dst: []f32, seed: u64, keep: f32, accumulate: bool) Error!void {
         try self.launchFlat(.dropout, src.len, .{ src, dst, src.len, seed, keep, accumulate });

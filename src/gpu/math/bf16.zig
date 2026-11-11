@@ -6,6 +6,14 @@ pub inline fn encode(x: f32) u16 {
     return @truncate((bits +% 0x7FFF +% ((bits >> 16) & 1)) >> 16);
 }
 
+pub inline fn load(comptime E: type, p: [*]const E, i: usize) f32 {
+    return if (E == u16) decode(p[i]) else p[i];
+}
+
+pub inline fn store(comptime E: type, p: [*]E, i: usize, v: f32) void {
+    p[i] = if (E == u16) encode(v) else v;
+}
+
 pub inline fn decode(h: u16) f32 {
     return @bitCast(@as(u32, h) << 16);
 }

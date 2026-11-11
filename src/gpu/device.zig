@@ -171,6 +171,26 @@ export fn reluBackward(x: [*]const f32, g_out: [*]const f32, g_in: [*]f32, n: u3
     if (t < n) g_in[t] += if (x[t] > 0) g_out[t] else 0;
 }
 
+export fn toHalf(x: [*]const f32, y: [*]u16, n: u32) callconv(.nvptx_kernel) void {
+    const t = globalIndex();
+    if (t < n) y[t] = bf16.encode(x[t]);
+}
+
+export fn fromHalf(x: [*]const u16, y: [*]f32, n: u32) callconv(.nvptx_kernel) void {
+    const t = globalIndex();
+    if (t < n) y[t] = bf16.decode(x[t]);
+}
+
+export fn addFromHalf(x: [*]const u16, y: [*]f32, n: u32) callconv(.nvptx_kernel) void {
+    const t = globalIndex();
+    if (t < n) y[t] += bf16.decode(x[t]);
+}
+
+export fn addToHalf(x: [*]const f32, y: [*]u16, n: u32) callconv(.nvptx_kernel) void {
+    const t = globalIndex();
+    if (t < n) y[t] = bf16.encode(bf16.decode(y[t]) + x[t]);
+}
+
 export fn activation(x: [*]const f32, out: [*]f32, n: u32, kind: u32) callconv(.nvptx_kernel) void {
     const t = globalIndex();
     if (t < n) out[t] = act.forward(@fromBackingInt(@intCast(kind)), x[t]);
@@ -181,17 +201,33 @@ export fn activationBackward(x: [*]const f32, y: [*]const f32, g_out: [*]const f
     if (t < n) g_in[t] += g_out[t] * act.derivative(@fromBackingInt(@intCast(kind)), x[t], y[t]);
 }
 
-export fn addRelu(a: [*]const f32, b: [*]const f32, out: [*]f32, n: u32) callconv(.nvptx_kernel) void {
+inline fn addReluOf(comptime E: type, a: [*]const E, b: [*]const E, out: [*]E, n: u32) void {
     const t = globalIndex();
-    if (t < n) out[t] = @max(a[t] + b[t], 0);
+    if (t < n) bf16.store(E, out, t, @max(bf16.load(E, a, t) + bf16.load(E, b, t), 0));
+}
+
+inline fn addReluBackwardOf(comptime E: type, out: [*]const E, g: [*]const E, grad_a: [*]E, grad_b: [*]E, n: u32, flags: u32) void {
+    const t = globalIndex();
+    if (t >= n) return;
+    const v = if (bf16.load(E, out, t) > 0) bf16.load(E, g, t) else 0;
+    if (flags & 1 != 0) bf16.store(E, grad_a, t, bf16.load(E, grad_a, t) + v);
+    if (flags & 2 != 0) bf16.store(E, grad_b, t, bf16.load(E, grad_b, t) + v);
+}
+
+export fn addRelu(a: [*]const f32, b: [*]const f32, out: [*]f32, n: u32) callconv(.nvptx_kernel) void {
+    addReluOf(f32, a, b, out, n);
+}
+
+export fn addReluHalf(a: [*]const u16, b: [*]const u16, out: [*]u16, n: u32) callconv(.nvptx_kernel) void {
+    addReluOf(u16, a, b, out, n);
 }
 
 export fn addReluBackward(out: [*]const f32, g: [*]const f32, grad_a: [*]f32, grad_b: [*]f32, n: u32, flags: u32) callconv(.nvptx_kernel) void {
-    const t = globalIndex();
-    if (t >= n) return;
-    const v = if (out[t] > 0) g[t] else 0;
-    if (flags & 1 != 0) grad_a[t] += v;
-    if (flags & 2 != 0) grad_b[t] += v;
+    addReluBackwardOf(f32, out, g, grad_a, grad_b, n, flags);
+}
+
+export fn addReluBackwardHalf(out: [*]const u16, g: [*]const u16, grad_a: [*]u16, grad_b: [*]u16, n: u32, flags: u32) callconv(.nvptx_kernel) void {
+    addReluBackwardOf(u16, out, g, grad_a, grad_b, n, flags);
 }
 
 export fn addInPlace(dst: [*]f32, src: [*]const f32, n: u32) callconv(.nvptx_kernel) void {
@@ -244,7 +280,18 @@ const column = struct {
 };
 
 export fn columnReduce(args: ga.ColumnArgs) callconv(.nvptx_kernel) void {
-    const a, const b, const mean, const inv_std, const mask, const out = .{ args.a, args.b, args.mean, args.inv_std, args.mask, args.out };
+    columnReduceOf(f32, args);
+}
+
+export fn columnReduceHalf(args: ga.ColumnArgs) callconv(.nvptx_kernel) void {
+    columnReduceOf(u16, args);
+}
+
+inline fn columnReduceOf(comptime E: type, args: ga.ColumnArgs) void {
+    const a: [*]const E = @ptrCast(args.a);
+    const b: [*]const E = @ptrCast(args.b);
+    const mask: [*]const E = @ptrCast(args.mask);
+    const mean, const inv_std, const out = .{ args.mean, args.inv_std, args.out };
     const rows, const c, const row_stride, const kind, const scale = .{ args.rows, args.channels, args.row_stride, args.kind, args.scale };
     const tid: usize = @workItemId(0);
     const lane = tid % 32;
@@ -258,16 +305,16 @@ export fn columnReduce(args: ga.ColumnArgs) callconv(.nvptx_kernel) void {
         const s = inv_std[ch];
         var r = @as(usize, @workGroupId(0)) * 8 + group;
         while (r < rows) : (r += row_stride) {
-            const v = a[r * c + ch];
+            const v = bf16.load(E, a, r * c + ch);
             if (kind == 0) {
                 first += v;
             } else if (kind == 2) {
                 first += v - m;
                 second += (v - m) * (v - m);
             } else {
-                const g = if (kind == 3 and mask[r * c + ch] <= 0) 0 else v;
+                const g = if (kind == 3 and bf16.load(E, mask, r * c + ch) <= 0) 0 else v;
                 first += g;
-                second += g * ((b[r * c + ch] - m) * s);
+                second += g * ((bf16.load(E, b, r * c + ch) - m) * s);
             }
         }
     }
@@ -336,11 +383,19 @@ export fn batchNormGradFinish(sums: [*]const f32, gamma_grad: [*]f32, beta_grad:
     gamma_grad[ch] += sums[c + ch];
 }
 export fn batchNormApply(x: [*]const f32, y: [*]f32, p: nm.Affine, l: nm.Layout) callconv(.nvptx_kernel) void {
-    if (globalIndex() < l.len) nm.apply(globalIndex(), x, y, p, l);
+    if (globalIndex() < l.len) nm.apply(f32, globalIndex(), x, y, p, l);
 }
 
-export fn batchNormGradInput(io: nm.GradIo, p: nm.Affine, l: nm.Layout) callconv(.nvptx_kernel) void {
-    if (globalIndex() < l.len) nm.gradInput(globalIndex(), io, p, l);
+export fn batchNormApplyHalf(x: [*]const u16, y: [*]u16, p: nm.Affine, l: nm.Layout) callconv(.nvptx_kernel) void {
+    if (globalIndex() < l.len) nm.apply(u16, globalIndex(), x, y, p, l);
+}
+
+export fn batchNormGradInput(io: nm.GradIo(f32), p: nm.Affine, l: nm.Layout) callconv(.nvptx_kernel) void {
+    if (globalIndex() < l.len) nm.gradInput(f32, globalIndex(), io, p, l);
+}
+
+export fn batchNormGradInputHalf(io: nm.GradIo(u16), p: nm.Affine, l: nm.Layout) callconv(.nvptx_kernel) void {
+    if (globalIndex() < l.len) nm.gradInput(u16, globalIndex(), io, p, l);
 }
 
 export fn crossEntropyRows(x: [*]const f32, logp: [*]f32, labels: [*]const u8, row_loss: [*]f32, rows: u32, cols: u32, smoothing: f32) callconv(.nvptx_kernel) void {
@@ -419,6 +474,22 @@ export fn avgPoolBackward(gout: [*]const f32, gin: [*]f32, len: u32, d: cv.Dims)
 
 export fn maxPoolBackward(index: [*]const u32, gout: [*]const f32, gin: [*]f32, len: u32, d: cv.Dims) callconv(.nvptx_kernel) void {
     if (globalIndex() < len) cv.maxPoolBackward(@intCast(globalIndex()), index, gout, gin, d);
+}
+
+export fn maxPoolHalf(x: [*]const u16, out: [*]u16, index: [*]u32, len: u32, d: cv.Dims) callconv(.nvptx_kernel) void {
+    if (globalIndex() < len) cv.maxPoolHalf(@intCast(globalIndex()), x, out, index, d);
+}
+
+export fn avgPoolHalf(x: [*]const u16, out: [*]u16, len: u32, d: cv.Dims) callconv(.nvptx_kernel) void {
+    if (globalIndex() < len) cv.avgPoolHalf(@intCast(globalIndex()), x, out, d);
+}
+
+export fn avgPoolBackwardHalf(gout: [*]const u16, gin: [*]u16, len: u32, d: cv.Dims) callconv(.nvptx_kernel) void {
+    if (globalIndex() < len) cv.avgPoolBackwardHalf(@intCast(globalIndex()), gout, gin, d);
+}
+
+export fn maxPoolBackwardHalf(index: [*]const u32, gout: [*]const u16, gin: [*]u16, len: u32, d: cv.Dims) callconv(.nvptx_kernel) void {
+    if (globalIndex() < len) cv.maxPoolBackwardHalf(@intCast(globalIndex()), index, gout, gin, d);
 }
 
 export fn dropout(src: [*]const f32, dst: [*]f32, len: u32, seed: u64, keep: f32, accumulate: u32) callconv(.nvptx_kernel) void {
@@ -628,6 +699,14 @@ export fn im2colHalf(x: [*]const f32, dst: [*]u16, d: cv.Dims, cols_padded: u32)
     }
 }
 export fn packHalfTransposed(src: [*]const f32, dst: [*]u16, args: ga.PackArgs) callconv(.nvptx_kernel) void {
+    packTransposedOf(f32, src, dst, args);
+}
+
+export fn transposeHalf(src: [*]const u16, dst: [*]u16, args: ga.PackArgs) callconv(.nvptx_kernel) void {
+    packTransposedOf(u16, src, dst, args);
+}
+
+inline fn packTransposedOf(comptime E: type, src: [*]const E, dst: [*]u16, args: ga.PackArgs) void {
     const tid: usize = @workItemId(0);
     const lane = tid % 32;
     const group = tid / 32;
@@ -636,7 +715,7 @@ export fn packHalfTransposed(src: [*]const f32, dst: [*]u16, args: ga.PackArgs) 
     inline for (0..4) |step| {
         const j = col_base + group + 8 * step;
         const i = row_base + lane;
-        transpose_tile.values[(group + 8 * step) * 33 + lane] = if (i < args.rows and j < args.cols) src[j * args.src_stride + i] else 0;
+        transpose_tile.values[(group + 8 * step) * 33 + lane] = if (i < args.rows and j < args.cols) bf16.load(E, src, j * args.src_stride + i) else 0;
     }
     barrier();
     inline for (0..4) |step| {
@@ -836,7 +915,7 @@ inline fn storeTile(comptime kind: GemmKind, c: [*]f32, acc: *const Acc, shape: 
                     const at = if (shape.transpose_out != 0) col * shape.m + r else r * shape.n + col;
                     if (half_output and shape.output_half != 0) {
                         const half_out: [*]u16 = @ptrCast(@alignCast(c));
-                        half_out[at] = bf16.encode(acc[mi][ni][q]);
+                        half_out[at] = bf16.encode((if (shape.accumulate != 0) bf16.decode(half_out[at]) else 0) + acc[mi][ni][q]);
                     } else if (shape.split_stride != 0) {
                         c[@as(usize, @workGroupId(2)) * shape.split_stride + at] = acc[mi][ni][q];
                     } else if (shape.chunk < shape.k_padded) {

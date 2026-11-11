@@ -93,7 +93,7 @@ pub fn normApply(par: kernels.Parallel, x: []const f32, y: []f32, p: norm.Affine
     kernels.parallelFor(par, l.len / l.channels, 256, ApplyJob{ .x = x.ptr, .y = y.ptr, .p = p, .l = l }, normApplyRows);
 }
 
-const GradJob = struct { io: norm.GradIo, p: norm.Affine, l: norm.Layout };
+const GradJob = struct { io: norm.GradIo(f32), p: norm.Affine, l: norm.Layout };
 
 fn normGradRows(job: GradJob, lo: usize, hi: usize) void {
     const c: usize = job.l.channels;
@@ -112,7 +112,7 @@ fn normGradRows(job: GradJob, lo: usize, hi: usize) void {
     }
 }
 
-pub fn normGradInput(par: kernels.Parallel, io: norm.GradIo, p: norm.Affine, l: norm.Layout) void {
+pub fn normGradInput(par: kernels.Parallel, io: norm.GradIo(f32), p: norm.Affine, l: norm.Layout) void {
     kernels.parallelFor(par, l.len / l.channels, 256, GradJob{ .io = io, .p = p, .l = l }, normGradRows);
 }
 const parts = 8;
@@ -316,13 +316,13 @@ test "row-wise batch-norm apply and input gradient equal the per-element referen
         defer gpa.free(want);
         const got = try gpa.alloc(f32, len);
         defer gpa.free(got);
-        for (0..len) |t| norm.apply(t, x.ptr, want.ptr, p, l);
+        for (0..len) |t| norm.apply(f32, t, x.ptr, want.ptr, p, l);
         normApply(par, x, got, p, l);
         try testing.expectEqualSlices(f32, want, got);
 
         @memset(want, 0.25);
         @memset(got, 0.25);
-        for (0..len) |t| norm.gradInput(t, .{ .x = x.ptr, .dy = dy.ptr, .dx = want.ptr, .sums = &sums, .mask = mask.ptr }, p, l);
+        for (0..len) |t| norm.gradInput(f32, t, .{ .x = x.ptr, .dy = dy.ptr, .dx = want.ptr, .sums = &sums, .mask = mask.ptr }, p, l);
         normGradInput(par, .{ .x = x.ptr, .dy = dy.ptr, .dx = got.ptr, .sums = &sums, .mask = mask.ptr }, p, l);
         for (want, got) |a, b| try testing.expectApproxEqAbs(a, b, 1e-6);
     }
