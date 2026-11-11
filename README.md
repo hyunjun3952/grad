@@ -85,6 +85,10 @@ python scripts/check-onnx.py model.onnx cifar <the ten logits printed above>
 
 The script runs the model in the ONNX reference evaluator and compares it with the engine; the MLP, the MNIST CNN and the CIFAR ResNet-14 agree to 5e-6, so the file can be loaded by onnxruntime, OpenVINO and so on, from Python or any other language. Importing is a separate, run-time-shaped inference engine (grad.onnx.Model, src/onnx/runtime.zig), because a graph read at run time has no compile-time type to live in. It runs on the CPU and supports Conv (strides, pads, dilations, groups), MaxPool, AveragePool, GlobalAveragePool, BatchNormalization, Gemm, MatMul, Add/Sub/Mul/Div with broadcasting, Relu, Sigmoid, Tanh, Gelu, Softmax, Flatten, Reshape, Transpose, Concat, Identity, Dropout. zig build onnx -- model.onnx mnist|cifar 1000 loads a model and measures its accuracy; it reproduces the logits of the engine that exported it to 5 digits. Training an imported graph is not possible.
 
+## bf16 activations
+
+`Tensor(T, shape)` is generic over its element type, and on the GPU the activations of a network can be kept in bf16 (stored as `u16`) between layers while parameters, parameter gradients, optimizer state and the loss stay in f32. `Tape.cast(x, u16)` and `Tape.cast(x, f32)` convert in both directions and pass gradients through; batch norm (also fused with ReLU), `addRelu`, max and average pooling and stride-1 convolutions accept bf16 tensors directly. A bf16 convolution gathers its input straight from the bf16 activations and writes bf16, so the pack and unpack passes of the f32 path disappear, and the element-wise kernels move half the bytes. `zig build cifar -Dbf16=true -- 50 --gpu --tensor-cores ...` casts after the stem and back before the classifier; the CIFAR epoch goes from 18.3 s to 15.4 s in the same session. Limits: GPU only, convolutions need a multiple of 64 input and 32 output channels (checked at compile time), and `matmul`, `relu`, `add`, `mul`, `dropout`, the losses and the ONNX exporter are still f32 only.
+
 ## Optional cuDNN backend
 
 The engine does not need cuDNN, but it can use it: `src/gpu/cudnn.zig` loads `cudnn64_9.dll` dynamically (the same way `nvcuda.dll` is loaded) and drives the legacy descriptor API, with the best algorithm per shape chosen by `cudnnFind*` and cached. `zig build bench -- cudnn` times it on the CIFAR shapes: cuDNN reaches 8 to 10 TFLOPS in f32 (TF32) and 20 to 24 TFLOPS in bf16, versus about 5 TFLOPS for the built-in f32 GEMM and 17 to 18 TFLOPS for the built-in bf16 implicit GEMM. On the CIFAR ResNet-14 an f32 epoch takes 53.7 s with the strict f32 kernels, 25.0 s with the built-in `--tf32` implicit GEMM and 24.1 s with `--cudnn`; the bf16 path (`--tensor-cores`) takes 17.2 s.
@@ -215,7 +219,7 @@ pub fn main(init: std.process.Init) !void {
 A layer is any struct with `init`, `deinit`, `toGpu`, `forward`, `params` and `state`. `nn.initAll`, `nn.params` and `nn.state` walk a tuple of layers, and `grad.trainer.run` takes care of batching, shuffling, augmentation, evaluation, checkpoints and the GPU.
 ## Limitations
 
-- The Linux GPU loader compiles but is untested; f32 tensors (bf16 only inside GEMM), activations in NHWC, tensors of rank 6 or less on the GPU.
+- The Linux GPU loader compiles but is untested; activations are f32 or (on the GPU, for a subset of ops) bf16, in NHWC, tensors of rank 6 or less on the GPU.
 - Grouped and dilated convolutions use a simple one-thread-per-output kernel (correct but not tuned); only the dense stride-1 shapes get the tensor-core paths.
 - Batch sizes are compile-time constants; a program lists the sizes it is built for (`--batch=N` picks one).
 - ONNX files can be imported for CPU inference only, and only single-input graphs can be exported.

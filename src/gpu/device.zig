@@ -214,6 +214,20 @@ inline fn addReluBackwardOf(comptime E: type, out: [*]const E, g: [*]const E, gr
     if (flags & 2 != 0) bf16.store(E, grad_b, t, bf16.load(E, grad_b, t) + v);
 }
 
+export fn addReluQuad(a: [*]const u16, b: [*]const u16, out: [*]u16, n: u32) callconv(.nvptx_kernel) void {
+    const t = globalIndex();
+    if (t * 4 < n) bf16.storeQuad(u16, out, t * 4, @max(bf16.loadQuad(u16, a, t * 4) + bf16.loadQuad(u16, b, t * 4), @as(bf16.Quad, @splat(0))));
+}
+
+export fn addReluBackwardQuad(out: [*]const u16, g: [*]const u16, grad_a: [*]u16, grad_b: [*]u16, n: u32, flags: u32) callconv(.nvptx_kernel) void {
+    const t = globalIndex();
+    if (t * 4 >= n) return;
+    const zero: bf16.Quad = @splat(0);
+    const v = @select(f32, bf16.loadQuad(u16, out, t * 4) > zero, bf16.loadQuad(u16, g, t * 4), zero);
+    if (flags & 1 != 0) bf16.storeQuad(u16, grad_a, t * 4, bf16.loadQuad(u16, grad_a, t * 4) + v);
+    if (flags & 2 != 0) bf16.storeQuad(u16, grad_b, t * 4, bf16.loadQuad(u16, grad_b, t * 4) + v);
+}
+
 export fn addRelu(a: [*]const f32, b: [*]const f32, out: [*]f32, n: u32) callconv(.nvptx_kernel) void {
     addReluOf(f32, a, b, out, n);
 }
@@ -301,7 +315,7 @@ inline fn columnReduceOf(comptime E: type, args: ga.ColumnArgs) void {
     var first: f32 = 0;
     var second: f32 = 0;
     if (valid) {
-        const m = mean[ch] * scale;
+        const m = if (kind == 2) bf16.load(E, a, ch) else mean[ch] * scale;
         const s = inv_std[ch];
         var r = @as(usize, @workGroupId(0)) * 8 + group;
         while (r < rows) : (r += row_stride) {
@@ -356,6 +370,14 @@ export fn columnCombine(partial: [*]const f32, out: [*]f32, blocks: u32, width: 
 }
 
 export fn batchNormFinish(sums: [*]const f32, shift: [*]const f32, st: nm.Stats, l: nm.Layout) callconv(.nvptx_kernel) void {
+    batchNormFinishOf(f32, sums, shift, st, l);
+}
+
+export fn batchNormFinishHalf(sums: [*]const f32, shift: [*]const u16, st: nm.Stats, l: nm.Layout) callconv(.nvptx_kernel) void {
+    batchNormFinishOf(u16, sums, shift, st, l);
+}
+
+inline fn batchNormFinishOf(comptime E: type, sums: [*]const f32, shift: [*]const E, st: nm.Stats, l: nm.Layout) void {
     const mean, const inv_std, const running_mean, const running_var = .{ st.mean, st.inv_std, st.running_mean, st.running_var };
     const c = l.channels;
     const rows = l.len / c;
@@ -368,7 +390,7 @@ export fn batchNormFinish(sums: [*]const f32, shift: [*]const f32, st: nm.Stats,
     }
     const n: f32 = @floatFromInt(rows);
     const offset = sums[ch] / n;
-    const mu = shift[ch] + offset;
+    const mu = bf16.load(E, shift, ch) + offset;
     const variance = @max(sums[c + ch] / n - offset * offset, 0);
     mean[ch] = mu;
     inv_std[ch] = 1 / @sqrt(variance + nm.eps);
@@ -384,6 +406,14 @@ export fn batchNormGradFinish(sums: [*]const f32, gamma_grad: [*]f32, beta_grad:
 }
 export fn batchNormApply(x: [*]const f32, y: [*]f32, p: nm.Affine, l: nm.Layout) callconv(.nvptx_kernel) void {
     if (globalIndex() < l.len) nm.apply(f32, globalIndex(), x, y, p, l);
+}
+
+export fn batchNormApplyQuad(x: [*]const u16, y: [*]u16, p: nm.Affine, l: nm.Layout) callconv(.nvptx_kernel) void {
+    if (globalIndex() * 4 < l.len) nm.applyQuad(u16, globalIndex() * 4, x, y, p, l);
+}
+
+export fn batchNormGradInputQuad(io: nm.GradIo(u16), p: nm.Affine, l: nm.Layout) callconv(.nvptx_kernel) void {
+    if (globalIndex() * 4 < l.len) nm.gradInputQuad(u16, globalIndex() * 4, io, p, l);
 }
 
 export fn batchNormApplyHalf(x: [*]const u16, y: [*]u16, p: nm.Affine, l: nm.Layout) callconv(.nvptx_kernel) void {
@@ -496,69 +526,82 @@ export fn dropout(src: [*]const f32, dst: [*]f32, len: u32, seed: u64, keep: f32
     if (globalIndex() < len) drop.apply(globalIndex(), src, dst, seed, keep, accumulate != 0);
 }
 
-const Slot = struct { w: u64, g: u64, m: u64, v: u64, at: usize, valid: bool };
+const tensor_chunk = 1024;
 
-fn locate(table: ga.TensorTable, t: usize) Slot {
-    var slot: Slot = .{ .w = 0, .g = 0, .m = 0, .v = 0, .at = t, .valid = false };
-    inline for (0..ga.max_tensors) |i| {
-        if (!slot.valid and i < table.count) {
-            if (slot.at < table.len[i]) {
-                slot.w = table.w[i];
-                slot.g = table.g[i];
-                slot.m = table.m[i];
-                slot.v = table.v[i];
-                slot.valid = true;
-            } else {
-                slot.at -= table.len[i];
-            }
-        }
-    }
-    return slot;
-}
+const TensorBlock = struct { w: u64, g: u64, m: u64, v: u64, at: usize, n: usize };
+
+const current_block = struct {
+    var words: [6]u64 addrspace(.shared) = undefined;
+};
 
 fn pointer(comptime T: type, address: u64) T {
     return @ptrFromInt(address);
 }
 
+inline fn tableBlock(table: ga.TensorTable) TensorBlock {
+    if (@workItemId(0) == 0) {
+        const block: u32 = @workGroupId(0);
+        inline for (0..ga.max_tensors) |i| {
+            const last = i + 1 >= table.count or block < table.first_block[@min(i + 1, ga.max_tensors - 1)];
+            if (i < table.count and block >= table.first_block[i] and last) {
+                const offset = (block - table.first_block[i]) * tensor_chunk;
+                current_block.words = .{ table.w[i], table.g[i], table.m[i], table.v[i], offset, @min(tensor_chunk, table.len[i] - offset) };
+            }
+        }
+    }
+    barrier();
+    const w = current_block.words;
+    barrier();
+    return .{ .w = w[0], .g = w[1], .m = w[2], .v = w[3], .at = w[4], .n = w[5] };
+}
+
 export fn zeroGrads(table: ga.TensorTable) callconv(.nvptx_kernel) void {
-    const slot = locate(table, globalIndex());
-    if (slot.valid) pointer([*]f32, slot.g)[slot.at] = 0;
+    const b = tableBlock(table);
+    var e: usize = @workItemId(0);
+    while (e < b.n) : (e += threads) pointer([*]f32, b.g)[b.at + e] = 0;
 }
 
 export fn sgd(table: ga.TensorTable, lr: f32) callconv(.nvptx_kernel) void {
-    const slot = locate(table, globalIndex());
-    if (slot.valid) pointer([*]f32, slot.w)[slot.at] -= lr * pointer([*]const f32, slot.g)[slot.at];
+    const b = tableBlock(table);
+    var e: usize = @workItemId(0);
+    while (e < b.n) : (e += threads) pointer([*]f32, b.w)[b.at + e] -= lr * pointer([*]const f32, b.g)[b.at + e];
 }
 
 export fn ema(table: ga.TensorTable, decay: f32) callconv(.nvptx_kernel) void {
-    const slot = locate(table, globalIndex());
-    if (!slot.valid) return;
-    const shadow = pointer([*]f32, slot.g) + slot.at;
-    shadow[0] = decay * shadow[0] + (1 - decay) * pointer([*]const f32, slot.w)[slot.at];
+    const b = tableBlock(table);
+    var e: usize = @workItemId(0);
+    while (e < b.n) : (e += threads) {
+        const shadow = pointer([*]f32, b.g) + b.at + e;
+        shadow[0] = decay * shadow[0] + (1 - decay) * pointer([*]const f32, b.w)[b.at + e];
+    }
 }
 
 export fn swapWeights(table: ga.TensorTable) callconv(.nvptx_kernel) void {
-    const slot = locate(table, globalIndex());
-    if (!slot.valid) return;
-    const live = pointer([*]f32, slot.w) + slot.at;
-    const shadow = pointer([*]f32, slot.g) + slot.at;
-    const kept = live[0];
-    live[0] = shadow[0];
-    shadow[0] = kept;
+    const b = tableBlock(table);
+    var e: usize = @workItemId(0);
+    while (e < b.n) : (e += threads) {
+        const live = pointer([*]f32, b.w) + b.at + e;
+        const shadow = pointer([*]f32, b.g) + b.at + e;
+        const kept = live[0];
+        live[0] = shadow[0];
+        shadow[0] = kept;
+    }
 }
 
 export fn adam(table: ga.TensorTable, hp: ga.AdamArgs) callconv(.nvptx_kernel) void {
-    const slot = locate(table, globalIndex());
-    if (!slot.valid) return;
-    const w = pointer([*]f32, slot.w) + slot.at;
-    const m = pointer([*]f32, slot.m) + slot.at;
-    const v = pointer([*]f32, slot.v) + slot.at;
-    const grad = pointer([*]const f32, slot.g)[slot.at];
-    const m_new = hp.beta1 * m[0] + (1 - hp.beta1) * grad;
-    const v_new = hp.beta2 * v[0] + (1 - hp.beta2) * grad * grad;
-    m[0] = m_new;
-    v[0] = v_new;
-    w[0] -= hp.step * m_new / (@sqrt(v_new) * hp.inv_sqrt_c2 + hp.eps) + hp.decay * w[0];
+    const b = tableBlock(table);
+    var e: usize = @workItemId(0);
+    while (e < b.n) : (e += threads) {
+        const w = pointer([*]f32, b.w) + b.at + e;
+        const m = pointer([*]f32, b.m) + b.at + e;
+        const v = pointer([*]f32, b.v) + b.at + e;
+        const grad = pointer([*]const f32, b.g)[b.at + e];
+        const m_new = hp.beta1 * m[0] + (1 - hp.beta1) * grad;
+        const v_new = hp.beta2 * v[0] + (1 - hp.beta2) * grad * grad;
+        m[0] = m_new;
+        v[0] = v_new;
+        w[0] -= hp.step * m_new / (@sqrt(v_new) * hp.inv_sqrt_c2 + hp.eps) + hp.decay * w[0];
+    }
 }
 export fn gather(images: [*]const f32, labels_src: [*]const u8, order: [*]const u32, batch: [*]f32, labels_out: [*]u8, labels_other: [*]u8, args: ga.GatherArgs) callconv(.nvptx_kernel) void {
     const t = globalIndex();

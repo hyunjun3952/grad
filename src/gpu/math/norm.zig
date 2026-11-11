@@ -27,6 +27,30 @@ pub inline fn gradInput(comptime E: type, t: usize, io: GradIo(E), p: Affine, l:
     bf16.store(E, io.dx, t, bf16.load(E, io.dx, t) + p.gamma[ch] * p.inv_std[ch] / n * (n * g - io.sums[ch] - x_hat * io.sums[l.channels + ch]));
 }
 
+pub inline fn applyQuad(comptime E: type, t: usize, x: [*]const E, y: [*]E, p: Affine, l: Layout) void {
+    const ch = t % l.channels;
+    const gamma: bf16.Quad = p.gamma[ch..][0..4].*;
+    const mean: bf16.Quad = p.mean[ch..][0..4].*;
+    const inv_std: bf16.Quad = p.inv_std[ch..][0..4].*;
+    const beta: bf16.Quad = p.beta[ch..][0..4].*;
+    const v = gamma * (bf16.loadQuad(E, x, t) - mean) * inv_std + beta;
+    bf16.storeQuad(E, y, t, if (l.flag != 0) @max(v, @as(bf16.Quad, @splat(0))) else v);
+}
+
+pub inline fn gradInputQuad(comptime E: type, t: usize, io: GradIo(E), p: Affine, l: Layout) void {
+    const ch = t % l.channels;
+    const n: bf16.Quad = @splat(@floatFromInt(l.len / l.channels));
+    const gamma: bf16.Quad = p.gamma[ch..][0..4].*;
+    const mean: bf16.Quad = p.mean[ch..][0..4].*;
+    const inv_std: bf16.Quad = p.inv_std[ch..][0..4].*;
+    const sum_dy: bf16.Quad = io.sums[ch..][0..4].*;
+    const sum_dyx: bf16.Quad = io.sums[l.channels + ch ..][0..4].*;
+    const x_hat = (bf16.loadQuad(E, io.x, t) - mean) * inv_std;
+    const dy = bf16.loadQuad(E, io.dy, t);
+    const g = if (l.flag != 0) @select(f32, bf16.loadQuad(E, io.mask, t) > @as(bf16.Quad, @splat(0)), dy, @as(bf16.Quad, @splat(0))) else dy;
+    bf16.storeQuad(E, io.dx, t, bf16.loadQuad(E, io.dx, t) + gamma * inv_std / n * (n * g - sum_dy - x_hat * sum_dyx));
+}
+
 pub fn stats(x: []const f32, st: Stats, c: usize, training: bool) void {
     std.debug.assert(c <= max_channels);
     if (!training) {

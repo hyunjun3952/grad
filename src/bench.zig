@@ -516,13 +516,14 @@ fn cpuOps(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
     const Act = Tensor(f32, &.{ 64, 24, 24, 16 });
     const Channels = Tensor(f32, &.{16});
 
-    inline for (.{ .{ "conv 5x5 1->16", Conv1 }, .{ "conv 5x5 16->32", Conv2 } }) |case| {
+    inline for (.{ .{ "conv 5x5 1->16 (image input)", Conv1, false }, .{ "conv 5x5 16->32", Conv2, true } }) |case| {
         var best_forward: f64 = 1e9;
         var best_backward: f64 = 1e9;
         for (0..20) |_| {
             _ = arena.reset(.retain_capacity);
             var tape: Tape = .{ .gpa = arena.allocator(), .par = par };
-            const x = try tape.leaf(try @FieldType(case[1], "x").empty(arena.allocator()));
+            const input = try @FieldType(case[1], "x").empty(arena.allocator());
+            const x = if (case[2]) try tape.leaf(input) else try tape.constant(input);
             const w = try tape.leaf(try @FieldType(case[1], "w").empty(arena.allocator()));
             @memset(x.value.data, 0.5);
             @memset(w.value.data, 0.25);

@@ -93,6 +93,10 @@ const Kernel = enum {
     avgPoolBackwardHalf,
     addReluHalf,
     addReluBackwardHalf,
+    addReluQuad,
+    addReluBackwardQuad,
+    batchNormApplyQuad,
+    batchNormGradInputQuad,
     dropout,
     columnReduce,
     columnReduceHalf,
@@ -101,6 +105,7 @@ const Kernel = enum {
     columnCombine,
     splitCombine,
     batchNormFinish,
+    batchNormFinishHalf,
     batchNormApply,
     batchNormGradFinish,
     batchNormGradInput,
@@ -611,12 +616,14 @@ pub const Gpu = struct {
 
     pub fn addRelu(self: *Gpu, a: anytype, b: anytype, out: anytype) Error!void {
         const E = @typeInfo(@TypeOf(out)).pointer.child;
+        if (E == u16 and out.len % 4 == 0) return self.launchFlat(.addReluQuad, out.len / 4, .{ a, b, out, out.len });
         try self.launchFlat(if (E == u16) .addReluHalf else .addRelu, out.len, .{ a, b, out, out.len });
     }
 
     pub fn addReluBackward(self: *Gpu, out: anytype, g: anytype, grad_a: anytype, grad_b: anytype, a_needs_grad: bool, b_needs_grad: bool) Error!void {
         const E = @typeInfo(@TypeOf(out)).pointer.child;
         const flags: u32 = @as(u32, @intFromBool(a_needs_grad)) | @as(u32, @intFromBool(b_needs_grad)) << 1;
+        if (E == u16 and out.len % 4 == 0) return self.launchFlat(.addReluBackwardQuad, out.len / 4, .{ out, g, grad_a, grad_b, out.len, flags });
         try self.launchFlat(if (E == u16) .addReluBackwardHalf else .addReluBackward, out.len, .{ out, g, grad_a, grad_b, out.len, flags });
     }
 
@@ -681,19 +688,13 @@ pub const Gpu = struct {
     pub fn batchNormStats(self: *Gpu, x: anytype, st: norm.Stats, c: usize, training: bool) Error!void {
         const E = @typeInfo(@TypeOf(x)).pointer.child;
         const sums = try self.scratchZeroed(f32, 2 * c);
-        const shift: []const f32 = if (E == f32) x[0..c] else blk: {
-            const first_row = try self.scratch(f32, c);
-            try self.fromHalf(x[0..c], first_row);
-            break :blk first_row;
-        };
-        var args = columns(x, sums, .shifted_moments);
-        args.mean = shift.ptr;
-        if (training) try self.columnReduce(E, args);
-        try self.launchFlat(.batchNormFinish, c, .{ sums, shift, st, norm.Layout{ .len = @intCast(x.len), .channels = @intCast(c), .flag = @intFromBool(training) } });
+        if (training) try self.columnReduce(E, columns(x, sums, .shifted_moments));
+        try self.launchFlat(if (E == u16) .batchNormFinishHalf else .batchNormFinish, c, .{ sums, x[0..c], st, norm.Layout{ .len = @intCast(x.len), .channels = @intCast(c), .flag = @intFromBool(training) } });
     }
 
     pub fn batchNormApply(self: *Gpu, x: anytype, y: anytype, p: norm.Affine, l: norm.Layout) Error!void {
         const E = @typeInfo(@TypeOf(x)).pointer.child;
+        if (E == u16 and l.channels % 4 == 0 and x.len % 4 == 0) return self.launchFlat(.batchNormApplyQuad, x.len / 4, .{ x, y, p, l });
         try self.launchFlat(if (E == u16) .batchNormApplyHalf else .batchNormApply, x.len, .{ x, y, p, l });
     }
 
@@ -710,6 +711,7 @@ pub const Gpu = struct {
 
     pub fn batchNormGradInput(self: *Gpu, io: anytype, p: norm.Affine, l: norm.Layout) Error!void {
         const E = @typeInfo(@TypeOf(io.x)).pointer.child;
+        if (E == u16 and l.channels % 4 == 0 and l.len % 4 == 0) return self.launchFlat(.batchNormGradInputQuad, l.len / 4, .{ io, p, l });
         try self.launchFlat(if (E == u16) .batchNormGradInputHalf else .batchNormGradInput, l.len, .{ io, p, l });
     }
     pub fn dropout(self: *Gpu, src: []const f32, dst: []f32, seed: u64, keep: f32, accumulate: bool) Error!void {
@@ -717,9 +719,13 @@ pub const Gpu = struct {
     }
 
     fn launchTable(self: *Gpu, kernel: Kernel, table: ga.TensorTable, args: anytype) Error!void {
-        var total: usize = 0;
-        for (table.len[0..table.count]) |len| total += len;
-        try self.launchFlat(kernel, total, .{table} ++ args);
+        var blocks: u32 = 0;
+        var launched = table;
+        for (table.len[0..table.count], launched.first_block[0..table.count]) |len, *first| {
+            first.* = blocks;
+            blocks += ceilDiv(len, 1024);
+        }
+        try self.launch(kernel, .{ blocks, 1, 1 }, .{launched} ++ args);
     }
 
     pub fn zeroGrads(self: *Gpu, table: ga.TensorTable) Error!void {

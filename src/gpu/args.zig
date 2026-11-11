@@ -11,6 +11,7 @@ pub const max_tensors = 64;
 pub const TensorTable = extern struct {
     count: u32,
     len: [max_tensors]u32,
+    first_block: [max_tensors]u32,
     w: [max_tensors]u64,
     g: [max_tensors]u64,
     m: [max_tensors]u64,
