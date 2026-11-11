@@ -35,7 +35,7 @@ powershell -File scripts/fetch-data.ps1            # MNIST, Fashion-MNIST, CIFAR
 
 zig build regression                                # fit a curve with a small MLP (library API without the trainer)
 zig build charlm -- 1500 --gpu                      # character-level GRU on Tiny Shakespeare, then sample text
-zig build transformer -- 1500 --gpu                 # character-level Transformer (2 causal blocks, width 64), then sample text
+zig build transformer -- 1500 --gpu                 # character-level Transformer (3 causal blocks, width 128), then sample text
 zig build mnist -- 5                                # MLP on the CPU
 zig build mnist -- 5 --gpu                          # MLP on the GPU
 zig build mnist -Dcnn=true -- 30 --gpu --shift=1 --rotate=8 --zoom=0.05
@@ -122,7 +122,7 @@ zig build bench -- cudnn        # cuDNN convolutions on the CIFAR shapes (needs 
 | CIFAR-100 ResNet-14 (`-Dcifar100=true`) | GPU, bf16 | 17.3 s |
 | CIFAR-10 ResNet-14 64-192-384 (`-Dwide=true`) | GPU, bf16 | 25.3 s |
 | Character GRU, 256 units, 32 x 64 steps | GPU | about 70 ms per step (whole run, including start-up and the 600-character sample) |
-| Character Transformer, 2 blocks, width 64, 16 x 64 characters | GPU | 1500 steps in 22 s including the build and the sample; loss 1.95 nats/char (single run, not tuned) |
+| Character Transformer, 3 blocks, width 128, 4 heads, 32 x 64 characters | GPU | 84.6 s for 1500 steps (whole run, same accounting as the GRU row); loss 1.580 nats/char, the GRU reaches 1.579 in 101.5 s in the same session; the Transformer has about 640K parameters against about 330K for the GRU (counted by hand, not measured) |
 
 The MNIST CNN on the CPU went from 24.6 s to 13.2 s with the row-wise im2col/col2im, the stored max-pool winners and the vectorised batch-norm statistics (see `zig build bench -- cpu`); the bf16 CIFAR epoch has been 31.7, 25.0, 17.6 and now 17.2 s over the last rounds (fused ops, implicit GEMM, 64x128 and 128x128 tiles).
 
@@ -178,7 +178,7 @@ examples/
   mnist/  cifar/         image-classification programs built on the trainer
   regression/            a hand-written training loop: MLP, mse, Adam
   charlm/                a character-level GRU unrolled over 64 steps, with text generation
-  transformer/           a character-level Transformer with learned positions, 16 x 64 characters per step
+  transformer/           a character-level Transformer with learned positions, 32 x 64 characters per step
 scripts/fetch-data.ps1   dataset download with checksum verification
 scripts/check-onnx.py    compare an exported ONNX file with the engine (needs numpy and onnx)
 ```

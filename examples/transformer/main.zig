@@ -7,14 +7,15 @@ const Tape = grad.autograd.Tape;
 const Var = grad.autograd.Var;
 
 const vocab = 128;
-const width = 64;
+const width = 128;
 const heads = 4;
 const context = 64;
-const batch = 16;
+const batch = 32;
 const rows = batch * context;
 const Net = struct {
     nn.Embedding(vocab, width),
     nn.Embedding(context, width),
+    nn.TransformerBlock(width, heads, context),
     nn.TransformerBlock(width, heads, context),
     nn.TransformerBlock(width, heads, context),
     nn.LayerNorm(width),
@@ -41,9 +42,9 @@ const Run = struct {
 
 // Token and position embeddings are added, passed through two causal blocks, and projected to one score per character.
 fn forward(model: Net, tape: *Tape, tokens: []const u32, positions: []const u32) !Var(Logits) {
-    const token_table, const position_table, const first, const second, const final_norm, const head = model;
+    const token_table, const position_table, const first, const second, const third, const final_norm, const head = model;
     const embedded = try tape.add(try token_table.forward(tape, rows, tokens), try position_table.forward(tape, rows, positions));
-    const mixed = try second.forward(tape, try first.forward(tape, embedded));
+    const mixed = try third.forward(tape, try second.forward(tape, try first.forward(tape, embedded)));
     return head.forward(tape, try final_norm.forward(tape, mixed));
 }
 
@@ -172,7 +173,7 @@ pub fn main(init: std.process.Init) !void {
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    try out.print("character-level Transformer, {d} blocks, width {d}, {d} heads, context {d}, {d} characters of text, {s}\n", .{ 2, width, heads, context, text.len, if (gpu != null) "GPU" else "CPU" });
+    try out.print("character-level Transformer, {d} blocks, width {d}, {d} heads, context {d}, {d} characters of text, {s}\n", .{ 3, width, heads, context, text.len, if (gpu != null) "GPU" else "CPU" });
     try out.flush();
 
     var running: f64 = 0;
