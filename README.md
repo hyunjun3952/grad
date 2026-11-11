@@ -6,9 +6,9 @@ The goal is an engine that sits between "C with pointers" and "PyTorch": plain s
 
 | Task | Model | Accuracy | Time per epoch |
 | --- | --- | --- | --- |
-| MNIST | MLP 784-128-10 | 98.1% (10 epochs) | 0.19 s GPU, 0.26 s CPU (6 threads) |
-| MNIST | CNN conv5x16-conv5x32 + BatchNorm | 99.5% (30 epochs, light augmentation) | 0.9 s GPU, 19.5 s CPU |
-| CIFAR-10 | ResNet-14, widths 64-128-256 | 94.1% (50 epochs) to 94.9% (100 epochs); flip + shift + CutMix + label smoothing + EMA, +0.4 with `--tta` | 17.2 s GPU (bf16 tensor cores), 24.6 s (TF32), 52.8 s (strict f32) |
+| MNIST | MLP 784-128-10 | 98.1% (10 epochs) | 0.21 s GPU, 0.32 s CPU (6 threads) |
+| MNIST | CNN conv5x16-conv5x32 + BatchNorm | 99.5% (30 epochs, light augmentation) | 0.87 s GPU, 13.2 s CPU |
+| CIFAR-10 | ResNet-14, widths 64-128-256 | 94.1% (50 epochs) to 94.9% (100 epochs); flip + shift + CutMix + label smoothing + EMA, +0.4 with `--tta` | 17.2 s GPU (bf16 tensor cores), 25.0 s (TF32), 53.7 s (strict f32) |
 | CIFAR-10 | ResNet-14, widths 64-192-384 (`-Dwide=true`) | 94.8% / 95.3% with `--tta` (50 epochs), 95.4% / **96.2%** with `--tta` (100 epochs); same recipe | 24.7 s GPU (bf16 tensor cores) |
 
 Measured on an i5-8500 (6 cores) and an RTX 3060 12 GB. About 7,600 lines including 81 tests, with no comments except for explained magic numbers.
@@ -87,20 +87,74 @@ The script runs the model in the ONNX reference evaluator and compares it with t
 
 ## Optional cuDNN backend
 
-The engine does not need cuDNN, but it can use it: `src/gpu/cudnn.zig` loads `cudnn64_9.dll` dynamically (the same way `nvcuda.dll` is loaded) and drives the legacy descriptor API, with the best algorithm per shape chosen by `cudnnFind*` and cached. `zig build bench -- cudnn` times it on the CIFAR shapes: cuDNN reaches 8 to 10 TFLOPS in f32 (TF32) and 20 to 24 TFLOPS in bf16, versus about 5 TFLOPS for the built-in f32 GEMM and 17 to 18 TFLOPS for the built-in bf16 implicit GEMM. On the CIFAR ResNet-14 an f32 epoch takes 52.8 s with the strict f32 kernels, 24.6 s with the built-in `--tf32` implicit GEMM and 24.5 s with `--cudnn`; the bf16 path (`--tensor-cores`) takes 17.2 s.
+The engine does not need cuDNN, but it can use it: `src/gpu/cudnn.zig` loads `cudnn64_9.dll` dynamically (the same way `nvcuda.dll` is loaded) and drives the legacy descriptor API, with the best algorithm per shape chosen by `cudnnFind*` and cached. `zig build bench -- cudnn` times it on the CIFAR shapes: cuDNN reaches 8 to 10 TFLOPS in f32 (TF32) and 20 to 24 TFLOPS in bf16, versus about 5 TFLOPS for the built-in f32 GEMM and 17 to 18 TFLOPS for the built-in bf16 implicit GEMM. On the CIFAR ResNet-14 an f32 epoch takes 53.7 s with the strict f32 kernels, 25.0 s with the built-in `--tf32` implicit GEMM and 24.1 s with `--cudnn`; the bf16 path (`--tensor-cores`) takes 17.2 s.
 
 ## Benchmarks
 
+Measured on an Intel i5-8500 (6 cores, no hyper-threading) and an NVIDIA RTX 3060 12 GB, Windows 11, Zig 0.17.1, `ReleaseFast`. Times are the last epoch of a short run (the first one includes warm-up); GPU kernel numbers are the best of 20 runs. Every number can be reproduced with the commands below.
+
 ```powershell
-zig build bench                 # CPU matmul kernels, allocation overhead, thread scaling
-zig build bench -- step         # per-op profile of an MLP training step
+zig build bench                 # CPU matmul kernels, allocation overhead, MLP step profile
+zig build bench -- cpu          # per-op CPU times of the MNIST CNN
 zig build bench -- gpu          # FP32 GEMM on the device
-zig build bench -- tc           # FP32 vs bf16 tensor-core GEMM, packing included, implicit-GEMM convolutions
+zig build bench -- tc           # FP32 vs bf16 tensor-core GEMM, implicit-GEMM convolutions
 zig build bench -- cudnn        # cuDNN convolutions on the CIFAR shapes (needs the DLLs)
 ```
 
-On this machine: the CPU GEMM reaches about 108 GFLOPS per thread (packed B, 6x2 register tile); the GPU FP32 GEMM about 5 TFLOPS; the bf16 tensor-core kernel 12.8 to 21.6 TFLOPS on square and MLP shapes (end to end, packing included), with a relative RMS error of about 2e-3 against FP32.
+### Training, seconds per epoch
 
+| Model | Backend | Epoch |
+| --- | --- | --- |
+| MNIST MLP 784-128-10, batch 64 | CPU, 6 threads | 0.32 s |
+| | GPU | 0.21 s |
+| MNIST / Fashion-MNIST CNN | CPU, 6 threads | 13.2 s |
+| | GPU | 0.87 s |
+| CIFAR-10 ResNet-14 64-128-256, batch 64 | GPU, bf16 tensor cores (`--tensor-cores`) | **17.2 s** |
+| | GPU, TF32 tensor cores (`--tf32`) | 25.0 s |
+| | GPU, cuDNN TF32 (`--cudnn`) | 24.1 s |
+| | GPU, strict f32 | 53.7 s |
+| | GPU, bf16, `--deterministic` | 18.7 s |
+| CIFAR-100 ResNet-14 (`-Dcifar100=true`) | GPU, bf16 | 17.3 s |
+| CIFAR-10 ResNet-14 64-192-384 (`-Dwide=true`) | GPU, bf16 | 25.3 s |
+| Character GRU, 256 units, 32 x 64 steps | GPU | about 70 ms per step (whole run, including start-up and the 600-character sample) |
+
+The MNIST CNN on the CPU went from 24.6 s to 13.2 s with the row-wise im2col/col2im, the stored max-pool winners and the vectorised batch-norm statistics (see `zig build bench -- cpu`); the bf16 CIFAR epoch has been 31.7, 25.0, 17.6 and now 17.2 s over the last rounds (fused ops, implicit GEMM, 64x128 and 128x128 tiles).
+
+### GPU kernels (TFLOPS, kernel only)
+
+| Kernel | Shape | TFLOPS |
+| --- | --- | --- |
+| FP32 SIMT GEMM | 4096 x 4096 x 4096 | 5.1 |
+| bf16 tensor-core GEMM (cp.async, ldmatrix, mma.sync) | 4096 x 4096 x 4096 | 24.1 (21.7 with operand packing) |
+| bf16 implicit-GEMM conv forward | 3x3, 64 -> 64, 32x32, batch 64 | 17.8 |
+| | 3x3, 128 -> 128, 16x16 (128x128 tile) | 19.8 |
+| | 3x3, 256 -> 256, 8x8 | 18.6 |
+| bf16 implicit-GEMM conv weight gradient | the same three shapes | 13.4 / 18.5 / 17.6 |
+| TF32 implicit-GEMM conv forward | the same three shapes | 9.1 / 8.9 / 8.8 |
+| TF32 implicit-GEMM conv weight gradient | the same three shapes | 5.8 / 7.7 / 7.7 |
+| cuDNN 9.28, bf16 forward / dgrad / wgrad | 64 -> 64 | 23.8 / 19.1 / 16.2 |
+| | 128 -> 128 | 21.0 / 23.6 / 17.5 |
+| | 256 -> 256 | 22.5 / 19.5 / 19.9 |
+| cuDNN 9.28, TF32 forward | 64 / 128 / 256 channels | 8.4 / 10.0 / 10.6 |
+
+The bf16 tensor-core path has a relative RMS error of about 2e-3 against FP32. The built-in bf16 convolution reaches 75 to 90% of cuDNN; the element-wise kernels (batch norm, ReLU, packing) already run at the memory bandwidth of the card (about 430 GB/s measured on batch-norm apply), which is why activations stored in bf16 are the next speed-up.
+
+### CPU kernels
+
+| Kernel | Result |
+| --- | --- |
+| tiled + packed GEMM, 6x2 register tile, 1 thread | 100 to 112 GFLOPS (512 x 512: 111.7) |
+| `@Vector` triple loop / naive triple loop | 17 to 20 / 1.3 to 2.2 GFLOPS |
+| MLP training step, batch 64, 1 thread / 6 threads | 378 us (2.6k steps/s) / 149 us (6.7k steps/s) |
+
+Per-op CPU time of the MNIST CNN at batch 64 (forward / backward, ms): conv 5x5 1->16 0.84 / 2.10, conv 5x5 16->32 0.50 / 2.48, max-pool 0.90 / 0.09, batch norm + ReLU 0.76 / 0.73. The backward of the convolutions is a tall-skinny GEMM and is the next thing to split across threads.
+
+### Inference through ONNX (`zig build onnx`, CPU, 6 threads)
+
+| Model | Speed |
+| --- | --- |
+| MNIST CNN | 1.6k images/s |
+| CIFAR ResNet-14 | 37 images/s (convolutions as im2col + tiled GEMM; it was 6 images/s with direct loops) |
 ## Layout
 
 ```
