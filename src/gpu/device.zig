@@ -35,6 +35,20 @@ inline fn blockSum(value: f32, tid: usize) f32 {
     return total;
 }
 
+// Adds a value across the 32 lanes of a warp; every lane gets the total. All lanes of the warp must call it together.
+inline fn warpSum(value: f32) f32 {
+    var total = value;
+    inline for (.{ 16, 8, 4, 2, 1 }) |offset| {
+        const other = asm volatile ("shfl.sync.bfly.b32 %[out], %[in], %[offset], 0x1f, 0xffffffff;"
+            : [out] "=r" (-> u32),
+            : [in] "r" (@as(u32, @bitCast(total))),
+              [offset] "r" (@as(u32, offset)),
+        );
+        total += @as(f32, @bitCast(other));
+    }
+    return total;
+}
+
 // Waits until every thread of the block has reached this point.
 inline fn barrier() void {
     asm volatile ("bar.sync 0;" ::: .{ .memory = true });
@@ -234,14 +248,29 @@ export fn addToHalf(x: [*]const f32, y: [*]u16, n: u32) callconv(.nvptx_kernel) 
     if (t < n) y[t] = bf16.encode(bf16.decode(y[t]) + x[t]);
 }
 
+// NOTE: layer norm uses one warp per row (eight rows per block), the lanes striding over the columns and meeting in warpSum,
+// because one thread per row left most of the device idle. The sums run in another order than the CPU loop, so results agree only to rounding.
 inline fn layerNormRowsOf(comptime E: type, x: [*]const E, y: [*]E, gamma: [*]const f32, beta: [*]const f32, mean: [*]f32, inv_std: [*]f32, rows: u32, cols: u32) void {
-    const r = globalIndex();
+    const tid: usize = @workItemId(0);
+    const lane = tid % 32;
+    const r = @as(usize, @workGroupId(0)) * 8 + tid / 32;
     if (r >= rows) return;
-    const row = ln.forwardRow(E, x + r * cols, y + r * cols, gamma, beta, cols);
-    mean[r] = row.mean;
-    inv_std[r] = row.inv_std;
+    const xr = x + r * cols;
+    var sum: f32 = 0;
+    var j = lane;
+    while (j < cols) : (j += 32) sum += bf16.load(E, xr, j);
+    const mu = warpSum(sum) / @as(f32, @floatFromInt(cols));
+    var square: f32 = 0;
+    j = lane;
+    while (j < cols) : (j += 32) square += (bf16.load(E, xr, j) - mu) * (bf16.load(E, xr, j) - mu);
+    const inverse = 1 / @sqrt(warpSum(square) / @as(f32, @floatFromInt(cols)) + ln.eps);
+    j = lane;
+    while (j < cols) : (j += 32) bf16.store(E, y + r * cols, j, gamma[j] * (bf16.load(E, xr, j) - mu) * inverse + beta[j]);
+    if (lane == 0) {
+        mean[r] = mu;
+        inv_std[r] = inverse;
+    }
 }
-
 export fn layerNormRows(x: [*]const f32, y: [*]f32, gamma: [*]const f32, beta: [*]const f32, mean: [*]f32, inv_std: [*]f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
     layerNormRowsOf(f32, x, y, gamma, beta, mean, inv_std, rows, cols);
 }
@@ -251,10 +280,31 @@ export fn layerNormRowsHalf(x: [*]const u16, y: [*]u16, gamma: [*]const f32, bet
 }
 
 inline fn layerNormBackwardOf(comptime E: type, x: [*]const E, dy: [*]const E, dx: [*]E, gamma: [*]const f32, mean: [*]const f32, inv_std: [*]const f32, rows: u32, cols: u32) void {
-    const r = globalIndex();
-    if (r < rows) ln.backwardRow(E, x + r * cols, dy + r * cols, dx + r * cols, gamma, .{ .mean = mean[r], .inv_std = inv_std[r] }, cols);
+    const tid: usize = @workItemId(0);
+    const lane = tid % 32;
+    const r = @as(usize, @workGroupId(0)) * 8 + tid / 32;
+    if (r >= rows) return;
+    const xr = x + r * cols;
+    const dyr = dy + r * cols;
+    const mu = mean[r];
+    const inverse = inv_std[r];
+    var sum_g: f32 = 0;
+    var sum_gx: f32 = 0;
+    var j = lane;
+    while (j < cols) : (j += 32) {
+        const g = bf16.load(E, dyr, j) * gamma[j];
+        sum_g += g;
+        sum_gx += g * (bf16.load(E, xr, j) - mu) * inverse;
+    }
+    sum_g = warpSum(sum_g);
+    sum_gx = warpSum(sum_gx);
+    const n: f32 = @floatFromInt(cols);
+    j = lane;
+    while (j < cols) : (j += 32) {
+        const g = bf16.load(E, dyr, j) * gamma[j];
+        bf16.store(E, dx + r * cols, j, bf16.load(E, dx + r * cols, j) + inverse * (g - sum_g / n - (bf16.load(E, xr, j) - mu) * inverse * sum_gx / n));
+    }
 }
-
 export fn layerNormBackward(x: [*]const f32, dy: [*]const f32, dx: [*]f32, gamma: [*]const f32, mean: [*]const f32, inv_std: [*]const f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
     layerNormBackwardOf(f32, x, dy, dx, gamma, mean, inv_std, rows, cols);
 }

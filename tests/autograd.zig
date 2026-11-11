@@ -334,27 +334,29 @@ const WideConvNet = struct {
     }
 };
 
-const LayerNormNet = struct {
-    const X = Tensor(f32, &.{ 5, 6 });
-    const C = Tensor(f32, &.{6});
+fn LayerNormNet(comptime rows: usize, comptime cols: usize) type {
+    return struct {
+        const X = Tensor(f32, &.{ rows, cols });
+        const C = Tensor(f32, &.{cols});
 
-    pub const Inputs = struct { x: X, gamma: C, beta: C, y: X };
-    pub const names = .{ "x", "gamma", "beta", "y" };
-    pub const labels: [5]u8 = @splat(0);
-    const Result = struct { loss: Var(Tensor(f32, &.{})), x: Var(X), gamma: Var(C), beta: Var(C), y: Var(X) };
+        pub const Inputs = struct { x: X, gamma: C, beta: C, y: X };
+        pub const names = .{ "x", "gamma", "beta", "y" };
+        pub const labels: [rows]u8 = @splat(0);
+        const Result = struct { loss: Var(Tensor(f32, &.{})), x: Var(X), gamma: Var(C), beta: Var(C), y: Var(X) };
 
-    pub fn build(t: *Tape, p: Inputs, _: []const u8) !Result {
-        const x = try t.leaf(p.x);
-        const gamma = try t.leaf(p.gamma);
-        const beta = try t.leaf(p.beta);
-        const y = try t.leaf(p.y);
-        return .{ .loss = try t.mse(try t.layerNorm(x, gamma, beta), y), .x = x, .gamma = gamma, .beta = beta, .y = y };
-    }
+        pub fn build(t: *Tape, p: Inputs, _: []const u8) !Result {
+            const x = try t.leaf(p.x);
+            const gamma = try t.leaf(p.gamma);
+            const beta = try t.leaf(p.beta);
+            const y = try t.leaf(p.y);
+            return .{ .loss = try t.mse(try t.layerNorm(x, gamma, beta), y), .x = x, .gamma = gamma, .beta = beta, .y = y };
+        }
 
-    pub fn acceptable(_: Allocator, _: Inputs) !bool {
-        return true;
-    }
-};
+        pub fn acceptable(_: Allocator, _: Inputs) !bool {
+            return true;
+        }
+    };
+}
 
 // Both halves of a GRU step chained: every input of gruGates and gruNext receives a gradient, and the update gate feeds both.
 const GruOpsNet = struct {
@@ -1043,8 +1045,11 @@ test "the fused gru ops have correct gradients for every input, on the cpu and t
 }
 
 test "layer norm has correct gradients for the input, the scale and the shift, on the cpu and the gpu" {
-    try gradcheck.expectFiniteDifferences(LayerNormNet, 9, 1e-2, 5e-3);
-    try gradcheck.expectGpuMatchesCpu(LayerNormNet, 10, 1e-4);
+    try gradcheck.expectFiniteDifferences(LayerNormNet(5, 6), 9, 1e-2, 5e-3);
+    try gradcheck.expectGpuMatchesCpu(LayerNormNet(5, 6), 10, 1e-4);
+    // Rows wider than a warp, and not a multiple of its width, make each lane loop more than once.
+    try gradcheck.expectGpuMatchesCpu(LayerNormNet(37, 200), 13, 1e-4);
+    try gradcheck.expectGpuMatchesCpu(LayerNormNet(9, 32), 14, 1e-4);
 }
 
 test "embedding gathers rows by id and scatters the gradient back, repeated ids accumulate, on the cpu and the gpu" {

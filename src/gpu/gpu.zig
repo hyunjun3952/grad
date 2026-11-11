@@ -723,14 +723,14 @@ pub const Gpu = struct {
     }
 
     pub fn layerNorm(self: *Gpu, p: anytype, beta: []const f32, y: anytype) Error!void {
-        try self.launchFlat(if (isHalf(y)) .layerNormRowsHalf else .layerNormRows, p.mean.len, .{ p.x, y, p.gamma, beta, p.mean, p.inv_std, p.mean.len, p.gamma.len });
+        try self.launchFlat(if (isHalf(y)) .layerNormRowsHalf else .layerNormRows, 32 * p.mean.len, .{ p.x, y, p.gamma, beta, p.mean, p.inv_std, p.mean.len, p.gamma.len });
     }
 
     pub fn layerNormBackward(self: *Gpu, p: anytype, dy: anytype, dx: anytype, dgamma: ?[]f32, dbeta: ?[]f32) Error!void {
         const rows = p.mean.len;
         const cols = p.gamma.len;
         const half = isHalf(p.x);
-        if (dx) |out| try self.launchFlat(if (half) .layerNormBackwardHalf else .layerNormBackward, rows, .{ p.x, dy, out, p.gamma, p.mean, p.inv_std, rows, cols });
+        if (dx) |out| try self.launchFlat(if (half) .layerNormBackwardHalf else .layerNormBackward, 32 * rows, .{ p.x, dy, out, p.gamma, p.mean, p.inv_std, rows, cols });
         if (dgamma) |g| {
             // The sums over the rows go through the column reduction, which spreads the rows over many blocks.
             const sums = try self.scratchZeroed(f32, 2 * cols);
