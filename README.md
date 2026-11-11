@@ -6,10 +6,10 @@ The goal is an engine that sits between "C with pointers" and "PyTorch": plain s
 
 | Task | Model | Accuracy | Time per epoch |
 | --- | --- | --- | --- |
-| MNIST | MLP 784-128-10 | 98.1% (10 epochs) | 0.21 s GPU, 0.32 s CPU (6 threads) |
-| MNIST | CNN conv5x16-conv5x32 + BatchNorm | 99.5% (30 epochs, light augmentation) | 0.87 s GPU, 13.2 s CPU |
-| CIFAR-10 | ResNet-14, widths 64-128-256 | 94.1% (50 epochs) to 94.9% (100 epochs); flip + shift + CutMix + label smoothing + EMA, +0.4 with `--tta` | 17.2 s GPU (bf16 tensor cores), 25.0 s (TF32), 53.7 s (strict f32) |
-| CIFAR-10 | ResNet-14, widths 64-192-384 (`-Dwide=true`) | 94.8% / 95.3% with `--tta` (50 epochs), 95.4% / **96.2%** with `--tta` (100 epochs); same recipe | 24.7 s GPU (bf16 tensor cores) |
+| MNIST | MLP 784-128-10 | 98.1% (10 epochs) | 0.16 s GPU, 0.30 s CPU (6 threads) |
+| MNIST | CNN conv5x16-conv5x32 + BatchNorm | 99.5% (30 epochs, light augmentation) | 0.80 s GPU, 9.1 s CPU |
+| CIFAR-10 | ResNet-14, widths 64-128-256 | 94.1% (50 epochs) to 94.9% (100 epochs); flip + shift + CutMix + label smoothing + EMA, +0.4 with `--tta` | 14.0 s GPU (bf16 tensor cores), 24.2 s (TF32), 52.0 s (strict f32) |
+| CIFAR-10 | ResNet-14, widths 64-192-384 (`-Dwide=true`) | 94.8% / 95.3% with `--tta` (50 epochs), 95.4% / **96.2%** with `--tta` (100 epochs); same recipe | 20.6 s GPU (bf16 tensor cores) |
 
 Measured on an i5-8500 (6 cores) and an RTX 3060 12 GB. About 8,200 lines of code in src and examples, plus 3,400 lines of tests (110 tests).
 
@@ -93,7 +93,7 @@ The script runs the model in the ONNX reference evaluator and compares it with t
 
 ## Optional cuDNN backend
 
-The engine does not need cuDNN, but it can use it: `src/gpu/cudnn.zig` loads `cudnn64_9.dll` dynamically (the same way `nvcuda.dll` is loaded) and drives the legacy descriptor API, with the best algorithm per shape chosen by `cudnnFind*` and cached. `zig build bench -- cudnn` times it on the CIFAR shapes: cuDNN reaches 8 to 10 TFLOPS in f32 (TF32) and 20 to 24 TFLOPS in bf16, versus about 5 TFLOPS for the built-in f32 GEMM and 17 to 18 TFLOPS for the built-in bf16 implicit GEMM. On the CIFAR ResNet-14 an f32 epoch takes 53.7 s with the strict f32 kernels, 25.0 s with the built-in `--tf32` implicit GEMM and 24.1 s with `--cudnn`; the bf16 path (`--tensor-cores`) takes 17.2 s.
+The engine does not need cuDNN, but it can use it: `src/gpu/cudnn.zig` loads `cudnn64_9.dll` dynamically (the same way `nvcuda.dll` is loaded) and drives the legacy descriptor API, with the best algorithm per shape chosen by `cudnnFind*` and cached. `zig build bench -- cudnn` times it on the CIFAR shapes: cuDNN reaches 8 to 10 TFLOPS in f32 (TF32) and 20 to 24 TFLOPS in bf16, versus about 5 TFLOPS for the built-in f32 GEMM and 12 to 19 TFLOPS for the built-in bf16 implicit GEMM. On the CIFAR ResNet-14 an f32 epoch takes 52.0 s with the strict f32 kernels, 24.2 s with the built-in `--tf32` implicit GEMM and 23.0 s with `--cudnn`; the bf16 path (`--tensor-cores`) takes 14.0 s (all measured in one session).
 
 ## Benchmarks
 
@@ -111,50 +111,50 @@ zig build bench -- cudnn        # cuDNN convolutions on the CIFAR shapes (needs 
 
 | Model | Backend | Epoch |
 | --- | --- | --- |
-| MNIST MLP 784-128-10, batch 64 | CPU, 6 threads | 0.29 s (0.32 s before the element-wise ops ran on the worker pool) |
-| | GPU | 0.21 s |
-| MNIST / Fashion-MNIST CNN | CPU, 6 threads | 9.4 s (11.0 s before the convolution input gradient also ran in chunks of images, 11.8 s before the im2col matrix was built in cache-sized chunks, 12.8 s before the element-wise ops ran on the worker pool and the example fused batch norm with ReLU; median of five alternating runs) |
-| | GPU | 0.87 s |
-| CIFAR-10 ResNet-14 64-128-256, batch 64 | GPU, bf16 tensor cores (`--tensor-cores`) | **17.2 s** |
-| | GPU, TF32 tensor cores (`--tf32`) | 25.0 s |
-| | GPU, cuDNN TF32 (`--cudnn`) | 24.1 s |
-| | GPU, strict f32 | 53.7 s |
-| | GPU, bf16, `--deterministic` | 18.7 s |
-| CIFAR-100 ResNet-14 (`-Dcifar100=true`) | GPU, bf16 | 17.3 s |
-| CIFAR-10 ResNet-14 64-192-384 (`-Dwide=true`) | GPU, bf16 | 25.3 s |
-| Character GRU, 256 units, 32 x 64 steps | GPU | about 70 ms per step (whole run, including start-up and the 600-character sample); after the forward and backward pass was recorded once into a CUDA graph (`Gpu.beginCapture`, `endCapture`, `replay`) and replayed, 300 steps took 17.1 s against 20.1 s before in one session, both times with the same losses. The step had about 4500 tiny kernels, so the replay showed that launch cost was only part of the 70 ms. After the three projections of the GRU were fused (one product for the input, one for the update and reset parts of the state, one for the candidate) and the gate arithmetic became two kernels (`Tape.gruGates`, `Tape.gruNext`), 300 steps took 11.2 to 12.5 s against 17.5 to 20.4 s for the unfused layer in the same session; the loss after 300 steps is 2.163 against 2.140 (a different initialisation, since the weights have other shapes). An exported GRU is written out as Slice, Add, Sigmoid, Tanh, Mul and Sub nodes. The f32 GEMM then got a block-count rule: a product whose 128 x 128 tiles, even with the largest K split, would give fewer blocks than the card has multiprocessors (the GRU step has 32 rows and weight gradients with a K of 32) takes the 32 x 32 tile. Measured as training time only (the examples print it; median of five alternating runs with `scripts/compare.ps1`, spread under 1%), 300 steps went from 10.60 s to 4.01 s with that rule and the warp-per-row loss kernels, and to 3.81 s with `Tape.linear` (bias added in place, no separate sum), same loss; `zig build bench -- gpu` and the CIFAR epoch stayed the same. The same trick on the Transformer example gave no measurable change and is not used there |
-| Character Transformer, 3 blocks, width 128, 4 heads, 32 x 64 characters | GPU | 84.6 s for 1500 steps (whole run, same accounting as the GRU row); loss 1.580 nats/char, the GRU reaches 1.579 in 101.5 s in the same session; with `-Dbf16=true` (bf16 activations) the same run takes 67.2 s against 66.8 s for f32 in a later session, loss 1.581, so on a model this small bf16 is not faster; after batched matmul became one launch with a batch axis (f32 kernels), 600 steps took 30.5 to 31.1 s before and 11.9 s after in one session (f32 and bf16 alike, identical losses), and 1500 steps took 22.9 s in total (not compared against the old build at 1500 steps); later, measured as training time only (median of five alternating runs), 600 steps went from 7.49 s to 6.31 s with the GEMM tile rule and softmax and cross entropy running one warp per row, and to 5.99 s with `Tape.linear`, same loss; the Transformer has about 640K parameters against about 330K for the GRU (counted by hand, not measured) |
+| MNIST MLP 784-128-10, batch 64 | CPU, 6 threads | 0.30 s |
+| | GPU | 0.16 s (0.19 s before the CUDA-graph and kernel work of this round) |
+| MNIST / Fashion-MNIST CNN | CPU, 6 threads | 9.1 s (12.2 s before the CPU element-wise ops, the fused batch norm + ReLU in the example and the chunked im2col ran; median of three alternating runs) |
+| | GPU | 0.80 s (0.86 s before) |
+| CIFAR-10 ResNet-14 64-128-256, batch 64 | GPU, bf16 tensor cores (`--tensor-cores`) | **14.0 s** (the commit before this round measured 14.05 s in the same session, so no change) |
+| | GPU, TF32 tensor cores (`--tf32`) | 24.2 s |
+| | GPU, cuDNN TF32 (`--cudnn`) | 23.0 s |
+| | GPU, strict f32 | 52.0 s |
+| | GPU, bf16, `--deterministic` | 14.4 s |
+| CIFAR-100 ResNet-14 (`-Dcifar100=true`) | GPU, bf16 | 14.05 s |
+| CIFAR-10 ResNet-14 64-192-384 (`-Dwide=true`) | GPU, bf16 | 20.6 s |
+| Character GRU, 256 units, 32 x 64 steps | GPU | 300 steps took 3.71 s in the final measurement of this round against 10.45 s for the commit before it (training time only, median of five alternating runs, -64.5%). History: about 70 ms per step (whole run, including start-up and the 600-character sample); after the forward and backward pass was recorded once into a CUDA graph (`Gpu.beginCapture`, `endCapture`, `replay`) and replayed, 300 steps took 17.1 s against 20.1 s before in one session, both times with the same losses. The step had about 4500 tiny kernels, so the replay showed that launch cost was only part of the 70 ms. After the three projections of the GRU were fused (one product for the input, one for the update and reset parts of the state, one for the candidate) and the gate arithmetic became two kernels (`Tape.gruGates`, `Tape.gruNext`), 300 steps took 11.2 to 12.5 s against 17.5 to 20.4 s for the unfused layer in the same session; the loss after 300 steps is 2.163 against 2.140 (a different initialisation, since the weights have other shapes). An exported GRU is written out as Slice, Add, Sigmoid, Tanh, Mul and Sub nodes. The f32 GEMM then got a block-count rule: a product whose 128 x 128 tiles, even with the largest K split, would give fewer blocks than the card has multiprocessors (the GRU step has 32 rows and weight gradients with a K of 32) takes the 32 x 32 tile. Measured as training time only (the examples print it; median of five alternating runs with `scripts/compare.ps1`, spread under 1%), 300 steps went from 10.60 s to 4.01 s with that rule and the warp-per-row loss kernels, and to 3.81 s with `Tape.linear` (bias added in place, no separate sum), same loss; `zig build bench -- gpu` and the CIFAR epoch stayed the same. The same trick on the Transformer example gave no measurable change and is not used there |
+| Character Transformer, 3 blocks, width 128, 4 heads, 32 x 64 characters | GPU | 600 steps took 5.93 s in the final measurement of this round against 7.43 s for the commit before it (training time only, median of five alternating runs, -20.2%). History: 84.6 s for 1500 steps (whole run, same accounting as the GRU row); loss 1.580 nats/char, the GRU reaches 1.579 in 101.5 s in the same session; with `-Dbf16=true` (bf16 activations) the same run takes 67.2 s against 66.8 s for f32 in a later session, loss 1.581, so on a model this small bf16 is not faster; after batched matmul became one launch with a batch axis (f32 kernels), 600 steps took 30.5 to 31.1 s before and 11.9 s after in one session (f32 and bf16 alike, identical losses), and 1500 steps took 22.9 s in total (not compared against the old build at 1500 steps); later, measured as training time only (median of five alternating runs), 600 steps went from 7.49 s to 6.31 s with the GEMM tile rule and softmax and cross entropy running one warp per row, and to 5.99 s with `Tape.linear`, same loss; the Transformer has about 640K parameters against about 330K for the GRU (counted by hand, not measured) |
 
-The MNIST CNN on the CPU went from 24.6 s to 13.2 s with the row-wise im2col/col2im, the stored max-pool winners and the vectorised batch-norm statistics (see `zig build bench -- cpu`); the bf16 CIFAR epoch has been 31.7, 25.0, 17.6 and now 17.2 s over the last rounds (fused ops, implicit GEMM, 64x128 and 128x128 tiles).
+The MNIST CNN on the CPU went from 24.6 s to 13.2 s with the row-wise im2col/col2im, the stored max-pool winners and the vectorised batch-norm statistics (see `zig build bench -- cpu`); the bf16 CIFAR epoch has been 31.7, 25.0, 17.6 and 17.2 s over the earlier rounds (fused ops, implicit GEMM, 64x128 and 128x128 tiles) and measured 14.0 s in the latest session; that last step is not a speed-up of the code, because the commit before the latest round measured the same 14.05 s in the same session (the card ran faster than in the earlier sessions, so compare numbers only inside one session).
 
 ### GPU kernels (TFLOPS, kernel only)
 
 | Kernel | Shape | TFLOPS |
 | --- | --- | --- |
-| FP32 SIMT GEMM | 4096 x 4096 x 4096 | 5.1 |
-| bf16 tensor-core GEMM (cp.async, ldmatrix, mma.sync) | 4096 x 4096 x 4096 | 24.1 (21.7 with operand packing) |
+| FP32 SIMT GEMM | 4096 x 4096 x 4096 | 5.3 |
+| bf16 tensor-core GEMM (cp.async, ldmatrix, mma.sync) | 4096 x 4096 x 4096 | 22.4 (20.3 with operand packing) |
 | bf16 implicit-GEMM conv forward | 3x3, 64 -> 64, 32x32, batch 64 | 17.8 |
-| | 3x3, 128 -> 128, 16x16 (128x128 tile) | 19.8 |
-| | 3x3, 256 -> 256, 8x8 | 18.6 |
-| bf16 implicit-GEMM conv weight gradient | the same three shapes | 13.4 / 18.5 / 17.6 |
-| TF32 implicit-GEMM conv forward | the same three shapes | 9.1 / 8.9 / 8.8 |
-| TF32 implicit-GEMM conv weight gradient | the same three shapes | 5.8 / 7.7 / 7.7 |
-| cuDNN 9.28, bf16 forward / dgrad / wgrad | 64 -> 64 | 23.8 / 19.1 / 16.2 |
-| | 128 -> 128 | 21.0 / 23.6 / 17.5 |
-| | 256 -> 256 | 22.5 / 19.5 / 19.9 |
-| cuDNN 9.28, TF32 forward | 64 / 128 / 256 channels | 8.4 / 10.0 / 10.6 |
+| | 3x3, 128 -> 128, 16x16 (128x128 tile) | 15.3 |
+| | 3x3, 256 -> 256, 8x8 | 19.0 |
+| bf16 implicit-GEMM conv weight gradient | the same three shapes | 13.3 / 13.5 / 12.4 |
+| TF32 implicit-GEMM conv forward | the same three shapes | 8.9 / 8.9 / 8.8 |
+| TF32 implicit-GEMM conv weight gradient | the same three shapes | 5.8 / 7.4 / 7.5 |
+| cuDNN 9.28, bf16 forward / dgrad / wgrad | 64 -> 64 | 23.9 / 19.2 / 16.0 |
+| | 128 -> 128 | 20.8 / 23.4 / 17.3 |
+| | 256 -> 256 | 22.3 / 19.3 / 19.8 |
+| cuDNN 9.28, TF32 forward | 64 / 128 / 256 channels | 8.9 / 9.9 / 10.5 |
 
-The bf16 tensor-core path has a relative RMS error of about 2e-3 against FP32. The built-in bf16 convolution reaches 75 to 90% of cuDNN; the element-wise kernels (batch norm, ReLU, packing) already run at the memory bandwidth of the card (about 430 GB/s measured on batch-norm apply), which is why activations stored in bf16 are the next speed-up.
+The bf16 tensor-core path has a relative RMS error of about 2e-3 against FP32. The built-in bf16 convolution reaches 63 to 85% of cuDNN (the weight gradients of the 128 and 256 channel stages are the weakest, 79% and 63%; the kernel numbers of the earlier README, 19.8 TFLOPS for the 128-channel forward and 18.5 / 17.6 for the weight gradients, could not be reproduced in this session even on the older commit, so they are replaced by what was measured); the element-wise kernels (batch norm, ReLU, packing) already run at the memory bandwidth of the card (about 430 GB/s measured on batch-norm apply), which is why activations stored in bf16 are the next speed-up.
 
 ### CPU kernels
 
 | Kernel | Result |
 | --- | --- |
-| tiled + packed GEMM, 6x2 register tile, 1 thread | 100 to 112 GFLOPS (512 x 512: 111.7) |
+| tiled + packed GEMM, 6x2 register tile, 1 thread | 92 to 112 GFLOPS (512 x 512: 112.2) |
 | `@Vector` triple loop / naive triple loop | 17 to 20 / 1.3 to 2.2 GFLOPS |
-| MLP training step, batch 64, 1 thread / 6 threads | 378 us (2.6k steps/s) / 149 us (6.7k steps/s) |
+| MLP training step, batch 64, 1 thread / 6 threads | 370 us (2.7k steps/s) / 140 us (7.2k steps/s) |
 
-Per-op CPU time of the MNIST CNN at batch 64 (forward / backward, ms): conv 5x5 1->16 0.71 / 0.20, conv 5x5 16->32 0.52 / 2.45, max-pool 0.87 / 0.06, batch norm + ReLU 0.62 / 0.54. The first backward went from 0.39 to 0.20 ms when the tiled GEMM learned to split K across threads for products with few outputs and a long K (its weight gradient, 25 x 16 outputs over 36864 positions); the epoch did not change measurably (13.50 against 13.49 s) because most of a step was not in the convolutions: timing the layers of the forward pass in a real run showed ReLU, bias add and gradient accumulation at 0.9 ms or more each on tensors of 2.4 MB, since those loops ran on one thread. They now run on the worker pool for equal shapes and for a vector added to every row, and the example uses the fused batch-norm ReLU. Thread scaling is still poor (24.3 s on one thread, 13.1 s on six): the direct convolution builds an im2col buffer of 15 MB for the first layer, and a path without it is the next step.
+Per-op CPU time of the MNIST CNN at batch 64 (best of 20, forward / backward, ms): conv 5x5 1->16 0.44 / 0.37, conv 5x5 16->32 0.28 / 0.98, max-pool 0.88 / 0.07, batch norm + ReLU 0.69 / 0.67, ReLU 0.61 / 0.34. The second convolution's backward went from 2.45 to 0.98 ms when the input gradient was formed and scattered a few images at a time, so the 15 MB column buffer is gone. Earlier, timing the layers of a real run showed ReLU, bias add and gradient accumulation at 0.9 ms or more each on tensors of 2.4 MB because they ran on one thread; they now run on the worker pool for equal shapes and for a vector added to every row, and the example uses the fused batch-norm ReLU. Thread scaling is still modest (about 24 s on one thread against 9.1 s on six, measured before the last two steps).
 
 ### Inference through ONNX (`zig build onnx`, CPU, 6 threads)
 
