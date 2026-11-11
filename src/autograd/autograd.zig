@@ -9,6 +9,7 @@ const conv = @import("../gpu/math/conv.zig");
 const cpu = @import("../cpu/ops.zig");
 const activation_math = @import("../gpu/math/activation.zig");
 const softmax_math = @import("../gpu/math/softmax.zig");
+const layernorm_math = @import("../gpu/math/layernorm.zig");
 const drop = @import("../gpu/math/dropout.zig");
 const norm = @import("../gpu/math/norm.zig");
 const bf16_math = @import("../gpu/math/bf16.zig");
@@ -279,6 +280,41 @@ pub const Tape = struct {
                 for (c.x.grad.data, c.x.value.data, c.out.grad.data) |*gx, v, g| {
                     gx.* += if (v > 0) g else 0;
                 }
+            }
+        }.run);
+        return out;
+    }
+
+    pub fn layerNorm(self: *Tape, x: anytype, gamma: anytype, beta: anytype) Error!Var(@TypeOf(x.value)) {
+        const X = @TypeOf(x.value);
+        comptime if (X.rank != 2 or X.Elem != f32 or @TypeOf(gamma.value).shape[0] != X.shape[1]) @compileError("layerNorm expects an f32 (rows, columns) tensor and (columns) parameters");
+        const rows = X.shape[0];
+        const cols = X.shape[1];
+        const Stats = Tensor(f32, &.{rows});
+        const mean = try self.newTensor(Stats);
+        const inv_std = try self.newTensor(Stats);
+        const value = try self.newTensor(X);
+        if (self.par.gpu) |dev| {
+            try dev.layerNorm(.{ .x = x.value.data, .gamma = gamma.value.data, .mean = mean.data, .inv_std = inv_std.data }, beta.value.data, value.data);
+        } else {
+            for (0..rows) |r| {
+                const row = layernorm_math.forwardRow(x.value.data.ptr + r * cols, value.data.ptr + r * cols, gamma.value.data.ptr, beta.value.data.ptr, cols);
+                mean.data[r] = row.mean;
+                inv_std.data[r] = row.inv_std;
+            }
+        }
+        const out = try self.makeVar(value, x.needs_grad or gamma.needs_grad or beta.needs_grad);
+        const Ctx = struct { x: @TypeOf(x), gamma: @TypeOf(gamma), beta: @TypeOf(beta), mean: Stats, inv_std: Stats, out: @TypeOf(out) };
+        if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .gamma = gamma, .beta = beta, .mean = mean, .inv_std = inv_std, .out = out }, struct {
+            fn run(t: *Tape, c: *const Ctx) Error!void {
+                if (t.par.gpu) |dev| {
+                    const p: gpu_mod.Gpu.LayerNorm = .{ .x = c.x.value.data, .gamma = c.gamma.value.data, .mean = c.mean.data, .inv_std = c.inv_std.data };
+                    return dev.layerNormBackward(p, c.out.grad.data, if (c.x.needs_grad) c.x.grad.data else null, if (c.gamma.needs_grad) c.gamma.grad.data else null, if (c.gamma.needs_grad) c.beta.grad.data else null);
+                }
+                for (0..rows) |r| {
+                    if (c.x.needs_grad) layernorm_math.backwardRow(c.x.value.data.ptr + r * cols, c.out.grad.data.ptr + r * cols, c.x.grad.data.ptr + r * cols, c.gamma.value.data.ptr, .{ .mean = c.mean.data[r], .inv_std = c.inv_std.data[r] }, cols);
+                }
+                if (c.gamma.needs_grad) for (0..cols) |j| layernorm_math.parameterGradient(c.x.value.data.ptr, c.out.grad.data.ptr, c.mean.data.ptr, c.inv_std.data.ptr, c.gamma.grad.data.ptr, c.beta.grad.data.ptr, rows, cols, j);
             }
         }.run);
         return out;
@@ -1015,6 +1051,28 @@ const WideConvNet = struct {
     }
 };
 
+const LayerNormNet = struct {
+    const X = Tensor(f32, &.{ 5, 6 });
+    const C = Tensor(f32, &.{6});
+
+    pub const Inputs = struct { x: X, gamma: C, beta: C, y: X };
+    pub const names = .{ "x", "gamma", "beta", "y" };
+    pub const labels: [5]u8 = @splat(0);
+    const Result = struct { loss: Var(Tensor(f32, &.{})), x: Var(X), gamma: Var(C), beta: Var(C), y: Var(X) };
+
+    pub fn build(t: *Tape, p: Inputs, _: []const u8) !Result {
+        const x = try t.leaf(p.x);
+        const gamma = try t.leaf(p.gamma);
+        const beta = try t.leaf(p.beta);
+        const y = try t.leaf(p.y);
+        return .{ .loss = try t.mse(try t.layerNorm(x, gamma, beta), y), .x = x, .gamma = gamma, .beta = beta, .y = y };
+    }
+
+    pub fn acceptable(_: Allocator, _: Inputs) !bool {
+        return true;
+    }
+};
+
 fn SoftmaxNet(comptime period: usize) type {
     return struct {
         const X = Tensor(f32, &.{ 6, 3 });
@@ -1641,6 +1699,11 @@ test "softmax rows, with and without a causal mask, have correct values and grad
         try gradcheck.expectFiniteDifferences(SoftmaxNet(period), 7, 1e-2, 3e-3);
         try gradcheck.expectGpuMatchesCpu(SoftmaxNet(period), 8, 1e-5);
     }
+}
+
+test "layer norm has correct gradients for the input, the scale and the shift, on the cpu and the gpu" {
+    try gradcheck.expectFiniteDifferences(LayerNormNet, 9, 1e-2, 5e-3);
+    try gradcheck.expectGpuMatchesCpu(LayerNormNet, 10, 1e-4);
 }
 
 test "label smoothing blends the target and its gradient with the uniform distribution" {

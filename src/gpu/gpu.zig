@@ -60,6 +60,9 @@ const Kernel = enum {
     relu,
     reluBackward,
     transposeHalf,
+    layerNormRows,
+    layerNormBackward,
+    layerNormParameters,
     softmaxRows,
     softmaxBackward,
     toHalf,
@@ -590,6 +593,19 @@ pub const Gpu = struct {
 
     pub fn reluBackward(self: *Gpu, x: []const f32, g_out: []const f32, g_in: []f32) Error!void {
         try self.launchFlat(.reluBackward, x.len, .{ x, g_out, g_in, x.len });
+    }
+
+    pub const LayerNorm = struct { x: []const f32, gamma: []const f32, mean: []f32, inv_std: []f32 };
+
+    pub fn layerNorm(self: *Gpu, p: LayerNorm, beta: []const f32, y: []f32) Error!void {
+        try self.launchFlat(.layerNormRows, p.mean.len, .{ p.x, y, p.gamma, beta, p.mean, p.inv_std, p.mean.len, p.gamma.len });
+    }
+
+    pub fn layerNormBackward(self: *Gpu, p: LayerNorm, dy: []const f32, dx: ?[]f32, dgamma: ?[]f32, dbeta: ?[]f32) Error!void {
+        const rows = p.mean.len;
+        const cols = p.gamma.len;
+        if (dx) |out| try self.launchFlat(.layerNormBackward, rows, .{ p.x, dy, out, p.gamma, p.mean, p.inv_std, rows, cols });
+        if (dgamma) |g| try self.launchFlat(.layerNormParameters, cols, .{ p.x, dy, p.mean, p.inv_std, g, dbeta.?, rows, cols });
     }
 
     pub fn softmax(self: *Gpu, x: []const f32, y: []f32, cols: usize, period: usize) Error!void {

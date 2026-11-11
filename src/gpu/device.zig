@@ -6,6 +6,7 @@ const cv = @import("math/conv.zig");
 const drop = @import("math/dropout.zig");
 const nm = @import("math/norm.zig");
 const soft = @import("math/softmax.zig");
+const ln = @import("math/layernorm.zig");
 
 const BK = 8;
 const threads = 256;
@@ -190,6 +191,24 @@ export fn addFromHalf(x: [*]const u16, y: [*]f32, n: u32) callconv(.nvptx_kernel
 export fn addToHalf(x: [*]const f32, y: [*]u16, n: u32) callconv(.nvptx_kernel) void {
     const t = globalIndex();
     if (t < n) y[t] = bf16.encode(bf16.decode(y[t]) + x[t]);
+}
+
+export fn layerNormRows(x: [*]const f32, y: [*]f32, gamma: [*]const f32, beta: [*]const f32, mean: [*]f32, inv_std: [*]f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
+    const r = globalIndex();
+    if (r >= rows) return;
+    const row = ln.forwardRow(x + r * cols, y + r * cols, gamma, beta, cols);
+    mean[r] = row.mean;
+    inv_std[r] = row.inv_std;
+}
+
+export fn layerNormBackward(x: [*]const f32, dy: [*]const f32, dx: [*]f32, gamma: [*]const f32, mean: [*]const f32, inv_std: [*]const f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
+    const r = globalIndex();
+    if (r < rows) ln.backwardRow(x + r * cols, dy + r * cols, dx + r * cols, gamma, .{ .mean = mean[r], .inv_std = inv_std[r] }, cols);
+}
+
+export fn layerNormParameters(x: [*]const f32, dy: [*]const f32, mean: [*]const f32, inv_std: [*]const f32, dgamma: [*]f32, dbeta: [*]f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
+    const j = globalIndex();
+    if (j < cols) ln.parameterGradient(x, dy, mean, inv_std, dgamma, dbeta, rows, cols, j);
 }
 
 export fn softmaxRows(x: [*]const f32, y: [*]f32, rows: u32, cols: u32, period: u32) callconv(.nvptx_kernel) void {
