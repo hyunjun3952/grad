@@ -1,5 +1,6 @@
 const std = @import("std");
 const grad = @import("grad");
+const config = @import("config");
 
 const nn = grad.nn;
 const Tensor = grad.Tensor;
@@ -21,7 +22,9 @@ const Net = struct {
     nn.LayerNorm(width),
     nn.Linear(width, vocab),
 };
-const Logits = Tensor(f32, &.{ rows, vocab });
+// With -Dbf16=true the activations between the layers are bf16 (GPU only); parameters, sums and the loss stay f32.
+const Act = if (config.bf16) u16 else f32;
+const Logits = Tensor(Act, &.{ rows, vocab });
 
 const Run = struct {
     gpu: ?*grad.gpu.Gpu,
@@ -43,7 +46,7 @@ const Run = struct {
 // Token and position embeddings are added, passed through two causal blocks, and projected to one score per character.
 fn forward(model: Net, tape: *Tape, tokens: []const u32, positions: []const u32) !Var(Logits) {
     const token_table, const position_table, const first, const second, const third, const final_norm, const head = model;
-    const embedded = try tape.add(try token_table.forward(tape, rows, tokens), try position_table.forward(tape, rows, positions));
+    const embedded = try tape.add(try token_table.forward(tape, rows, tokens, Act), try position_table.forward(tape, rows, positions, Act));
     const mixed = try third.forward(tape, try second.forward(tape, try first.forward(tape, embedded)));
     return head.forward(tape, try final_norm.forward(tape, mixed));
 }
@@ -104,7 +107,7 @@ fn generate(run: Run, gpa: std.mem.Allocator, model: Net, rng: std.Random, out: 
         }
         try run.put(tokens, host_tokens);
         var tape: Tape = .{ .gpa = arena.allocator(), .par = run.par };
-        const scores = try forward(model, &tape, tokens, positions);
+        const scores = try tape.cast(try forward(model, &tape, tokens, positions), f32);
         try run.get(logits, scores.value.data);
         const next = sample(rng, logits[(filled - 1) * vocab ..][0..vocab], 0.8);
         try out.writeByte(next);

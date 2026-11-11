@@ -30,7 +30,7 @@ pub fn build(b: *std.Build) void {
     config.addOption(bool, "cnn", b.option(bool, "cnn", "mnist example: train the convolutional network instead of the MLP") orelse false);
     config.addOption(bool, "wide", b.option(bool, "wide", "cifar example: widths 64-192-384 instead of 64-128-256 (slower, more accurate)") orelse false);
 
-    config.addOption(bool, "bf16", b.option(bool, "bf16", "cifar example: keep the activations in bf16 between the stem and the classifier (needs --gpu)") orelse false);
+    config.addOption(bool, "bf16", b.option(bool, "bf16", "cifar and transformer examples: keep the activations in bf16 (needs --gpu)") orelse false);
     config.addOption(bool, "cifar100", b.option(bool, "cifar100", "cifar example: train on CIFAR-100 (data/cifar100) instead of CIFAR-10") orelse false);
 
     inline for (.{ "mnist", "cifar", "regression", "charlm", "transformer", "onnx" }) |name| {
@@ -54,7 +54,11 @@ pub fn build(b: *std.Build) void {
         b.step(name, "Train the " ++ name ++ " example (zig build " ++ name ++ " -- [epochs] [--gpu] ...)").dependOn(&run_cmd.step);
     }
     const mod_tests = b.addTest(.{
-        .root_module = mod,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/all.zig"),
+            .target = target,
+            .imports = &.{.{ .name = "grad", .module = mod }},
+        }),
         .filters = b.option([]const []const u8, "test-filter", "Only run tests whose name contains this text (repeatable)") orelse &.{},
     });
 

@@ -16,18 +16,23 @@ pub const trainer = @import("nn/trainer.zig");
 pub const Tensor = tensor.Tensor;
 pub const matmul = tensor.matmul;
 
-test {
-    @import("std").testing.refAllDecls(@This());
-    _ = @import("gpu/parity.zig");
-    _ = @import("cpu/ops.zig");
-    _ = @import("onnx/onnx.zig");
-    _ = @import("onnx/runtime.zig");
-    _ = @import("gpu/math/conv.zig");
-    _ = @import("gpu/math/dropout.zig");
-    _ = @import("gpu/math/activation.zig");
-    _ = @import("gpu/math/softmax.zig");
-    _ = @import("gpu/math/layernorm.zig");
-    _ = @import("gpu/math/augment.zig");
-    _ = @import("gpu/math/norm.zig");
-    _ = @import("gpu/math/bf16.zig");
-}
+// The modules below are internals that the programs do not need but the tests in tests/ reach into.
+pub const cpu_ops = @import("cpu/ops.zig");
+pub const dataset = @import("data/dataset.zig");
+pub const gpu_args = @import("gpu/args.zig");
+pub const gpu_cuda = @import("gpu/cuda.zig");
+pub const gpu_cudnn = @import("gpu/cudnn.zig");
+pub const onnx_runtime = @import("onnx/runtime.zig");
+pub const trace = @import("autograd/trace.zig");
+
+/// Per-element math shared by the CPU and the device code.
+pub const math = struct {
+    pub const activation = @import("gpu/math/activation.zig");
+    pub const augment = @import("gpu/math/augment.zig");
+    pub const bf16 = @import("gpu/math/bf16.zig");
+    pub const conv = @import("gpu/math/conv.zig");
+    pub const dropout = @import("gpu/math/dropout.zig");
+    pub const layernorm = @import("gpu/math/layernorm.zig");
+    pub const norm = @import("gpu/math/norm.zig");
+    pub const softmax = @import("gpu/math/softmax.zig");
+};

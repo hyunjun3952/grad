@@ -50,19 +50,3 @@ pub fn apply(x: []const f32, y: []f32, kind: Kind, lo: usize, hi: usize) void {
 pub fn applyBackward(x: []const f32, y: []const f32, g_out: []const f32, g_in: []f32, kind: Kind, lo: usize, hi: usize) void {
     for (x[lo..hi], y[lo..hi], g_out[lo..hi], g_in[lo..hi]) |v, w, g, *gx| gx.* += g * derivative(kind, v, w);
 }
-
-test "activations match reference values and their derivatives match finite differences" {
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), forward(.sigmoid, 0), 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.880797), forward(.sigmoid, 2), 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.761594), forward(.tanh, 1), 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, -0.761594), forward(.tanh, -1), 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.841192), forward(.gelu, 1), 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, -0.158808), forward(.gelu, -1), 1e-5);
-    inline for (.{ Kind.sigmoid, Kind.tanh, Kind.gelu }) |kind| {
-        for ([_]f32{ -3, -1.2, -0.3, 0.4, 1.5, 3 }) |x| {
-            const h: f32 = 1e-2;
-            const numeric = (forward(kind, x + h) - forward(kind, x - h)) / (2 * h);
-            try std.testing.expectApproxEqAbs(numeric, derivative(kind, x, forward(kind, x)), 2e-3);
-        }
-    }
-}

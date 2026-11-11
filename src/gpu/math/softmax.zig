@@ -33,14 +33,3 @@ pub inline fn backwardRow(comptime E: type, y: [*]const E, dy: [*]const E, dx: [
     for (0..cols) |j| dot += bf16.load(E, y, j) * bf16.load(E, dy, j);
     for (0..cols) |j| bf16.store(E, dx, j, bf16.load(E, dx, j) + bf16.load(E, y, j) * (bf16.load(E, dy, j) - dot));
 }
-
-test "causal softmax rows sum to one over the allowed columns and zero elsewhere" {
-    const x = [_]f32{ 1, 2, 3, 4 };
-    var y: [4]f32 = undefined;
-    forwardRow(f32, &x, &y, 4, 2);
-    try std.testing.expectApproxEqAbs(@as(f32, 1), y[0] + y[1], 1e-6);
-    try std.testing.expectEqual(@as(f32, 0), y[2]);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.26894143), y[0], 1e-5);
-    try std.testing.expectEqual(@as(usize, 2), limitOf(5, 6, 4));
-    try std.testing.expectEqual(@as(usize, 6), limitOf(5, 6, 0));
-}

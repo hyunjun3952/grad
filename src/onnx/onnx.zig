@@ -174,8 +174,11 @@ const Builder = struct {
     }
 
     fn convert(self: *Builder, e: Entry) Error!void {
+        // NOTE: a cast only changes how an activation is stored, so the exported graph stays in f32 and the output aliases the input.
+        if (e.op == .cast) return self.produce(e.output, try self.use(e.inputs[0]));
         const out = try self.fresh("value");
         switch (e.op) {
+            .cast => unreachable,
             .add => try self.node("Add", &.{ try self.use(e.inputs[0]), try self.use(e.inputs[1]) }, out, &.{}),
             .mul => try self.node("Mul", &.{ try self.use(e.inputs[0]), try self.use(e.inputs[1]) }, out, &.{}),
             .matmul => try self.node("MatMul", &.{ try self.use(e.inputs[0]), try self.use(e.inputs[1]) }, out, &.{}),
@@ -323,43 +326,4 @@ pub fn save(gpa: Allocator, io: Io, path: []const u8, graph: Graph) !void {
     const bytes = try build(gpa, graph);
     defer gpa.free(bytes);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
-}
-
-const testing = std.testing;
-const autograd = @import("../autograd/autograd.zig");
-const Tensor = @import("../tensor/tensor.zig").Tensor;
-
-fn countOf(haystack: []const u8, needle: []const u8) usize {
-    return std.mem.count(u8, haystack, needle);
-}
-
-test "a traced network becomes an onnx model with its weights, layout changes and reshapes" {
-    const gpa = testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    var trace: Trace = .{ .gpa = gpa };
-    defer trace.deinit();
-    var tape: autograd.Tape = .{ .gpa = arena.allocator(), .trace = &trace };
-
-    const image = try tape.constant(try tape.filledTensor(Tensor(f32, &.{ 1, 36 }), 1));
-    const filters = try tape.constant(try tape.filledTensor(Tensor(f32, &.{ 9, 4 }), 0.5));
-    const dense = try tape.constant(try tape.filledTensor(Tensor(f32, &.{ 16, 2 }), 1));
-    const bias = try tape.constant(try tape.filledTensor(Tensor(f32, &.{2}), 0.25));
-    const convolved = try tape.conv2d(autograd.reshape(image, &.{ 1, 6, 6, 1 }), filters, .{});
-    const pooled = try tape.maxPool(try tape.activate(convolved, .gelu), .{});
-    const logits = try tape.add(try tape.matmul(autograd.reshape(pooled, &.{ 1, 16 }), dense), bias);
-
-    const weights = [_]Weight{
-        .{ .id = @intFromPtr(filters.value.data.ptr), .data = filters.value.data },
-        .{ .id = @intFromPtr(dense.value.data.ptr), .data = dense.value.data },
-        .{ .id = @intFromPtr(bias.value.data.ptr), .data = bias.value.data },
-    };
-    const bytes = try build(gpa, .{ .trace = &trace, .weights = &weights, .inputs = &.{View.of(image)}, .outputs = &.{View.of(logits)} });
-    defer gpa.free(bytes);
-
-    try testing.expectEqualSlices(u8, &.{ 0x08, 0x09 }, bytes[0..2]);
-    for ([_][]const u8{ "Conv", "Gelu", "MaxPool", "MatMul", "Add", "Identity", "output", "input" }) |name| try testing.expect(countOf(bytes, name) >= 1);
-    try testing.expectEqual(@as(usize, 2), countOf(bytes, "Reshape"));
-    try testing.expectEqual(@as(usize, 4), countOf(bytes, "Transpose"));
-    try testing.expectError(error.UnknownTensor, build(gpa, .{ .trace = &trace, .weights = weights[1..], .inputs = &.{View.of(image)}, .outputs = &.{View.of(logits)} }));
 }

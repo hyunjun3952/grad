@@ -40,6 +40,7 @@ const Kernel = enum {
     sgemmSmallNT,
     sgemmSmallTN,
     packHalf,
+    packHalfCopy,
     packHalfTransposed,
     im2colHalf,
     sgemmTensor,
@@ -66,7 +67,9 @@ const Kernel = enum {
     reluBackwardHalf,
     transposeHalf,
     embeddingGather,
+    embeddingGatherHalf,
     embeddingScatter,
+    embeddingScatterHalf,
     layerNormRows,
     layerNormRowsHalf,
     layerNormBackward,
@@ -463,10 +466,12 @@ pub const Gpu = struct {
     // ***** kernel wrappers *****
 
     /// Multiplies row-major matrices into out, using tensor cores when tensorWorthwhile says so and the f32 kernels otherwise.
+    /// Any operand or the result may be bf16 (u16); such a product always runs on tensor cores, with f32 accumulation and a rounded result.
     /// NOTE: for a long k and few output tiles the f32 path splits k across blocks that add atomically; deterministic mode uses one split.
-    pub fn matmul(self: *Gpu, a: []const f32, b: []const f32, out: []f32, shape: MatmulShape, opts: MatmulOpts) Error!void {
+    pub fn matmul(self: *Gpu, a: anytype, b: anytype, out: anytype, shape: MatmulShape, opts: MatmulOpts) Error!void {
         std.debug.assert(!(opts.trans_a and opts.trans_b));
-        if (self.tensorWorthwhile(shape.m, shape.n, shape.k)) return self.matmulTensor(a, b, out, shape, opts);
+        const wide = @typeInfo(@TypeOf(a)).pointer.child != u16 and @typeInfo(@TypeOf(b)).pointer.child != u16 and @typeInfo(@TypeOf(out)).pointer.child != u16;
+        if (!wide or self.tensorWorthwhile(shape.m, shape.n, shape.k)) return self.matmulTensor(a, b, out, shape, opts);
         const tile: usize = if (shape.n <= 32 and shape.m <= 64) 2 else if (shape.n <= 32) 1 else 0;
         const transpose: usize = if (opts.trans_a) 2 else if (opts.trans_b) 1 else 0;
         const kernel: Kernel = @fromBackingInt(@backingInt(Kernel.sgemmNN) + @as(u5, @intCast(tile * 3 + transpose)));
@@ -494,7 +499,7 @@ pub const Gpu = struct {
         if (transpose) {
             try self.launch(if (@typeInfo(@TypeOf(src)).pointer.child == u16) .transposeHalf else .packHalfTransposed, .{ toU32(cols_padded / 32), toU32(rows_padded / 32), 1 }, .{ src, dst, args });
         } else {
-            try self.launchFlat(.packHalf, rows_padded * cols_padded, .{ src, dst, args });
+            try self.launchFlat(if (@typeInfo(@TypeOf(src)).pointer.child == u16) .packHalfCopy else .packHalf, rows_padded * cols_padded, .{ src, dst, args });
         }
         return .{ .data = dst, .rows_padded = rows_padded, .cols_padded = cols_padded };
     }
@@ -609,9 +614,10 @@ pub const Gpu = struct {
         const half_out = @typeInfo(@TypeOf(out)).pointer.child == u16;
         std.debug.assert(a.cols_padded == b.rows_padded and a.rows_padded % 128 == 0 and b.cols_padded % 64 == 0 and a.cols_padded % 32 == 0);
         const blocks = (a.rows_padded / 128) * (b.cols_padded / 64);
-        const splits = @max(1, @min(a.cols_padded / 256, (128 + blocks - 1) / blocks));
+        // NOTE: a bf16 result is rounded once per element, so K is never split across blocks for it.
+        const splits = if (half_out) 1 else @max(1, @min(a.cols_padded / 256, (128 + blocks - 1) / blocks));
         const chunk = std.mem.alignForward(usize, (a.cols_padded + splits - 1) / splits, 32);
-        std.debug.assert(!half_out or (chunk >= a.cols_padded and !accumulate and !transpose_out));
+        std.debug.assert(!half_out or (chunk >= a.cols_padded and !transpose_out));
         if (!half_out and chunk < a.cols_padded and !accumulate) try self.fill(out, 0);
         const kernel_shape = pack(ga.TensorShape, .{ .m = shape.m, .n = shape.n, .k_padded = a.cols_padded, .n_padded = b.cols_padded, .accumulate = accumulate, .chunk = chunk, .transpose_out = transpose_out, .output_half = half_out, .split_stride = 0 });
         const mark = self.step_used;
@@ -622,7 +628,7 @@ pub const Gpu = struct {
         if (!half_out) try self.combineSplits(target, out, launched, parts, accumulate);
     }
 
-    fn matmulTensor(self: *Gpu, a: []const f32, b: []const f32, out: []f32, shape: MatmulShape, opts: MatmulOpts) Error!void {
+    fn matmulTensor(self: *Gpu, a: anytype, b: anytype, out: anytype, shape: MatmulShape, opts: MatmulOpts) Error!void {
         const mark = self.step_used;
         defer self.step_used = mark;
         const k_padded = std.mem.alignForward(usize, shape.k, 32);
@@ -643,12 +649,12 @@ pub const Gpu = struct {
         try self.launchFlat(if (isHalf(g_in)) .reluBackwardHalf else .reluBackward, x.len, .{ x, g_out, g_in, x.len });
     }
 
-    pub fn embeddingGather(self: *Gpu, table: []const f32, ids: []const u32, out: []f32) Error!void {
-        try self.launchFlat(.embeddingGather, out.len, .{ table, ids, out, ids.len, out.len / ids.len });
+    pub fn embeddingGather(self: *Gpu, table: []const f32, ids: []const u32, out: anytype) Error!void {
+        try self.launchFlat(if (isHalf(out)) .embeddingGatherHalf else .embeddingGather, out.len, .{ table, ids, out, ids.len, out.len / ids.len });
     }
 
-    pub fn embeddingScatter(self: *Gpu, dy: []const f32, ids: []const u32, dtable: []f32) Error!void {
-        try self.launchFlat(.embeddingScatter, dy.len, .{ dy, ids, dtable, ids.len, dy.len / ids.len });
+    pub fn embeddingScatter(self: *Gpu, dy: anytype, ids: []const u32, dtable: []f32) Error!void {
+        try self.launchFlat(if (isHalf(dy)) .embeddingScatterHalf else .embeddingScatter, dy.len, .{ dy, ids, dtable, ids.len, dy.len / ids.len });
     }
 
     /// The input and the statistics of a layer norm; the activations x may be f32 or bf16, the rest is f32.
@@ -846,110 +852,3 @@ pub const Gpu = struct {
         try self.launchFlat(.gather, rows * pixels, .{ from.images, from.labels, from.order, to.batch, to.labels, to.other_labels, args });
     }
 };
-
-const testing = std.testing;
-
-test "device memory round trip, fill, and the step arena" {
-    const gpu = try Gpu.forTest(16 << 20);
-    defer gpu.deinit();
-
-    const a = try gpu.alloc(f32, 1000);
-    var host: [1000]f32 = undefined;
-    for (&host, 0..) |*x, i| x.* = @floatFromInt(i);
-    try gpu.upload(a, &host);
-    var back: [1000]f32 = undefined;
-    try gpu.download(&back, a);
-    try testing.expectEqualSlices(f32, &host, &back);
-
-    try gpu.fill(a, 2.5);
-    try gpu.download(&back, a);
-    for (back) |x| try testing.expectEqual(@as(f32, 2.5), x);
-    try testing.expectEqual(@as(f32, 2.5), try gpu.scalar(a));
-
-    const s1 = try gpu.scratch(f32, 10);
-    const s2 = try gpu.scratch(f32, 10);
-    try testing.expect(@intFromPtr(s2.ptr) >= @intFromPtr(s1.ptr) + 40);
-    try testing.expectEqual(@as(usize, 0), @intFromPtr(s2.ptr) % 256);
-    try gpu.resetStep();
-    const s3 = try gpu.scratch(f32, 10);
-    try testing.expectEqual(@intFromPtr(s1.ptr), @intFromPtr(s3.ptr));
-    try testing.expectError(error.OutOfMemory, gpu.scratch(u8, 1 << 30));
-}
-
-test "deterministic mode gives bit-identical results on every run, for split-K products and batch-norm statistics" {
-    const gpu = try Gpu.forTest(16 << 20);
-    defer gpu.deinit();
-    gpu.tensor_core_min_work = 0;
-    gpu.deterministic = true;
-    const gpa = testing.allocator;
-    var prng = std.Random.DefaultPrng.init(17);
-    const rng = prng.random();
-
-    const m = 64;
-    const n = 64;
-    const k = 16384;
-    const a = try gpa.alloc(f32, m * k);
-    defer gpa.free(a);
-    const b = try gpa.alloc(f32, k * n);
-    defer gpa.free(b);
-    for (a) |*v| v.* = rng.floatNorm(f32);
-    for (b) |*v| v.* = rng.floatNorm(f32);
-    const da = try gpu.alloc(f32, a.len);
-    const db = try gpu.alloc(f32, b.len);
-    const dc = try gpu.alloc(f32, m * n);
-    try gpu.upload(da, a);
-    try gpu.upload(db, b);
-
-    const rows = 20000;
-    const channels = 48;
-    const x = try gpa.alloc(f32, rows * channels);
-    defer gpa.free(x);
-    for (x) |*v| v.* = rng.floatNorm(f32) * 3 + 1;
-    const dx = try gpu.alloc(f32, x.len);
-    try gpu.upload(dx, x);
-    const mean = try gpu.alloc(f32, channels);
-    const inv_std = try gpu.alloc(f32, channels);
-    const running_mean = try gpu.alloc(f32, channels);
-    const running_var = try gpu.alloc(f32, channels);
-    try gpu.fill(running_mean, 0);
-    try gpu.fill(running_var, 1);
-
-    var first_product: [m * n]f32 = undefined;
-    var first_stats: [2 * channels]f32 = undefined;
-    for (0..2) |tensor_cores| {
-        gpu.tensor_cores = tensor_cores == 1;
-        for (0..6) |run| {
-            try gpu.matmul(da, db, dc, .{ .m = m, .n = n, .k = k }, .{});
-            try gpu.batchNormStats(dx, .{ .mean = mean.ptr, .inv_std = inv_std.ptr, .running_mean = running_mean.ptr, .running_var = running_var.ptr }, channels, true);
-            var product: [m * n]f32 = undefined;
-            var stats: [2 * channels]f32 = undefined;
-            try gpu.download(&product, dc);
-            try gpu.download(stats[0..channels], mean);
-            try gpu.download(stats[channels..], inv_std);
-            if (run == 0) {
-                first_product = product;
-                first_stats = stats;
-            } else {
-                try testing.expectEqualSlices(f32, &first_product, &product);
-                try testing.expectEqualSlices(f32, &first_stats, &stats);
-            }
-        }
-        const tolerance: f32 = if (tensor_cores == 1) 2.0 else 0.05;
-        for (0..4) |i| {
-            for (0..n) |j| {
-                var want: f64 = 0;
-                for (0..k) |p| want += @as(f64, a[i * k + p]) * b[p * n + j];
-                try testing.expectApproxEqAbs(@as(f32, @floatCast(want)), first_product[i * n + j], tolerance);
-            }
-        }
-    }
-    for (0..channels) |ch| {
-        var sum: f64 = 0;
-        var square: f64 = 0;
-        for (0..rows) |r| sum += x[r * channels + ch];
-        const mu = sum / rows;
-        for (0..rows) |r| square += (x[r * channels + ch] - mu) * (x[r * channels + ch] - mu);
-        try testing.expectApproxEqAbs(@as(f32, @floatCast(mu)), first_stats[ch], 1e-4);
-        try testing.expectApproxEqAbs(@as(f32, @floatCast(1 / @sqrt(square / rows + norm.eps))), first_stats[channels + ch], 1e-4);
-    }
-}

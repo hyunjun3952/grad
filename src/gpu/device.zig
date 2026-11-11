@@ -269,14 +269,31 @@ export fn layerNormParametersHalf(x: [*]const u16, dy: [*]const u16, mean: [*]co
     layerNormParametersOf(u16, x, dy, mean, inv_std, dgamma, dbeta, rows, cols);
 }
 
-export fn embeddingGather(table: [*]const f32, ids: [*]const u32, out: [*]f32, n: u32, width: u32) callconv(.nvptx_kernel) void {
+// The table and its gradient are always f32; only the gathered rows (out) and their gradient (dy) may be bf16 (E).
+inline fn embeddingGatherOf(comptime E: type, table: [*]const f32, ids: [*]const u32, out: [*]E, n: u32, width: u32) void {
     const t = globalIndex();
-    if (t < @as(usize, n) * width) out[t] = table[@as(usize, ids[t / width]) * width + t % width];
+    if (t < @as(usize, n) * width) bf16.store(E, out, t, table[@as(usize, ids[t / width]) * width + t % width]);
+}
+
+export fn embeddingGather(table: [*]const f32, ids: [*]const u32, out: [*]f32, n: u32, width: u32) callconv(.nvptx_kernel) void {
+    embeddingGatherOf(f32, table, ids, out, n, width);
+}
+
+export fn embeddingGatherHalf(table: [*]const f32, ids: [*]const u32, out: [*]u16, n: u32, width: u32) callconv(.nvptx_kernel) void {
+    embeddingGatherOf(u16, table, ids, out, n, width);
+}
+
+inline fn embeddingScatterOf(comptime E: type, dy: [*]const E, ids: [*]const u32, dtable: [*]f32, n: u32, width: u32) void {
+    const t = globalIndex();
+    if (t < @as(usize, n) * width) _ = @atomicRmw(f32, &dtable[@as(usize, ids[t / width]) * width + t % width], .Add, bf16.load(E, dy, t), .monotonic);
 }
 
 export fn embeddingScatter(dy: [*]const f32, ids: [*]const u32, dtable: [*]f32, n: u32, width: u32) callconv(.nvptx_kernel) void {
-    const t = globalIndex();
-    if (t < @as(usize, n) * width) _ = @atomicRmw(f32, &dtable[@as(usize, ids[t / width]) * width + t % width], .Add, dy[t], .monotonic);
+    embeddingScatterOf(f32, dy, ids, dtable, n, width);
+}
+
+export fn embeddingScatterHalf(dy: [*]const u16, ids: [*]const u32, dtable: [*]f32, n: u32, width: u32) callconv(.nvptx_kernel) void {
+    embeddingScatterOf(u16, dy, ids, dtable, n, width);
 }
 
 inline fn softmaxRowsOf(comptime E: type, x: [*]const E, y: [*]E, rows: u32, cols: u32, period: u32) void {
@@ -867,14 +884,22 @@ fn TensorTile(comptime tile_rows: usize, comptime tile_cols: usize) type {
     };
 }
 
-export fn packHalf(src: [*]const f32, dst: [*]u16, args: ga.PackArgs) callconv(.nvptx_kernel) void {
+inline fn packHalfOf(comptime E: type, src: [*]const E, dst: [*]u16, args: ga.PackArgs) void {
     const t = globalIndex();
     if (t >= @as(usize, args.rows_padded) * args.cols_padded) return;
     const i = t / args.cols_padded;
     const j = t % args.cols_padded;
     const inside = i < args.rows and j < args.cols;
     const source = if (args.transpose != 0) j * args.src_stride + i else i * args.src_stride + j;
-    dst[t] = if (inside) bf16.encode(src[source]) else 0;
+    dst[t] = if (inside) bf16.encode(bf16.load(E, src, source)) else 0;
+}
+
+export fn packHalf(src: [*]const f32, dst: [*]u16, args: ga.PackArgs) callconv(.nvptx_kernel) void {
+    packHalfOf(f32, src, dst, args);
+}
+
+export fn packHalfCopy(src: [*]const u16, dst: [*]u16, args: ga.PackArgs) callconv(.nvptx_kernel) void {
+    packHalfOf(u16, src, dst, args);
 }
 
 const transpose_tile = struct {

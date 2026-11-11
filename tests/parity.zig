@@ -1,10 +1,11 @@
 const std = @import("std");
+const lib = @import("grad");
 const testing = std.testing;
 
-const gpu_mod = @import("gpu.zig");
+const gpu_mod = lib.gpu;
 const Gpu = gpu_mod.Gpu;
-const kernels = @import("../cpu/kernels.zig");
-const bf16 = @import("math/bf16.zig");
+const kernels = lib.kernels;
+const bf16 = lib.math.bf16;
 
 fn expectClose(want: []const f32, got: []const f32, tolerance: f32) !void {
     try testing.expectEqual(want.len, got.len);
