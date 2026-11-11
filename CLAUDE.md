@@ -51,6 +51,7 @@ zig build -Dtarget=x86_64-linux-gnu --prefix zig-out-linux   # Linux compile che
 - A GPU test compares against the CPU or a reference with the `tests/gradcheck.zig` helpers (`expectFiniteDifferences`, `expectGpuMatchesCpu`, `expectTensorCoresClose`, ...) or hand-written references; fixed bf16 or TF32 tolerances are loose on purpose. Use `Gpu.forTest(bytes)` to get a device or skip.
 - Zig 0.17 gotchas seen here: `[_]T{x} ** n` fails the `**` spacing rule in this toolchain (use `@splat` or a comptime loop); `zig fmt` rewrites some builtins (`@intFromEnum` becomes `@backingInt`), so re-read a line after formatting before patching it by text; a function parameter may not shadow a method or a file-level name; `gpa.create` does not apply struct field defaults, so set fields explicitly (see `Gpu.init`).
 - PowerShell does not stop at a failed .NET call unless `$ErrorActionPreference = 'Stop'` is set; scripted multi-file edits should set it, otherwise half of a patch can be written.
+- Keep `TODO.md` current: it lists the next tasks, most useful first. Delete a task when it is done, add new work with a line on why it matters, and update it in the same commit as the change that finishes or creates the task.
 
 ## Mistakes that happened repeatedly (do not repeat them)
 
