@@ -456,7 +456,7 @@ export fn gather(images: [*]const f32, labels_src: [*]const u8, order: [*]const 
     const side = aug.side(args.pixels, args.channels);
     const from = if (box.contains(p, side, args.channels)) partner else r;
     const idx: usize = order[args.start + from];
-    const config: aug.Config = .{ .max_shift = args.max_shift, .max_angle = args.max_angle, .max_scale = args.max_scale, .flip = args.flip != 0, .cutout = args.cutout, .channels = args.channels, .seed = args.seed };
+    const config: aug.Config = .{ .max_shift = args.max_shift, .max_angle = args.max_angle, .max_scale = args.max_scale, .flip = args.flip != 0, .mirror = args.mirror != 0, .cutout = args.cutout, .channels = args.channels, .seed = args.seed };
     const source = images + idx * args.pixels;
     batch[t] = if (config.active()) aug.pixel(source, p, side, args.channels, aug.transformOf(args.start + from, config)) else source[p];
     if (p == 0) {

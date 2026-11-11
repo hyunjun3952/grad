@@ -19,13 +19,14 @@ pub const Config = struct {
     max_angle: f32 = 0,
     max_scale: f32 = 0,
     flip: bool = false,
+    mirror: bool = false,
     cutout: f32 = 0,
     box: Box = .{},
     channels: u32 = 1,
     seed: u64 = 0,
 
     pub inline fn active(self: Config) bool {
-        return self.max_shift != 0 or self.max_angle != 0 or self.max_scale != 0 or self.flip or self.cutout != 0;
+        return self.max_shift != 0 or self.max_angle != 0 or self.max_scale != 0 or self.flip or self.mirror or self.cutout != 0;
     }
 };
 
@@ -55,7 +56,7 @@ pub inline fn transformOf(sample: usize, config: Config) Transform {
     // Degrees to radians; the polynomials above stay accurate up to about 45 degrees.
     const angle = unit(drop.hash(config.seed, 4 * sample + 1)) * config.max_angle * (3.14159265 / 180.0);
     const zoom = 1 + unit(drop.hash(config.seed, 4 * sample + 2)) * config.max_scale;
-    const mirror: f32 = if (config.flip and drop.hash(config.seed, 4 * sample + 3) & 1 == 1) -1 else 1;
+    const mirror: f32 = if (config.mirror or (config.flip and drop.hash(config.seed, 4 * sample + 3) & 1 == 1)) -1 else 1;
     const cut_bits = drop.hash(config.seed, 4 * sample + 3) >> 8;
     return .{
         .a = mirror * cosine(angle) / zoom,
@@ -191,7 +192,7 @@ test "gpu gather applies the same augmentation as the cpu" {
     const labels = [_]u8{ 4, 5, 6, 7 };
     const order = [_]u32{ 2, 0, 1, 3 };
     const start = 2;
-    const config: Config = .{ .max_shift = 2, .max_angle = 25, .max_scale = 0.15, .box = .{ .x0 = 3, .y0 = 5, .x1 = 20, .y1 = 12 }, .seed = 5 };
+    const config: Config = .{ .max_shift = 2, .max_angle = 25, .max_scale = 0.15, .mirror = true, .box = .{ .x0 = 3, .y0 = 5, .x1 = 20, .y1 = 12 }, .seed = 5 };
 
     const d_images = try gpu.alloc(f32, images.len);
     const d_labels = try gpu.alloc(u8, labels.len);
@@ -272,4 +273,21 @@ test "cutout blanks a square around a random centre and leaves the rest unchange
     }
     try std.testing.expect(found and low and high);
     try std.testing.expect(config.active());
+}
+
+test "mirror flips every sample, flip only some" {
+    const image = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    var always: usize = 0;
+    var sometimes: usize = 0;
+    for (0..64) |sample| {
+        const forced = transformOf(sample, .{ .mirror = true, .seed = 8 });
+        always += @intFromBool(forced.a < 0);
+        sometimes += @intFromBool(transformOf(sample, .{ .flip = true, .seed = 8 }).a < 0);
+        var out: [9]f32 = undefined;
+        for (&out, 0..) |*v, p| v.* = pixel(&image, p, 3, 1, forced);
+        try std.testing.expectEqualSlices(f32, &.{ 3, 2, 1, 6, 5, 4, 9, 8, 7 }, &out);
+    }
+    try std.testing.expectEqual(@as(usize, 64), always);
+    try std.testing.expect(sometimes > 10 and sometimes < 54);
+    try std.testing.expect((Config{ .mirror = true }).active());
 }

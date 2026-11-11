@@ -52,6 +52,7 @@ Build options such as `-Dcnn=true -Dhidden=2048 -Dbatch=256` go before the `--`;
 | `--cudnn[=DIR]` | Run convolutions through cuDNN (f32 with TF32 tensor cores) instead of the built-in kernels. The DLLs are loaded at run time from `data/cudnn` (or DIR); if they cannot be found the built-in kernels are used. Fetch them with `scripts/fetch-cudnn.ps1` (about 1.3 GB, never committed). |
 | `--cutout=N` | Blank a random N x N square of every training image (CPU and GPU, same math). |
 | `--cutmix=P` | With probability P per batch, paste a random square from the neighbouring image and weight the two labels by the pasted area (CutMix; CPU and GPU). |
+| `--tta` | After training, also report the test accuracy with every test image averaged with its mirror image (about +0.4 points on CIFAR-10). With `--load` and `--until=0` it evaluates a checkpoint. |
 | `--warmup=N` | Ramp the learning rate linearly over the first N epochs, then follow the cosine schedule. |
 | `--ema=D` | Keep an exponential moving average of all weights and batch-norm statistics (decay D, e.g. 0.999) and report its test accuracy next to the raw one. Stored in checkpoints. |
 | `--smoothing=F` | Label smoothing for the cross-entropy loss (CPU and GPU). |

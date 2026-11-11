@@ -44,33 +44,61 @@ fn Runner(comptime Spec: type) type {
     const pixels = Spec.side * Spec.side * Spec.channels;
 
     return struct {
-        fn accuracy(gpa: Allocator, par: kernels.Parallel, model: Spec.Layers, data: Dataset) !f64 {
+        fn scores(par: kernels.Parallel, model: Spec.Layers, arena: *std.heap.ArenaAllocator, host: []f32, images: []f32) !void {
+            _ = arena.reset(.retain_capacity);
+            if (par.gpu) |dev| try dev.resetStep();
+            var tape: Tape = .{ .gpa = arena.allocator(), .par = par };
+            const x: Tensor(f32, &.{ Spec.eval_batch, pixels }) = .{ .data = images };
+            const logits = try Spec.forward(model, &tape, try tape.constant(x));
+            if (par.gpu) |dev| try dev.download(host, logits.value.data) else @memcpy(host, logits.value.data);
+        }
+
+        fn accuracy(gpa: Allocator, par: kernels.Parallel, model: Spec.Layers, data: Dataset, mirrored_too: bool) !f64 {
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
             const host_logits = try gpa.alloc(f32, Spec.eval_batch * Spec.classes);
             defer gpa.free(host_logits);
+            const mirror_logits = try gpa.alloc(f32, Spec.eval_batch * Spec.classes);
+            defer gpa.free(mirror_logits);
             const host_labels = try gpa.alloc(u8, data.count());
             defer gpa.free(host_labels);
             if (par.gpu) |dev| try dev.download(host_labels, data.labels) else @memcpy(host_labels, data.labels);
 
+            const mirrored: []f32 = if (!mirrored_too) &.{} else if (par.gpu) |dev| try dev.alloc(f32, Spec.eval_batch * pixels) else try gpa.alloc(f32, Spec.eval_batch * pixels);
+            defer if (par.gpu == null) gpa.free(mirrored);
+            var identity: []u32 = &.{};
+            var scratch_labels: [2][]u8 = .{ &.{}, &.{} };
+            if (mirrored_too and par.gpu != null) {
+                const dev = par.gpu.?;
+                const host_order = try gpa.alloc(u32, data.count());
+                defer gpa.free(host_order);
+                for (host_order, 0..) |*o, i| o.* = @intCast(i);
+                identity = try dev.alloc(u32, host_order.len);
+                try dev.upload(identity, host_order);
+                for (&scratch_labels) |*l| l.* = try dev.alloc(u8, Spec.eval_batch);
+            }
+            const flip: augment_math.Config = .{ .mirror = true, .channels = Spec.channels };
+
             var correct: usize = 0;
             var start: usize = 0;
             while (start + Spec.eval_batch <= data.count()) : (start += Spec.eval_batch) {
-                _ = arena.reset(.retain_capacity);
-                if (par.gpu) |dev| try dev.resetStep();
-                var tape: Tape = .{ .gpa = arena.allocator(), .par = par };
-                const x: Tensor(f32, &.{ Spec.eval_batch, pixels }) = .{ .data = data.images[start * pixels ..][0 .. Spec.eval_batch * pixels] };
-                const logits = try Spec.forward(model, &tape, try tape.constant(x));
-                const values: []const f32 = if (par.gpu) |dev| blk: {
-                    try dev.download(host_logits, logits.value.data);
-                    break :blk host_logits;
-                } else logits.value.data;
+                try scores(par, model, &arena, host_logits, data.images[start * pixels ..][0 .. Spec.eval_batch * pixels]);
+                if (mirrored_too) {
+                    if (par.gpu) |dev| {
+                        try dev.gather(data.images, data.labels, identity, mirrored, scratch_labels[0], scratch_labels[1], start, flip);
+                    } else {
+                        const transform = augment_math.transformOf(0, flip);
+                        for (mirrored, 0..) |*v, i| v.* = augment_math.pixel(data.images[start * pixels + i / pixels * pixels ..].ptr, i % pixels, Spec.side, Spec.channels, transform);
+                    }
+                    try scores(par, model, &arena, mirror_logits, mirrored);
+                    for (host_logits, mirror_logits) |*a, b| a.* += b;
+                }
 
                 for (0..Spec.eval_batch) |row| {
-                    const scores = values[row * Spec.classes ..][0..Spec.classes];
+                    const row_scores = host_logits[row * Spec.classes ..][0..Spec.classes];
                     var best: usize = 0;
-                    for (scores, 0..) |s, j| {
-                        if (s > scores[best]) best = j;
+                    for (row_scores, 0..) |s, j| {
+                        if (s > row_scores[best]) best = j;
                     }
                     correct += @intFromBool(best == host_labels[start + row]);
                 }
@@ -78,7 +106,6 @@ fn Runner(comptime Spec: type) type {
             const seen = data.count() / Spec.eval_batch * Spec.eval_batch;
             return 100.0 * @as(f64, @floatFromInt(correct)) / @as(f64, @floatFromInt(seen));
         }
-
         fn run(init: std.process.Init) !void {
             const io = init.io;
             const gpa = init.gpa;
@@ -104,6 +131,7 @@ fn Runner(comptime Spec: type) type {
             var warmup_epochs: usize = 0;
             var ema_decay: f32 = 0;
             var cutmix: f32 = 0;
+            var report_mirrored = false;
             var data_dir: []const u8 = Spec.data_dir;
             var positional: usize = 0;
             for (args[1..]) |arg| {
@@ -133,6 +161,8 @@ fn Runner(comptime Spec: type) type {
                     augment_config.max_scale = try std.fmt.parseFloat(f32, arg["--zoom=".len..]);
                 } else if (std.mem.startsWith(u8, arg, "--cutout=")) {
                     augment_config.cutout = try std.fmt.parseFloat(f32, arg["--cutout=".len..]);
+                } else if (std.mem.eql(u8, arg, "--tta")) {
+                    report_mirrored = true;
                 } else if (std.mem.startsWith(u8, arg, "--cutmix=")) {
                     cutmix = try std.fmt.parseFloat(f32, arg["--cutmix=".len..]);
                 } else if (std.mem.startsWith(u8, arg, "--ema=")) {
@@ -190,7 +220,7 @@ fn Runner(comptime Spec: type) type {
             const train_data = if (gpu) |dev| try train.toGpu(dev) else train;
             const test_data = if (gpu) |dev| try test_set.toGpu(dev) else test_set;
 
-            if (load_path != null) try out.print("loaded checkpoint after {d} epochs, test accuracy {d:.2}%\n", .{ start_epoch, try accuracy(gpa, par, model, test_data) });
+            if (load_path != null) try out.print("loaded checkpoint after {d} epochs, test accuracy {d:.2}%\n", .{ start_epoch, try accuracy(gpa, par, model, test_data, false) });
 
             const order = try gpa.alloc(u32, train.count());
             defer gpa.free(order);
@@ -273,11 +303,11 @@ fn Runner(comptime Spec: type) type {
                 if (gpu) |dev| loss_sum = try dev.scalar(loss_total);
 
                 const seconds = @as(f64, @floatFromInt(Io.Clock.awake.now(io).nanoseconds - started.nanoseconds)) / 1e9;
-                const acc = try accuracy(gpa, par, model, test_data);
+                const acc = try accuracy(gpa, par, model, test_data, false);
                 var ema_acc: f64 = 0;
                 if (ema_decay > 0) {
                     try average.swap(par);
-                    ema_acc = try accuracy(gpa, par, model, test_data);
+                    ema_acc = try accuracy(gpa, par, model, test_data, false);
                     try average.swap(par);
                 }
                 if (progress) try out.writeAll("\r\x1b[2K");
@@ -285,6 +315,14 @@ fn Runner(comptime Spec: type) type {
                 if (ema_decay > 0) try out.print("  ema {d:.2}%", .{ema_acc});
                 try out.print("  ({d:.2} s)\n", .{seconds});
                 try out.flush();
+            }
+            if (report_mirrored) {
+                try out.print("final test accuracy {d:.2}%, with mirrored inputs averaged {d:.2}%\n", .{ try accuracy(gpa, par, model, test_data, false), try accuracy(gpa, par, model, test_data, true) });
+                if (ema_decay > 0) {
+                    try average.swap(par);
+                    try out.print("ema   test accuracy {d:.2}%, with mirrored inputs averaged {d:.2}%\n", .{ try accuracy(gpa, par, model, test_data, false), try accuracy(gpa, par, model, test_data, true) });
+                    try average.swap(par);
+                }
             }
             if (save_path) |path| {
                 const counters = [_]u32{ @intCast(@max(stop_epoch, start_epoch)), adam.t };
