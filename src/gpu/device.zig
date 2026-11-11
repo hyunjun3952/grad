@@ -211,6 +211,16 @@ export fn layerNormParameters(x: [*]const f32, dy: [*]const f32, mean: [*]const 
     if (j < cols) ln.parameterGradient(x, dy, mean, inv_std, dgamma, dbeta, rows, cols, j);
 }
 
+export fn embeddingGather(table: [*]const f32, ids: [*]const u32, out: [*]f32, n: u32, width: u32) callconv(.nvptx_kernel) void {
+    const t = globalIndex();
+    if (t < @as(usize, n) * width) out[t] = table[@as(usize, ids[t / width]) * width + t % width];
+}
+
+export fn embeddingScatter(dy: [*]const f32, ids: [*]const u32, dtable: [*]f32, n: u32, width: u32) callconv(.nvptx_kernel) void {
+    const t = globalIndex();
+    if (t < @as(usize, n) * width) _ = @atomicRmw(f32, &dtable[@as(usize, ids[t / width]) * width + t % width], .Add, dy[t], .monotonic);
+}
+
 export fn softmaxRows(x: [*]const f32, y: [*]f32, rows: u32, cols: u32, period: u32) callconv(.nvptx_kernel) void {
     const r = globalIndex();
     if (r < rows) soft.forwardRow(x + r * cols, y + r * cols, cols, soft.limitOf(r, cols, period));

@@ -285,6 +285,28 @@ pub const Tape = struct {
         return out;
     }
 
+    pub fn embedding(self: *Tape, table: anytype, comptime n: usize, ids: []const u32) Error!Var(Tensor(f32, &.{ n, @TypeOf(table.value).shape[1] })) {
+        const width = @TypeOf(table.value).shape[1];
+        std.debug.assert(ids.len == n);
+        const value = try self.newTensor(Tensor(f32, &.{ n, width }));
+        if (self.par.gpu) |dev| {
+            try dev.embeddingGather(table.value.data, ids, value.data);
+        } else {
+            for (ids, 0..) |id, i| @memcpy(value.data[i * width ..][0..width], table.value.data[@as(usize, id) * width ..][0..width]);
+        }
+        const out = try self.makeVar(value, table.needs_grad);
+        const Ctx = struct { table: @TypeOf(table), ids: []const u32, out: @TypeOf(out) };
+        if (out.needs_grad) try self.recordBackward(Ctx{ .table = table, .ids = ids, .out = out }, struct {
+            fn run(t: *Tape, c: *const Ctx) Error!void {
+                if (t.par.gpu) |dev| return dev.embeddingScatter(c.out.grad.data, c.ids, c.table.grad.data);
+                for (c.ids, 0..) |id, i| {
+                    for (c.table.grad.data[@as(usize, id) * width ..][0..width], c.out.grad.data[i * width ..][0..width]) |*g, d| g.* += d;
+                }
+            }
+        }.run);
+        return out;
+    }
+
     pub fn layerNorm(self: *Tape, x: anytype, gamma: anytype, beta: anytype) Error!Var(@TypeOf(x.value)) {
         const X = @TypeOf(x.value);
         comptime if (X.rank != 2 or X.Elem != f32 or @TypeOf(gamma.value).shape[0] != X.shape[1]) @compileError("layerNorm expects an f32 (rows, columns) tensor and (columns) parameters");
@@ -1706,6 +1728,45 @@ test "layer norm has correct gradients for the input, the scale and the shift, o
     try gradcheck.expectGpuMatchesCpu(LayerNormNet, 10, 1e-4);
 }
 
+test "embedding gathers rows by id and scatters the gradient back, repeated ids accumulate, on the cpu and the gpu" {
+    const gpu = try gpu_mod.Gpu.forTest(1 << 20);
+    defer gpu.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const T = Tensor(f32, &.{ 5, 3 });
+    const table_values = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+    const host_ids = [_]u32{ 4, 1, 1, 0 };
+    const expected = [_]f32{ 13, 14, 15, 4, 5, 6, 4, 5, 6, 1, 2, 3 };
+    const expected_grad = [_]f32{ 10, 11, 12, 11, 13, 15, 0, 0, 0, 0, 0, 0, 1, 2, 3 };
+    var upstream: [12]f32 = undefined;
+    for (&upstream, 0..) |*g, i| g.* = @floatFromInt(i + 1);
+
+    var on_cpu: Tape = .{ .gpa = arena.allocator() };
+    const table = try on_cpu.leaf(try T.fromSlice(on_cpu.gpa, &table_values));
+    const rows = try on_cpu.embedding(table, 4, &host_ids);
+    try testing.expectEqualSlices(f32, &expected, rows.value.data);
+    @memcpy(rows.grad.data, &upstream);
+    try on_cpu.nodes.items[0].run(&on_cpu, on_cpu.nodes.items[0].ctx);
+    try testing.expectEqualSlices(f32, &expected_grad, table.grad.data);
+
+    const device_table = try gpu.alloc(f32, T.len);
+    const device_grad = try gpu.alloc(f32, T.len);
+    const device_ids = try gpu.alloc(u32, host_ids.len);
+    try gpu.upload(device_table, &table_values);
+    try gpu.upload(device_ids, &host_ids);
+    try gpu.fill(device_grad, 0);
+    var on_gpu: Tape = .{ .gpa = arena.allocator(), .par = .{ .gpu = gpu } };
+    const gpu_table: Var(T) = .{ .value = .{ .data = device_table }, .grad = .{ .data = device_grad }, .needs_grad = true };
+    const gathered = try on_gpu.embedding(gpu_table, 4, device_ids);
+    var host: [12]f32 = undefined;
+    try gpu.download(&host, gathered.value.data);
+    try testing.expectEqualSlices(f32, &expected, &host);
+    try gpu.upload(gathered.grad.data, &upstream);
+    try on_gpu.nodes.items[0].run(&on_gpu, on_gpu.nodes.items[0].ctx);
+    var grads: [15]f32 = undefined;
+    try gpu.download(&grads, device_grad);
+    try testing.expectEqualSlices(f32, &expected_grad, &grads);
+}
 test "label smoothing blends the target and its gradient with the uniform distribution" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

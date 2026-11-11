@@ -60,6 +60,8 @@ const Kernel = enum {
     relu,
     reluBackward,
     transposeHalf,
+    embeddingGather,
+    embeddingScatter,
     layerNormRows,
     layerNormBackward,
     layerNormParameters,
@@ -593,6 +595,14 @@ pub const Gpu = struct {
 
     pub fn reluBackward(self: *Gpu, x: []const f32, g_out: []const f32, g_in: []f32) Error!void {
         try self.launchFlat(.reluBackward, x.len, .{ x, g_out, g_in, x.len });
+    }
+
+    pub fn embeddingGather(self: *Gpu, table: []const f32, ids: []const u32, out: []f32) Error!void {
+        try self.launchFlat(.embeddingGather, out.len, .{ table, ids, out, ids.len, out.len / ids.len });
+    }
+
+    pub fn embeddingScatter(self: *Gpu, dy: []const f32, ids: []const u32, dtable: []f32) Error!void {
+        try self.launchFlat(.embeddingScatter, dy.len, .{ dy, ids, dtable, ids.len, dy.len / ids.len });
     }
 
     pub const LayerNorm = struct { x: []const f32, gamma: []const f32, mean: []f32, inv_std: []f32 };
