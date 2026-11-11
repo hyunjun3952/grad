@@ -392,18 +392,18 @@ fn implicitGemm(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
         try dev.upload(y, host[0..y.len]);
         try dev.upload(w, host[0..w.len]);
 
-        const geo: grad.gpu.ConvGeometry = .{ .n = case.n, .h = case.side, .w = case.side, .c = case.c_in, .k = 3, .stride = 1, .pad = 1, .out_h = case.side, .out_w = case.side, .positions = @intCast(rows) };
+        const geo: grad.gpu.ConvGeometry = .{ .n = case.n, .h = case.side, .w = case.side, .c = case.c_in, .k = 3, .stride = 1, .pad = 1, .out_h = case.side, .out_w = case.side, .positions = @intCast(rows), .c_out = case.c_out };
         const x_half = (try dev.packMatrix(x, rows, case.c_in, rows, case.c_in, false)).data;
         const w_half = try dev.packMatrix(w, kc, case.c_out, kc, case.c_out, false);
         const dy_t = try dev.packMatrix(y, case.c_out, rows, std.mem.alignForward(usize, case.c_out, 128), std.mem.alignForward(usize, rows, 32), true);
         const flops = 2.0 * @as(f64, @floatFromInt(rows)) * @as(f64, @floatFromInt(kc)) * @as(f64, @floatFromInt(case.c_out));
         var tflops: [2]f64 = undefined;
         for (0..2) |variant| {
-            if (variant == 0) try dev.convImplicitForward(x_half, w_half, y, geo, case.c_out, false) else try dev.convImplicitWeightGrad(dy_t, x_half, dw, geo, case.c_out, kc);
+            if (variant == 0) try dev.convImplicitForward(x_half, w_half, y, geo, false) else try dev.convImplicitWeightGrad(dy_t, x_half, dw, geo);
             try dev.cu.sync();
             const t0 = Io.Clock.awake.now(io);
             for (0..20) |_| {
-                if (variant == 0) try dev.convImplicitForward(x_half, w_half, y, geo, case.c_out, false) else try dev.convImplicitWeightGrad(dy_t, x_half, dw, geo, case.c_out, kc);
+                if (variant == 0) try dev.convImplicitForward(x_half, w_half, y, geo, false) else try dev.convImplicitWeightGrad(dy_t, x_half, dw, geo);
             }
             try dev.cu.sync();
             const ns: f64 = @floatFromInt(Io.Clock.awake.now(io).nanoseconds - t0.nanoseconds);
@@ -413,11 +413,11 @@ fn implicitGemm(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
         const dy_t32 = try dev.transposeF32(y, case.c_out, rows, std.mem.alignForward(usize, case.c_out, 32), positions_padded);
         var tf32_rates: [2]f64 = undefined;
         for (0..2) |variant| {
-            if (variant == 0) try dev.convTf32Forward(x, w, case.c_out, y, geo, case.c_out, false) else try dev.convTf32WeightGrad(dy_t32, positions_padded, x, dw, geo, case.c_out, kc);
+            if (variant == 0) try dev.convTf32Forward(x, w, case.c_out, y, geo, false) else try dev.convTf32WeightGrad(dy_t32, x, dw, geo);
             try dev.cu.sync();
             const t0 = Io.Clock.awake.now(io);
             for (0..20) |_| {
-                if (variant == 0) try dev.convTf32Forward(x, w, case.c_out, y, geo, case.c_out, false) else try dev.convTf32WeightGrad(dy_t32, positions_padded, x, dw, geo, case.c_out, kc);
+                if (variant == 0) try dev.convTf32Forward(x, w, case.c_out, y, geo, false) else try dev.convTf32WeightGrad(dy_t32, x, dw, geo);
             }
             try dev.cu.sync();
             const ns: f64 = @floatFromInt(Io.Clock.awake.now(io).nanoseconds - t0.nanoseconds);

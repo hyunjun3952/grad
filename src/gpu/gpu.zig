@@ -198,6 +198,13 @@ pub const Gpu = struct {
         return self;
     }
 
+    pub fn forTest(step_bytes: usize) !*Gpu {
+        return init(std.testing.allocator, step_bytes) catch |err| switch (err) {
+            error.DriverNotFound => error.SkipZigTest,
+            else => err,
+        };
+    }
+
     pub fn deinit(self: *Gpu) void {
         if (self.cudnn_lib) |*lib| {
             for (self.cudnn_plans.items) |entry| lib.destroyPlan(entry.plan);
@@ -444,14 +451,18 @@ pub const Gpu = struct {
         return dst;
     }
 
-    pub fn convTf32Forward(self: *Gpu, x: []const f32, w: []const f32, w_pitch: usize, out: []f32, geo: ga.ConvGeometry, c_out: usize, accumulate: bool) Error!void {
+    pub fn convTf32Forward(self: *Gpu, x: []const f32, w: []const f32, w_pitch: usize, out: []f32, geo: ga.ConvGeometry, accumulate: bool) Error!void {
+        const c_out: usize = geo.c_out;
         const m = @as(usize, geo.n) * geo.out_h * geo.out_w;
         const k_total = @as(usize, geo.k) * geo.k * geo.c;
         const kernel_shape = pack(ga.TensorShape, .{ .m = m, .n = c_out, .k_padded = k_total, .n_padded = w_pitch, .accumulate = accumulate, .chunk = k_total, .transpose_out = false, .output_half = false });
         try self.launch(.convTf32Forward, .{ ceilDiv(c_out, 64), ceilDiv(m, 128), 1 }, .{ x, w, out, kernel_shape, geo });
     }
 
-    pub fn convTf32WeightGrad(self: *Gpu, dy_t: []const f32, positions_padded: usize, x: []const f32, out: []f32, geo: ga.ConvGeometry, c_out: usize, taps: usize) Error!void {
+    pub fn convTf32WeightGrad(self: *Gpu, dy_t: []const f32, x: []const f32, out: []f32, geo: ga.ConvGeometry) Error!void {
+        const c_out: usize = geo.c_out;
+        const taps = @as(usize, geo.k) * geo.k * geo.c;
+        const positions_padded = std.mem.alignForward(usize, geo.positions, 32);
         const short = c_out <= 64;
         const tile_rows: usize = if (short) 64 else 128;
         const tile_cols: usize = if (short) 128 else 64;
@@ -471,13 +482,16 @@ pub const Gpu = struct {
         return .{ .data = dst, .rows_padded = rows, .cols_padded = cols_padded };
     }
 
-    pub fn convImplicitForward(self: *Gpu, x_half: []const u16, w: Packed, out: []f32, geo: ga.ConvGeometry, c_out: usize, accumulate: bool) Error!void {
+    pub fn convImplicitForward(self: *Gpu, x_half: []const u16, w: Packed, out: []f32, geo: ga.ConvGeometry, accumulate: bool) Error!void {
+        const c_out: usize = geo.c_out;
         const m = @as(usize, geo.n) * geo.out_h * geo.out_w;
         const kernel_shape = pack(ga.TensorShape, .{ .m = m, .n = c_out, .k_padded = w.rows_padded, .n_padded = w.cols_padded, .accumulate = accumulate, .chunk = w.rows_padded, .transpose_out = false, .output_half = false });
         try self.launch(.convGemmForward, .{ toU32(w.cols_padded / 64), ceilDiv(m, 128), 1 }, .{ x_half, w.data, out, kernel_shape, geo });
     }
 
-    pub fn convImplicitWeightGrad(self: *Gpu, dy_t: Packed, x_half: []const u16, out: []f32, geo: ga.ConvGeometry, c_out: usize, taps: usize) Error!void {
+    pub fn convImplicitWeightGrad(self: *Gpu, dy_t: Packed, x_half: []const u16, out: []f32, geo: ga.ConvGeometry) Error!void {
+        const c_out: usize = geo.c_out;
+        const taps = @as(usize, geo.k) * geo.k * geo.c;
         const short = c_out <= 64;
         const tile_rows: usize = if (short) 64 else 128;
         const tile_cols: usize = if (short) 128 else 64;
@@ -608,8 +622,8 @@ pub const Gpu = struct {
         try self.launchFlat(.batchNormGradFinish, out.beta.len, .{ out.sums, out.gamma, out.beta, out.beta.len });
     }
 
-    pub fn batchNormGradInput(self: *Gpu, x: []const f32, dy: []const f32, dx: []f32, p: norm.Affine, sums: []const f32, mask: []const f32, l: norm.Layout) Error!void {
-        try self.launchFlat(.batchNormGradInput, x.len, .{ x, dy, dx, p, sums, if (mask.len != 0) mask else x, l });
+    pub fn batchNormGradInput(self: *Gpu, io: norm.GradIo, p: norm.Affine, l: norm.Layout) Error!void {
+        try self.launchFlat(.batchNormGradInput, l.len, .{ io, p, l });
     }
     pub fn dropout(self: *Gpu, src: []const f32, dst: []f32, seed: u64, keep: f32, accumulate: bool) Error!void {
         try self.launchFlat(.dropout, src.len, .{ src, dst, src.len, seed, keep, accumulate });
@@ -641,25 +655,21 @@ pub const Gpu = struct {
         try self.launchTable(.adam, table, .{hp});
     }
 
-    pub fn gather(self: *Gpu, images: []const f32, labels_src: []const u8, order: []const u32, batch: []f32, labels_out: []u8, labels_other: []u8, start: usize, augment: Augment) Error!void {
-        const rows = labels_out.len;
-        const pixels = batch.len / rows;
+    pub const GatherFrom = struct { images: []const f32, labels: []const u8, order: []const u32 };
+    pub const GatherTo = struct { batch: []f32, labels: []u8, other_labels: []u8 };
+
+    pub fn gather(self: *Gpu, from: GatherFrom, to: GatherTo, start: usize, augment: Augment) Error!void {
+        const rows = to.labels.len;
+        const pixels = to.batch.len / rows;
         const args = pack(ga.GatherArgs, .{ .start = start, .rows = rows, .pixels = pixels, .max_shift = augment.max_shift, .max_angle = augment.max_angle, .max_scale = augment.max_scale, .channels = augment.channels, .flip = augment.flip, .mirror = augment.mirror, .cutout = augment.cutout, .x0 = augment.box.x0, .y0 = augment.box.y0, .x1 = augment.box.x1, .y1 = augment.box.y1, .seed = augment.seed });
-        try self.launchFlat(.gather, rows * pixels, .{ images, labels_src, order, batch, labels_out, labels_other, args });
+        try self.launchFlat(.gather, rows * pixels, .{ from.images, from.labels, from.order, to.batch, to.labels, to.other_labels, args });
     }
 };
 
 const testing = std.testing;
 
-fn initForTest() !*Gpu {
-    return Gpu.init(testing.allocator, 16 << 20) catch |err| switch (err) {
-        error.DriverNotFound => error.SkipZigTest,
-        else => err,
-    };
-}
-
 test "device memory round trip, fill, and the step arena" {
-    const gpu = try initForTest();
+    const gpu = try Gpu.forTest(16 << 20);
     defer gpu.deinit();
 
     const a = try gpu.alloc(f32, 1000);
@@ -686,7 +696,7 @@ test "device memory round trip, fill, and the step arena" {
 }
 
 test "deterministic mode gives bit-identical results on every run, for split-K products and batch-norm statistics" {
-    const gpu = try initForTest();
+    const gpu = try Gpu.forTest(16 << 20);
     defer gpu.deinit();
     gpu.tensor_core_min_work = 0;
     gpu.deterministic = true;

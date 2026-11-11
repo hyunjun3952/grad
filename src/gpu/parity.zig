@@ -6,13 +6,6 @@ const Gpu = gpu_mod.Gpu;
 const kernels = @import("../cpu/kernels.zig");
 const bf16 = @import("math/bf16.zig");
 
-fn initForTest() !*Gpu {
-    return Gpu.init(testing.allocator, 64 << 20) catch |err| switch (err) {
-        error.DriverNotFound => error.SkipZigTest,
-        else => err,
-    };
-}
-
 fn expectClose(want: []const f32, got: []const f32, tolerance: f32) !void {
     try testing.expectEqual(want.len, got.len);
     for (want, got, 0..) |w, g, i| {
@@ -74,7 +67,7 @@ fn checkMatmul(gpu: *Gpu, m: usize, n: usize, k: usize, ta: bool, tb: bool, accu
 }
 
 test "gpu matmul, f32 and bf16 tensor cores, matches the cpu reference for every transpose, shape and accumulate flag" {
-    const gpu = try initForTest();
+    const gpu = try Gpu.forTest(64 << 20);
     defer gpu.deinit();
 
     const shapes = [_][3]usize{

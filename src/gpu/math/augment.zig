@@ -181,10 +181,7 @@ test "transforms stay inside the configured ranges and reach both ends" {
 }
 
 test "gpu gather applies the same augmentation as the cpu" {
-    const gpu = Gpu.init(std.testing.allocator, 1 << 20) catch |err| switch (err) {
-        error.DriverNotFound => return error.SkipZigTest,
-        else => return err,
-    };
+    const gpu = try Gpu.forTest(1 << 20);
     defer gpu.deinit();
     var prng = std.Random.DefaultPrng.init(3);
     var images: [4 * 784]f32 = undefined;
@@ -203,7 +200,7 @@ test "gpu gather applies the same augmentation as the cpu" {
     try gpu.upload(d_images, &images);
     try gpu.upload(d_labels, &labels);
     try gpu.upload(d_order, &order);
-    try gpu.gather(d_images, d_labels, d_order, d_batch, d_out_labels, d_other_labels, start, config);
+    try gpu.gather(.{ .images = d_images, .labels = d_labels, .order = d_order }, .{ .batch = d_batch, .labels = d_out_labels, .other_labels = d_other_labels }, start, config);
 
     var got: [2 * 784]f32 = undefined;
     var got_labels: [2]u8 = undefined;

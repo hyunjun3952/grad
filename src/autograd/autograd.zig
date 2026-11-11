@@ -53,6 +53,10 @@ pub fn reshape(x: anytype, comptime shape: []const usize) Var(Tensor(@TypeOf(x.v
     return .{ .value = .{ .data = x.value.data }, .grad = .{ .data = x.grad.data }, .needs_grad = x.needs_grad };
 }
 
+fn batchNormGradIo(k: anytype, sums: []const f32, comptime fuse_relu: bool) norm.GradIo {
+    return .{ .x = k.x.value.data.ptr, .dy = k.out.grad.data.ptr, .dx = k.x.grad.data.ptr, .sums = sums.ptr, .mask = if (fuse_relu) k.out.value.data.ptr else k.out.grad.data.ptr };
+}
+
 pub const Activation = activation_math.Kind;
 pub const ConvOpts = struct { stride: usize = 1, pad: usize = 0, dilation: usize = 1, groups: usize = 1 };
 pub const PoolOpts = struct { kernel: usize = 2, stride: usize = 2, pad: usize = 0 };
@@ -353,10 +357,10 @@ pub const Tape = struct {
                 const grads: norm.GradOut = .{ .sums = sums.data, .gamma = k.gamma.grad.data, .beta = k.beta.grad.data };
                 if (t.par.gpu) |dev| {
                     try dev.batchNormGradSums(k.x.value.data, k.out.grad.data, k.affine, mask, grads);
-                    if (k.x.needs_grad) try dev.batchNormGradInput(k.x.value.data, k.out.grad.data, k.x.grad.data, k.affine, sums.data, mask, layout);
+                    if (k.x.needs_grad) try dev.batchNormGradInput(batchNormGradIo(k, sums.data, fuse_relu), k.affine, layout);
                 } else {
                     cpu.normGradSums(t.par, k.x.value.data, k.out.grad.data, k.affine, mask, grads);
-                    if (k.x.needs_grad) cpu.normGradInput(t.par, k.x.value.data, k.out.grad.data, k.x.grad.data, k.affine, sums.data, if (fuse_relu) k.out.value.data else k.out.grad.data, layout);
+                    if (k.x.needs_grad) cpu.normGradInput(t.par, batchNormGradIo(k, sums.data, fuse_relu), k.affine, layout);
                 }
             }
         }.run);
@@ -399,8 +403,8 @@ pub const Tape = struct {
         const kc = k * k * c_in;
         const Col = Tensor(f32, &.{ rows, kc });
         const Flat = Tensor(f32, &.{ rows, c_out });
-        const geometry: ga.ConvGeometry = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = c_in, .k = k, .stride = opts.stride, .pad = opts.pad, .out_h = Out.shape[1], .out_w = Out.shape[2], .positions = rows };
-        const reverse: ga.ConvGeometry = .{ .n = In.shape[0], .h = Out.shape[1], .w = Out.shape[2], .c = c_out, .k = k, .stride = 1, .pad = k - 1 - opts.pad, .out_h = In.shape[1], .out_w = In.shape[2], .positions = In.len / c_in };
+        const geometry: ga.ConvGeometry = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = c_in, .k = k, .stride = opts.stride, .pad = opts.pad, .out_h = Out.shape[1], .out_w = Out.shape[2], .positions = rows, .c_out = c_out };
+        const reverse: ga.ConvGeometry = .{ .n = In.shape[0], .h = Out.shape[1], .w = Out.shape[2], .c = c_out, .k = k, .stride = 1, .pad = k - 1 - opts.pad, .out_h = In.shape[1], .out_w = In.shape[2], .positions = In.len / c_in, .c_out = c_in };
         const cudnn_geometry: gpu_mod.cudnn.Geometry = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = c_in, .k = c_out, .r = k, .pad = opts.pad, .stride = opts.stride };
         const aligned_out = std.mem.alignForward(usize, c_out, 64);
 
@@ -430,9 +434,9 @@ pub const Tape = struct {
                 const g = dev.?;
                 x_half = (try g.packMatrix(x.value.data, In.len / c_in, c_in, In.len / c_in, c_in, false)).data;
                 const w_half = try g.packMatrix(w.value.data, kc, c_out, kc, aligned_out, false);
-                try g.convImplicitForward(x_half, w_half, value.data, geometry, c_out, false);
+                try g.convImplicitForward(x_half, w_half, value.data, geometry, false);
             },
-            .tf32 => try dev.?.convTf32Forward(x.value.data, w.value.data, c_out, value.data, geometry, c_out, false),
+            .tf32 => try dev.?.convTf32Forward(x.value.data, w.value.data, c_out, value.data, geometry, false),
             .cudnn => {
                 const g = dev.?;
                 const mark = g.step_used;
@@ -484,23 +488,23 @@ pub const Tape = struct {
                         if (c.x.needs_grad) {
                             const grad_half = try g.packMatrix(grad.data, rows, c_out, rows, c_out, false);
                             const rotated = try g.packRotatedWeights(c.w.value.data, k, c_in, c_out);
-                            try g.convImplicitForward(grad_half.data, rotated, c.x.grad.data, reverse, c_in, true);
+                            try g.convImplicitForward(grad_half.data, rotated, c.x.grad.data, reverse, true);
                         }
                         if (c.w.needs_grad) {
                             const grad_t = try g.packMatrix(grad.data, c_out, rows, std.mem.alignForward(usize, c_out, 128), std.mem.alignForward(usize, rows, 32), true);
-                            try g.convImplicitWeightGrad(grad_t, c.x_half, c.w.grad.data, geometry, c_out, kc);
+                            try g.convImplicitWeightGrad(grad_t, c.x_half, c.w.grad.data, geometry);
                         }
                     },
                     .tf32 => {
                         const g = t.par.gpu.?;
                         if (c.x.needs_grad) {
                             const rotated = try g.rotateWeightsF32(c.w.value.data, k, c_in, c_out);
-                            try g.convTf32Forward(grad.data, rotated, std.mem.alignForward(usize, c_in, 64), c.x.grad.data, reverse, c_in, true);
+                            try g.convTf32Forward(grad.data, rotated, std.mem.alignForward(usize, c_in, 64), c.x.grad.data, reverse, true);
                         }
                         if (c.w.needs_grad) {
                             const positions_padded = std.mem.alignForward(usize, rows, 32);
                             const grad_t = try g.transposeF32(grad.data, c_out, rows, std.mem.alignForward(usize, c_out, 32), positions_padded);
-                            try g.convTf32WeightGrad(grad_t, positions_padded, c.x.value.data, c.w.grad.data, geometry, c_out, kc);
+                            try g.convTf32WeightGrad(grad_t, c.x.value.data, c.w.grad.data, geometry);
                         }
                     },
                     .cudnn => {
@@ -707,10 +711,7 @@ test "dropout is the identity at eval, and backward reuses the forward mask" {
 }
 
 test "gpu dropout draws the same mask as the cpu" {
-    const gpu = gpu_mod.Gpu.init(testing.allocator, 1 << 20) catch |err| switch (err) {
-        error.DriverNotFound => return error.SkipZigTest,
-        else => return err,
-    };
+    const gpu = try gpu_mod.Gpu.forTest(1 << 20);
     defer gpu.deinit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1164,10 +1165,7 @@ test "fused add and relu equals the two ops exactly and matches finite differenc
 }
 
 test "addRelu leaves a constant operand without a gradient, on the cpu and on the gpu" {
-    const gpu = gpu_mod.Gpu.init(testing.allocator, 1 << 20) catch |err| switch (err) {
-        error.DriverNotFound => return error.SkipZigTest,
-        else => return err,
-    };
+    const gpu = try gpu_mod.Gpu.forTest(1 << 20);
     defer gpu.deinit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1374,10 +1372,7 @@ test "batch norm gradients match finite differences, and the gpu matches the cpu
     try gradcheck.expectGpuMatchesCpu(BnCase, 43, 1e-5);
 }
 test "average pooling takes window means and spreads gradients evenly, also on the gpu" {
-    const gpu = gpu_mod.Gpu.init(testing.allocator, 1 << 20) catch |err| switch (err) {
-        error.DriverNotFound => return error.SkipZigTest,
-        else => return err,
-    };
+    const gpu = try gpu_mod.Gpu.forTest(1 << 20);
     defer gpu.deinit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

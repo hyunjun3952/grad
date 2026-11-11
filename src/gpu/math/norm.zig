@@ -7,6 +7,7 @@ pub const max_channels = 256;
 pub const Affine = extern struct { mean: [*]const f32, inv_std: [*]const f32, gamma: [*]const f32, beta: [*]const f32 };
 pub const Stats = extern struct { mean: [*]f32, inv_std: [*]f32, running_mean: [*]f32, running_var: [*]f32 };
 pub const Layout = extern struct { len: u32, channels: u32, flag: u32 };
+pub const GradIo = extern struct { x: [*]const f32, dy: [*]const f32, dx: [*]f32, sums: [*]const f32, mask: [*]const f32 };
 pub const GradOut = struct { sums: []f32, gamma: []f32, beta: []f32 };
 
 pub inline fn apply(t: usize, x: [*]const f32, y: [*]f32, p: Affine, l: Layout) void {
@@ -15,12 +16,12 @@ pub inline fn apply(t: usize, x: [*]const f32, y: [*]f32, p: Affine, l: Layout) 
     y[t] = if (l.flag != 0) @max(v, 0) else v;
 }
 
-pub inline fn gradInput(t: usize, x: [*]const f32, dy: [*]const f32, dx: [*]f32, p: Affine, sums: [*]const f32, mask: [*]const f32, l: Layout) void {
+pub inline fn gradInput(t: usize, io: GradIo, p: Affine, l: Layout) void {
     const ch = t % l.channels;
     const n: f32 = @floatFromInt(l.len / l.channels);
-    const x_hat = (x[t] - p.mean[ch]) * p.inv_std[ch];
-    const g = if (l.flag != 0 and mask[t] <= 0) 0 else dy[t];
-    dx[t] += p.gamma[ch] * p.inv_std[ch] / n * (n * g - sums[ch] - x_hat * sums[l.channels + ch]);
+    const x_hat = (io.x[t] - p.mean[ch]) * p.inv_std[ch];
+    const g = if (l.flag != 0 and io.mask[t] <= 0) 0 else io.dy[t];
+    io.dx[t] += p.gamma[ch] * p.inv_std[ch] / n * (n * g - io.sums[ch] - x_hat * io.sums[l.channels + ch]);
 }
 
 pub fn stats(x: []const f32, st: Stats, c: usize, training: bool) void {

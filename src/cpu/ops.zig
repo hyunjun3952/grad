@@ -74,9 +74,9 @@ pub fn col2im(par: kernels.Parallel, dcol: []const f32, dx: []f32, d: cv.Dims) v
 
 const norm = @import("../gpu/math/norm.zig");
 
-const NormJob = struct { x: [*]const f32, y: [*]f32, p: norm.Affine, l: norm.Layout, extra: [*]const f32, sums: [*]const f32, dx: [*]f32 };
+const ApplyJob = struct { x: [*]const f32, y: [*]f32, p: norm.Affine, l: norm.Layout };
 
-fn normApplyRows(job: NormJob, lo: usize, hi: usize) void {
+fn normApplyRows(job: ApplyJob, lo: usize, hi: usize) void {
     const c: usize = job.l.channels;
     const relu = job.l.flag != 0;
     for (lo..hi) |row| {
@@ -90,30 +90,30 @@ fn normApplyRows(job: NormJob, lo: usize, hi: usize) void {
 }
 
 pub fn normApply(par: kernels.Parallel, x: []const f32, y: []f32, p: norm.Affine, l: norm.Layout) void {
-    const job: NormJob = .{ .x = x.ptr, .y = y.ptr, .p = p, .l = l, .extra = x.ptr, .sums = x.ptr, .dx = y.ptr };
-    kernels.parallelFor(par, l.len / l.channels, 256, job, normApplyRows);
+    kernels.parallelFor(par, l.len / l.channels, 256, ApplyJob{ .x = x.ptr, .y = y.ptr, .p = p, .l = l }, normApplyRows);
 }
 
-fn normGradRows(job: NormJob, lo: usize, hi: usize) void {
+const GradJob = struct { io: norm.GradIo, p: norm.Affine, l: norm.Layout };
+
+fn normGradRows(job: GradJob, lo: usize, hi: usize) void {
     const c: usize = job.l.channels;
     const n: f32 = @floatFromInt(job.l.len / job.l.channels);
     const masked = job.l.flag != 0;
     for (lo..hi) |row| {
-        const x = job.x[row * c ..][0..c];
-        const dy = job.y[row * c ..][0..c];
-        const mask = job.extra[row * c ..][0..c];
-        const dx = job.dx[row * c ..][0..c];
+        const x = job.io.x[row * c ..][0..c];
+        const dy = job.io.dy[row * c ..][0..c];
+        const mask = job.io.mask[row * c ..][0..c];
+        const dx = job.io.dx[row * c ..][0..c];
         for (0..c) |ch| {
             const x_hat = (x[ch] - job.p.mean[ch]) * job.p.inv_std[ch];
             const g = if (masked and mask[ch] <= 0) 0 else dy[ch];
-            dx[ch] += job.p.gamma[ch] * job.p.inv_std[ch] / n * (n * g - job.sums[ch] - x_hat * job.sums[c + ch]);
+            dx[ch] += job.p.gamma[ch] * job.p.inv_std[ch] / n * (n * g - job.io.sums[ch] - x_hat * job.io.sums[c + ch]);
         }
     }
 }
 
-pub fn normGradInput(par: kernels.Parallel, x: []const f32, dy: []const f32, dx: []f32, p: norm.Affine, sums: []const f32, mask: []const f32, l: norm.Layout) void {
-    const job: NormJob = .{ .x = x.ptr, .y = @constCast(dy.ptr), .p = p, .l = l, .extra = mask.ptr, .sums = sums.ptr, .dx = dx.ptr };
-    kernels.parallelFor(par, l.len / l.channels, 256, job, normGradRows);
+pub fn normGradInput(par: kernels.Parallel, io: norm.GradIo, p: norm.Affine, l: norm.Layout) void {
+    kernels.parallelFor(par, l.len / l.channels, 256, GradJob{ .io = io, .p = p, .l = l }, normGradRows);
 }
 const parts = 8;
 const Wide = @Vector(4, f64);
@@ -322,8 +322,8 @@ test "row-wise batch-norm apply and input gradient equal the per-element referen
 
         @memset(want, 0.25);
         @memset(got, 0.25);
-        for (0..len) |t| norm.gradInput(t, x.ptr, dy.ptr, want.ptr, p, &sums, mask.ptr, l);
-        normGradInput(par, x, dy, got, p, &sums, mask, l);
+        for (0..len) |t| norm.gradInput(t, .{ .x = x.ptr, .dy = dy.ptr, .dx = want.ptr, .sums = &sums, .mask = mask.ptr }, p, l);
+        normGradInput(par, .{ .x = x.ptr, .dy = dy.ptr, .dx = got.ptr, .sums = &sums, .mask = mask.ptr }, p, l);
         for (want, got) |a, b| try testing.expectApproxEqAbs(a, b, 1e-6);
     }
 }

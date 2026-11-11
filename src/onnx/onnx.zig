@@ -280,7 +280,10 @@ const Builder = struct {
     }
 };
 
-pub fn build(gpa: Allocator, trace: *const Trace, weights: []const Weight, inputs: []const View, outputs: []const View) Error![]u8 {
+pub const Graph = struct { trace: *const Trace, weights: []const Weight, inputs: []const View, outputs: []const View };
+
+pub fn build(gpa: Allocator, graph: Graph) Error![]u8 {
+    const trace, const weights, const inputs, const outputs = .{ graph.trace, graph.weights, graph.inputs, graph.outputs };
     var b: Builder = .{
         .gpa = gpa,
         .names = .init(gpa),
@@ -316,8 +319,8 @@ pub fn build(gpa: Allocator, trace: *const Trace, weights: []const Weight, input
     return model.bytes.toOwnedSlice(gpa);
 }
 
-pub fn save(gpa: Allocator, io: Io, path: []const u8, trace: *const Trace, weights: []const Weight, inputs: []const View, outputs: []const View) !void {
-    const bytes = try build(gpa, trace, weights, inputs, outputs);
+pub fn save(gpa: Allocator, io: Io, path: []const u8, graph: Graph) !void {
+    const bytes = try build(gpa, graph);
     defer gpa.free(bytes);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
 }
@@ -351,12 +354,12 @@ test "a traced network becomes an onnx model with its weights, layout changes an
         .{ .id = @intFromPtr(dense.value.data.ptr), .data = dense.value.data },
         .{ .id = @intFromPtr(bias.value.data.ptr), .data = bias.value.data },
     };
-    const bytes = try build(gpa, &trace, &weights, &.{View.of(image)}, &.{View.of(logits)});
+    const bytes = try build(gpa, .{ .trace = &trace, .weights = &weights, .inputs = &.{View.of(image)}, .outputs = &.{View.of(logits)} });
     defer gpa.free(bytes);
 
     try testing.expectEqualSlices(u8, &.{ 0x08, 0x09 }, bytes[0..2]);
     for ([_][]const u8{ "Conv", "Gelu", "MaxPool", "MatMul", "Add", "Identity", "output", "input" }) |name| try testing.expect(countOf(bytes, name) >= 1);
     try testing.expectEqual(@as(usize, 2), countOf(bytes, "Reshape"));
     try testing.expectEqual(@as(usize, 4), countOf(bytes, "Transpose"));
-    try testing.expectError(error.UnknownTensor, build(gpa, &trace, weights[1..], &.{View.of(image)}, &.{View.of(logits)}));
+    try testing.expectError(error.UnknownTensor, build(gpa, .{ .trace = &trace, .weights = weights[1..], .inputs = &.{View.of(image)}, .outputs = &.{View.of(logits)} }));
 }

@@ -79,10 +79,7 @@ test "a checkpoint restores every tensor and counter and rejects a different lay
 }
 
 test "a gpu checkpoint round trips through device memory" {
-    const gpu = Gpu.init(testing.allocator, 1 << 20) catch |err| switch (err) {
-        error.DriverNotFound => return error.SkipZigTest,
-        else => return err,
-    };
+    const gpu = try Gpu.forTest(1 << 20);
     defer gpu.deinit();
     const path = ".zig-cache/checkpoint-gpu-test.bin";
     defer Io.Dir.cwd().deleteFile(testing.io, path) catch {};

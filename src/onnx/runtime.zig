@@ -732,7 +732,7 @@ test "an exported network, read back with runtime shapes, gives the same outputs
     const state = nn.state(layers);
     var weights: [state.len]onnx.Weight = undefined;
     inline for (state, 0..) |slice, i| weights[i] = .{ .id = @intFromPtr(slice.ptr), .data = slice };
-    const bytes = try onnx.build(gpa, &trace, &weights, &.{onnx.View.of(image)}, &.{onnx.View.of(logits)});
+    const bytes = try onnx.build(gpa, .{ .trace = &trace, .weights = &weights, .inputs = &.{onnx.View.of(image)}, .outputs = &.{onnx.View.of(logits)} });
     defer gpa.free(bytes);
 
     var model = try Model.parse(gpa, bytes);
@@ -797,7 +797,7 @@ test "a gru step with two inputs and two outputs survives export and import" {
     const state = nn.state(layers);
     var weights: [state.len]onnx.Weight = undefined;
     inline for (state, 0..) |slice, i| weights[i] = .{ .id = @intFromPtr(slice.ptr), .data = slice };
-    const bytes = try onnx.build(gpa, &trace, &weights, &.{ onnx.View.of(x), onnx.View.of(h) }, &.{ onnx.View.of(next), onnx.View.of(scores) });
+    const bytes = try onnx.build(gpa, .{ .trace = &trace, .weights = &weights, .inputs = &.{ onnx.View.of(x), onnx.View.of(h) }, .outputs = &.{ onnx.View.of(next), onnx.View.of(scores) } });
     defer gpa.free(bytes);
 
     var model = try Model.parse(gpa, bytes);

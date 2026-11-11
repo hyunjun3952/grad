@@ -15,7 +15,10 @@ const Tensor = @import("../tensor/tensor.zig").Tensor;
 
 const Tape = autograd.Tape;
 
-fn printProgress(out: *Io.Writer, epoch: usize, epochs: usize, done: usize, steps: usize, loss: f64, elapsed_ns: i96, epochs_left: usize) !void {
+const Progress = struct { epoch: usize, epochs: usize, done: usize, steps: usize, loss: f64, elapsed_ns: i96, epochs_left: usize };
+
+fn printProgress(out: *Io.Writer, p: Progress) !void {
+    const epoch, const epochs, const done, const steps, const loss, const elapsed_ns, const epochs_left = .{ p.epoch, p.epochs, p.done, p.steps, p.loss, p.elapsed_ns, p.epochs_left };
     const width = 24;
     const filled = done * width / steps;
     var bar: [width]u8 = undefined;
@@ -176,7 +179,7 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
                 try scores(par, model, &arena, host_logits, data.images[start * pixels ..][0 .. Spec.eval_batch * pixels]);
                 if (mirrored_too) {
                     if (par.gpu) |dev| {
-                        try dev.gather(data.images, data.labels, identity, mirrored, scratch_labels[0], scratch_labels[1], start, flip);
+                        try dev.gather(.{ .images = data.images, .labels = data.labels, .order = identity }, .{ .batch = mirrored, .labels = scratch_labels[0], .other_labels = scratch_labels[1] }, start, flip);
                     } else {
                         const transform = augment_math.transformOf(0, flip);
                         for (mirrored, 0..) |*v, i| v.* = augment_math.pixel(data.images[start * pixels + i / pixels * pixels ..].ptr, i % pixels, Spec.side, Spec.channels, transform);
@@ -247,7 +250,7 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
                 copied += 1;
                 if (par.gpu) |dev| try dev.download(host, slice) else @memcpy(host, slice);
             }
-            try onnx.save(gpa, io, path, &trace, &weights, &.{onnx.View.of(input)}, &.{onnx.View.of(logits)});
+            try onnx.save(gpa, io, path, .{ .trace = &trace, .weights = &weights, .inputs = &.{onnx.View.of(input)}, .outputs = &.{onnx.View.of(logits)} });
         }
 
         fn buffer(comptime T: type, gpa: Allocator, gpu: ?*Gpu, n: usize) ![]T {
@@ -294,7 +297,7 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
             }
 
             fn fill(self: Feed, step: usize, augment: augment_math.Config) !void {
-                if (self.gpu) |dev| return dev.gather(self.device.images, self.device.labels, self.order_device, self.batch.data, self.labels, self.other_labels, step * batch_size, augment);
+                if (self.gpu) |dev| return dev.gather(.{ .images = self.device.images, .labels = self.device.labels, .order = self.order_device }, .{ .batch = self.batch.data, .labels = self.labels, .other_labels = self.other_labels }, step * batch_size, augment);
                 const rows = self.order[step * batch_size ..][0..batch_size];
                 for (rows, 0..) |idx, row| {
                     const partner = (row + 1) % batch_size;
@@ -414,7 +417,7 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
                     if (gpu) |dev| try dev.addInPlace(loss_total, loss.value.data) else loss_sum += loss.value.data[0];
                     if (live and ((step + 1) % progress_every == 0 or step + 1 == steps)) {
                         const so_far = if (gpu) |dev| try dev.scalar(loss_total) else loss_sum;
-                        try printProgress(out, epoch, epochs, step + 1, steps, so_far / @as(f64, @floatFromInt(step + 1)), Io.Clock.awake.now(io).nanoseconds - started.nanoseconds, stop_epoch - epoch - 1);
+                        try printProgress(out, .{ .epoch = epoch, .epochs = epochs, .done = step + 1, .steps = steps, .loss = so_far / @as(f64, @floatFromInt(step + 1)), .elapsed_ns = Io.Clock.awake.now(io).nanoseconds - started.nanoseconds, .epochs_left = stop_epoch - epoch - 1 });
                     }
                 }
                 if (gpu) |dev| loss_sum = try dev.scalar(loss_total);

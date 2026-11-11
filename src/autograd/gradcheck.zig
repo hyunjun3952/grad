@@ -69,10 +69,7 @@ pub fn expectCudnnClose(comptime Case: type, seed: u64, tolerance: f32) !void {
 }
 
 fn compareWithGpu(comptime Case: type, seed: u64, tolerance: f32, backend: Backend) !void {
-    const gpu = Gpu.init(testing.allocator, 64 << 20) catch |err| switch (err) {
-        error.DriverNotFound => return error.SkipZigTest,
-        else => return err,
-    };
+    const gpu = try Gpu.forTest(64 << 20);
     defer gpu.deinit();
     gpu.tensor_cores = backend == .tensor_cores;
     gpu.tf32 = backend == .tf32;

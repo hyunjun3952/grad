@@ -317,8 +317,8 @@ export fn batchNormApply(x: [*]const f32, y: [*]f32, p: nm.Affine, l: nm.Layout)
     if (globalIndex() < l.len) nm.apply(globalIndex(), x, y, p, l);
 }
 
-export fn batchNormGradInput(x: [*]const f32, dy: [*]const f32, dx: [*]f32, p: nm.Affine, sums: [*]const f32, mask: [*]const f32, l: nm.Layout) callconv(.nvptx_kernel) void {
-    if (globalIndex() < l.len) nm.gradInput(globalIndex(), x, dy, dx, p, sums, mask, l);
+export fn batchNormGradInput(io: nm.GradIo, p: nm.Affine, l: nm.Layout) callconv(.nvptx_kernel) void {
+    if (globalIndex() < l.len) nm.gradInput(globalIndex(), io, p, l);
 }
 
 export fn crossEntropyRows(x: [*]const f32, logp: [*]f32, labels: [*]const u8, row_loss: [*]f32, rows: u32, cols: u32, smoothing: f32) callconv(.nvptx_kernel) void {
@@ -624,7 +624,7 @@ export fn packHalfTransposed(src: [*]const f32, dst: [*]u16, args: ga.PackArgs) 
 
 const GemmMode = enum { dense, gather_a, gather_b };
 
-const zero_geometry: ga.ConvGeometry = .{ .n = 0, .h = 0, .w = 0, .c = 0, .k = 0, .stride = 0, .pad = 0, .out_h = 0, .out_w = 0, .positions = 0 };
+const zero_geometry: ga.ConvGeometry = .{ .n = 0, .h = 0, .w = 0, .c = 0, .k = 0, .stride = 0, .pad = 0, .out_h = 0, .out_w = 0, .positions = 0, .c_out = 0 };
 
 inline fn copyAsyncZfill(dst: u32, src: anytype, valid: bool) void {
     asm volatile ("cp.async.cg.shared.global [%[dst]], [%[src]], 16, %[size];"
@@ -645,8 +645,27 @@ inline fn waitCopies() void {
 
 const Acc = [2][4][4]f32;
 const Warp = struct { lane: usize, row: usize, col: usize };
+const Block = struct { tid: usize, row0: usize, col0: usize, k_begin: usize };
 
-fn GemmLoader(comptime tc: type, comptime Elem: type, comptime mode: GemmMode) type {
+const GemmKind = struct {
+    tf32: bool = false,
+    rows: usize = 128,
+    cols: usize = 64,
+    mode: GemmMode,
+
+    fn Elem(comptime self: GemmKind) type {
+        return if (self.tf32) f32 else u16;
+    }
+
+    fn Tile(comptime self: GemmKind) type {
+        return if (self.tf32) Tf32Tile(self.rows, self.cols) else TensorTile(self.rows, self.cols);
+    }
+};
+
+fn GemmLoader(comptime kind: GemmKind) type {
+    const tc = kind.Tile();
+    const Elem = kind.Elem();
+    const mode = kind.mode;
     const a_per = tc.rows / 64;
     const b_per = tc.cols / 64;
     const lane_elems = 16 / @sizeOf(Elem);
@@ -674,7 +693,8 @@ fn GemmLoader(comptime tc: type, comptime Elem: type, comptime mode: GemmMode) t
         cursor_kx: i32,
         cursor_channel: usize,
 
-        inline fn init(a: [*]const Elem, b: [*]const Elem, geo: ga.ConvGeometry, shape: ga.TensorShape, row0: usize, col0: usize, k_begin: usize, tid: usize) @This() {
+        inline fn init(a: [*]const Elem, b: [*]const Elem, geo: ga.ConvGeometry, shape: ga.TensorShape, block: Block) @This() {
+            const tid, const row0, const col0, const k_begin = .{ block.tid, block.row0, block.col0, block.k_begin };
             var self: @This() = undefined;
             self.a = a;
             self.b = b;
@@ -763,9 +783,10 @@ fn GemmLoader(comptime tc: type, comptime Elem: type, comptime mode: GemmMode) t
     };
 }
 
-inline fn pipeline(comptime tc: type, loader: anytype, k_begin: usize, tiles: usize, warp: Warp, acc: *Acc, comptime compute: anytype) void {
+inline fn pipeline(comptime kind: GemmKind, loader: anytype, block: Block, tiles: usize, warp: Warp, acc: *Acc) void {
+    const tc = kind.Tile();
     inline for (0..tc.stages - 1) |stage| {
-        if (stage < tiles) loader.issue(stage, k_begin + stage * tc.depth);
+        if (stage < tiles) loader.issue(stage, block.k_begin + stage * tc.depth);
         commitCopies();
     }
     var tile: usize = 0;
@@ -773,18 +794,19 @@ inline fn pipeline(comptime tc: type, loader: anytype, k_begin: usize, tiles: us
         waitCopies();
         barrier();
         const ahead = tile + tc.stages - 1;
-        if (ahead < tiles) loader.issue(ahead % tc.stages, k_begin + ahead * tc.depth);
+        if (ahead < tiles) loader.issue(ahead % tc.stages, block.k_begin + ahead * tc.depth);
         commitCopies();
-        compute(tc, warp, (tile % tc.stages) * tc.stage_elems, acc);
+        const base = (tile % tc.stages) * tc.stage_elems;
+        if (kind.tf32) tf32Compute(tc, warp, base, acc) else bf16Compute(tc, warp, base, acc);
     }
 }
 
-inline fn storeTile(c: [*]f32, acc: *const Acc, shape: ga.TensorShape, warp: Warp, row0: usize, col0: usize, comptime half_output: bool) void {
+inline fn storeTile(comptime half_output: bool, c: [*]f32, acc: *const Acc, shape: ga.TensorShape, block: Block, warp: Warp) void {
     inline for (0..2) |mi| {
         inline for (0..4) |ni| {
             inline for (0..4) |q| {
-                const r = row0 + warp.row * 32 + mi * 16 + warp.lane / 4 + (q / 2) * 8;
-                const col = col0 + warp.col * 32 + ni * 8 + (warp.lane % 4) * 2 + q % 2;
+                const r = block.row0 + warp.row * 32 + mi * 16 + warp.lane / 4 + (q / 2) * 8;
+                const col = block.col0 + warp.col * 32 + ni * 8 + (warp.lane % 4) * 2 + q % 2;
                 if (r < shape.m and col < shape.n) {
                     const at = if (shape.transpose_out != 0) col * shape.m + r else r * shape.n + col;
                     if (half_output and shape.output_half != 0) {
@@ -801,20 +823,18 @@ inline fn storeTile(c: [*]f32, acc: *const Acc, shape: ga.TensorShape, warp: War
     }
 }
 
-inline fn tileGemm(comptime tc: type, comptime Elem: type, comptime mode: GemmMode, comptime compute: anytype, comptime half_output: bool, a: [*]const Elem, b: [*]const Elem, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) void {
+inline fn tileGemm(comptime kind: GemmKind, a: [*]const kind.Elem(), b: [*]const kind.Elem(), c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) void {
+    const tc = kind.Tile();
     const tid: usize = @workItemId(0);
     const warp: Warp = .{ .lane = tid % 32, .row = tid / 32 / (tc.cols / 32), .col = tid / 32 % (tc.cols / 32) };
-    const row0 = @as(usize, @workGroupId(1)) * tc.rows;
-    const col0 = @as(usize, @workGroupId(0)) * tc.cols;
-    const k_begin = @as(usize, @workGroupId(2)) * shape.chunk;
-    const tiles = (@min(shape.k_padded, k_begin + shape.chunk) -| k_begin) / tc.depth;
+    const block: Block = .{ .tid = tid, .row0 = @as(usize, @workGroupId(1)) * tc.rows, .col0 = @as(usize, @workGroupId(0)) * tc.cols, .k_begin = @as(usize, @workGroupId(2)) * shape.chunk };
+    const tiles = (@min(shape.k_padded, block.k_begin + shape.chunk) -| block.k_begin) / tc.depth;
 
-    var loader = GemmLoader(tc, Elem, mode).init(a, b, geo, shape, row0, col0, k_begin, tid);
+    var loader = GemmLoader(kind).init(a, b, geo, shape, block);
     var acc: Acc = @splat(@splat(@splat(0)));
-    pipeline(tc, &loader, k_begin, tiles, warp, &acc, compute);
-    storeTile(c, &acc, shape, warp, row0, col0, half_output);
+    pipeline(kind, &loader, block, tiles, warp, &acc);
+    storeTile(!kind.tf32, c, &acc, shape, block, warp);
 }
-
 inline fn bf16Compute(comptime tc: type, warp: Warp, base: usize, acc: *Acc) void {
     inline for (0..tc.depth / 16) |step| {
         var a_frag: [2][4]u32 = undefined;
@@ -857,28 +877,20 @@ inline fn tf32Compute(comptime tc: type, warp: Warp, base: usize, acc: *Acc) voi
     }
 }
 
-inline fn tensorGemm(comptime tile_rows: usize, comptime tile_cols: usize, comptime mode: GemmMode, a: [*]const u16, b: [*]const u16, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) void {
-    tileGemm(TensorTile(tile_rows, tile_cols), u16, mode, bf16Compute, true, a, b, c, shape, geo);
-}
-
-inline fn tf32Gemm(comptime tile_rows: usize, comptime tile_cols: usize, comptime mode: GemmMode, a: [*]const f32, b: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) void {
-    tileGemm(Tf32Tile(tile_rows, tile_cols), f32, mode, tf32Compute, false, a, b, c, shape, geo);
-}
-
 export fn sgemmTensor(a: [*]const u16, b: [*]const u16, c: [*]f32, shape: ga.TensorShape) callconv(.nvptx_kernel) void {
-    tensorGemm(128, 64, .dense, a, b, c, shape, zero_geometry);
+    tileGemm(.{ .mode = .dense }, a, b, c, shape, zero_geometry);
 }
 
 export fn convGemmForward(x: [*]const u16, w: [*]const u16, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
-    tensorGemm(128, 64, .gather_a, x, w, c, shape, geo);
+    tileGemm(.{ .mode = .gather_a }, x, w, c, shape, geo);
 }
 
 export fn convGemmWeightGrad(dy_t: [*]const u16, x: [*]const u16, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
-    tensorGemm(128, 64, .gather_b, dy_t, x, c, shape, geo);
+    tileGemm(.{ .mode = .gather_b }, dy_t, x, c, shape, geo);
 }
 
 export fn convGemmWeightGradShort(dy_t: [*]const u16, x: [*]const u16, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
-    tensorGemm(64, 128, .gather_b, dy_t, x, c, shape, geo);
+    tileGemm(.{ .rows = 64, .cols = 128, .mode = .gather_b }, dy_t, x, c, shape, geo);
 }
 
 export fn packWeightsRotated(src: [*]const f32, dst: [*]u16, args: ga.RotateArgs) callconv(.nvptx_kernel) void {
@@ -970,15 +982,15 @@ fn Tf32Tile(comptime tile_rows: usize, comptime tile_cols: usize) type {
 }
 
 export fn convTf32Forward(x: [*]const f32, w: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
-    tf32Gemm(128, 64, .gather_a, x, w, c, shape, geo);
+    tileGemm(.{ .tf32 = true, .mode = .gather_a }, x, w, c, shape, geo);
 }
 
 export fn convTf32WeightGrad(dy_t: [*]const f32, x: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
-    tf32Gemm(128, 64, .gather_b, dy_t, x, c, shape, geo);
+    tileGemm(.{ .tf32 = true, .mode = .gather_b }, dy_t, x, c, shape, geo);
 }
 
 export fn convTf32WeightGradShort(dy_t: [*]const f32, x: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
-    tf32Gemm(64, 128, .gather_b, dy_t, x, c, shape, geo);
+    tileGemm(.{ .tf32 = true, .rows = 64, .cols = 128, .mode = .gather_b }, dy_t, x, c, shape, geo);
 }
 
 export fn rotateWeightsF32(src: [*]const f32, dst: [*]f32, args: ga.RotateArgs) callconv(.nvptx_kernel) void {

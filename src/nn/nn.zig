@@ -397,10 +397,7 @@ test "a gru with zero weights halves the state, and its gradients match finite d
         try testing.expectApproxEqAbs(numeric, h.grad.data[i], 2e-3);
     }
 
-    const gpu = Gpu.init(gpa, 1 << 22) catch |err| switch (err) {
-        error.DriverNotFound => return,
-        else => return err,
-    };
+    const gpu = try Gpu.forTest(1 << 22);
     defer gpu.deinit();
     const on_gpu = try cell.toGpu(gpu);
     var gpu_tape: Tape = .{ .gpa = arena.allocator(), .par = .{ .gpu = gpu } };
