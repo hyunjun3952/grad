@@ -276,6 +276,224 @@ pub fn Gru(comptime n_in: usize, comptime hidden: usize) type {
     };
 }
 
+pub fn LayerNorm(comptime c: usize) type {
+    const V = Tensor(f32, &.{c});
+
+    return struct {
+        const Self = @This();
+
+        gamma: Var(V),
+        beta: Var(V),
+
+        pub fn init(gpa: Allocator, rng: std.Random) Allocator.Error!Self {
+            _ = rng;
+            const gamma = try V.full(gpa, 1);
+            errdefer gamma.deinit(gpa);
+            const grad_gamma = try V.zeros(gpa);
+            errdefer grad_gamma.deinit(gpa);
+            const beta = try V.zeros(gpa);
+            errdefer beta.deinit(gpa);
+            return .{
+                .gamma = .{ .value = gamma, .grad = grad_gamma, .needs_grad = true },
+                .beta = .{ .value = beta, .grad = try V.zeros(gpa), .needs_grad = true },
+            };
+        }
+
+        pub fn deinit(self: Self, gpa: Allocator) void {
+            self.gamma.value.deinit(gpa);
+            self.gamma.grad.deinit(gpa);
+            self.beta.value.deinit(gpa);
+            self.beta.grad.deinit(gpa);
+        }
+
+        pub fn toGpu(self: Self, gpu: *Gpu) autograd.Error!Self {
+            var out: Self = undefined;
+            inline for (.{ "gamma", "beta" }) |name| {
+                const value = try gpu.alloc(f32, c);
+                const grad = try gpu.alloc(f32, c);
+                try gpu.upload(value, @field(self, name).value.data);
+                try gpu.fill(grad, 0);
+                @field(out, name) = .{ .value = .{ .data = value }, .grad = .{ .data = grad }, .needs_grad = true };
+            }
+            return out;
+        }
+
+        pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(@TypeOf(x.value)) {
+            return tape.layerNorm(x, self.gamma, self.beta);
+        }
+
+        pub fn params(self: Self) struct { Var(V), Var(V) } {
+            return .{ self.gamma, self.beta };
+        }
+
+        pub fn state(self: Self) struct { []f32, []f32 } {
+            return .{ self.gamma.value.data, self.beta.value.data };
+        }
+    };
+}
+
+pub fn Embedding(comptime vocab: usize, comptime width: usize) type {
+    const W = Tensor(f32, &.{ vocab, width });
+
+    return struct {
+        const Self = @This();
+
+        table: Var(W),
+
+        pub fn init(gpa: Allocator, rng: std.Random) Allocator.Error!Self {
+            const table = try W.empty(gpa);
+            errdefer table.deinit(gpa);
+            for (table.data) |*v| v.* = rng.floatNorm(f32) * 0.1;
+            return .{ .table = .{ .value = table, .grad = try W.zeros(gpa), .needs_grad = true } };
+        }
+
+        pub fn deinit(self: Self, gpa: Allocator) void {
+            self.table.value.deinit(gpa);
+            self.table.grad.deinit(gpa);
+        }
+
+        pub fn toGpu(self: Self, gpu: *Gpu) autograd.Error!Self {
+            const value = try gpu.alloc(f32, W.len);
+            const grad = try gpu.alloc(f32, W.len);
+            try gpu.upload(value, self.table.value.data);
+            try gpu.fill(grad, 0);
+            return .{ .table = .{ .value = .{ .data = value }, .grad = .{ .data = grad }, .needs_grad = true } };
+        }
+
+        pub fn forward(self: Self, tape: *Tape, comptime n: usize, ids: []const u32) autograd.Error!Var(Tensor(f32, &.{ n, width })) {
+            return tape.embedding(self.table, n, ids);
+        }
+
+        pub fn params(self: Self) struct { Var(W) } {
+            return .{self.table};
+        }
+
+        pub fn state(self: Self) struct { []f32 } {
+            return .{self.table.value.data};
+        }
+    };
+}
+
+fn Head(comptime width: usize, comptime depth: usize, comptime steps: usize) type {
+    const Layers = struct { Linear(width, depth), Linear(width, depth), Linear(width, depth), Linear(depth, width) };
+
+    return struct {
+        const Self = @This();
+
+        layers: Layers,
+
+        pub fn init(gpa: Allocator, rng: std.Random) Allocator.Error!Self {
+            return .{ .layers = try initAll(Layers, gpa, rng) };
+        }
+
+        pub fn deinit(self: Self, gpa: Allocator) void {
+            deinitAll(self.layers, gpa);
+        }
+
+        pub fn toGpu(self: Self, gpu: *Gpu) autograd.Error!Self {
+            return .{ .layers = try toGpuAll(self.layers, gpu) };
+        }
+
+        pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(@TypeOf(x.value)) {
+            const rows = @TypeOf(x.value).shape[0];
+            const batch = rows / steps;
+            const scale = try tape.constant(try tape.filledTensor(Tensor(f32, &.{}), 1 / @sqrt(@as(f32, depth))));
+            const query = autograd.reshape(try self.layers[0].forward(tape, x), &.{ batch, steps, depth });
+            const key = autograd.reshape(try self.layers[1].forward(tape, x), &.{ batch, steps, depth });
+            const value = autograd.reshape(try self.layers[2].forward(tape, x), &.{ batch, steps, depth });
+            const scores = try tape.mul(autograd.reshape(try tape.batchedMatmul(query, key, true), &.{ rows, steps }), scale);
+            const weights = autograd.reshape(try tape.softmax(scores, steps), &.{ batch, steps, steps });
+            const mixed = autograd.reshape(try tape.batchedMatmul(weights, value, false), &.{ rows, depth });
+            return self.layers[3].forward(tape, mixed);
+        }
+
+        pub fn params(self: Self) Gathered(Layers, "params") {
+            return params_(self.layers);
+        }
+
+        pub fn state(self: Self) Gathered(Layers, "state") {
+            return state_(self.layers);
+        }
+    };
+}
+
+pub fn Attention(comptime width: usize, comptime heads: usize, comptime steps: usize) type {
+    const One = Head(width, width / heads, steps);
+    const Group = blk: {
+        var types: [heads]type = undefined;
+        for (&types) |*slot| slot.* = One;
+        break :blk @Tuple(&types);
+    };
+
+    return struct {
+        const Self = @This();
+
+        group: Group,
+
+        pub fn init(gpa: Allocator, rng: std.Random) Allocator.Error!Self {
+            return .{ .group = try initAll(Group, gpa, rng) };
+        }
+
+        pub fn deinit(self: Self, gpa: Allocator) void {
+            deinitAll(self.group, gpa);
+        }
+
+        pub fn toGpu(self: Self, gpu: *Gpu) autograd.Error!Self {
+            return .{ .group = try toGpuAll(self.group, gpu) };
+        }
+
+        pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(@TypeOf(x.value)) {
+            var total = try self.group[0].forward(tape, x);
+            inline for (1..heads) |i| total = try tape.add(total, try self.group[i].forward(tape, x));
+            return total;
+        }
+
+        pub fn params(self: Self) Gathered(Group, "params") {
+            return params_(self.group);
+        }
+
+        pub fn state(self: Self) Gathered(Group, "state") {
+            return state_(self.group);
+        }
+    };
+}
+
+pub fn TransformerBlock(comptime width: usize, comptime heads: usize, comptime steps: usize) type {
+    const Layers = struct { LayerNorm(width), Attention(width, heads, steps), LayerNorm(width), Linear(width, 4 * width), Linear(4 * width, width) };
+
+    return struct {
+        const Self = @This();
+
+        layers: Layers,
+
+        pub fn init(gpa: Allocator, rng: std.Random) Allocator.Error!Self {
+            return .{ .layers = try initAll(Layers, gpa, rng) };
+        }
+
+        pub fn deinit(self: Self, gpa: Allocator) void {
+            deinitAll(self.layers, gpa);
+        }
+
+        pub fn toGpu(self: Self, gpu: *Gpu) autograd.Error!Self {
+            return .{ .layers = try toGpuAll(self.layers, gpu) };
+        }
+
+        pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(@TypeOf(x.value)) {
+            const norm_in, const attention, const norm_out, const expand, const contract = self.layers;
+            const mixed = try tape.add(x, try attention.forward(tape, try norm_in.forward(tape, x)));
+            const hidden = try tape.activate(try expand.forward(tape, try norm_out.forward(tape, mixed)), .gelu);
+            return tape.add(mixed, try contract.forward(tape, hidden));
+        }
+
+        pub fn params(self: Self) Gathered(Layers, "params") {
+            return params_(self.layers);
+        }
+
+        pub fn state(self: Self) Gathered(Layers, "state") {
+            return state_(self.layers);
+        }
+    };
+}
 fn Gathered(comptime Layers: type, comptime method: []const u8) type {
     comptime var types: []const type = &.{};
     inline for (@typeInfo(Layers).@"struct".field_types) |Layer| {
@@ -322,9 +540,13 @@ pub fn params(layers: anytype) Gathered(@TypeOf(layers), "params") {
     return gather(layers, "params");
 }
 
+const params_ = params;
+
 pub fn state(layers: anytype) Gathered(@TypeOf(layers), "state") {
     return gather(layers, "state");
 }
+
+const state_ = state;
 
 const testing = std.testing;
 

@@ -55,6 +55,7 @@ pub fn build(b: *std.Build) void {
     }
     const mod_tests = b.addTest(.{
         .root_module = mod,
+        .filters = b.option([]const []const u8, "test-filter", "Only run tests whose name contains this text (repeatable)") orelse &.{},
     });
 
     const run_mod_tests = b.addRunArtifact(mod_tests);
