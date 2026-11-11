@@ -188,8 +188,31 @@ fn exportGemm(comptime name: []const u8, comptime BM: usize, comptime BN: usize,
     @export(&entry.kernel, .{ .name = name });
 }
 
+// Exports a kernel for f32 under name and for bf16 (u16) under name plus Half; make takes the element type and returns a struct with the entry run.
+fn exportPair(comptime name: []const u8, comptime make: fn (comptime type) type) void {
+    @export(&make(f32).run, .{ .name = name });
+    @export(&make(u16).run, .{ .name = name ++ "Half" });
+}
+
 comptime {
     @setEvalBranchQuota(100000);
+    exportPair("elementwise", elementwiseKernel);
+    exportPair("relu", reluKernel);
+    exportPair("reluBackward", reluBackwardKernel);
+    exportPair("layerNormRows", layerNormRowsKernel);
+    exportPair("layerNormBackward", layerNormBackwardKernel);
+    exportPair("embeddingGather", embeddingGatherKernel);
+    exportPair("embeddingScatter", embeddingScatterKernel);
+    exportPair("softmaxRows", softmaxRowsKernel);
+    exportPair("softmaxBackward", softmaxBackwardKernel);
+    exportPair("activation", activationKernel);
+    exportPair("activationBackward", activationBackwardKernel);
+    exportPair("addRelu", addReluKernel);
+    exportPair("addReluBackward", addReluBackwardKernel);
+    exportPair("addInPlace", addInPlaceKernel);
+    exportPair("sumTo", sumToKernel);
+    exportPair("columnReduce", columnReduceKernel);
+    exportPair("batchNormFinish", batchNormFinishKernel);
     exportGemm("sgemmNN", 128, 128, false, false);
     exportGemm("sgemmNT", 128, 128, false, true);
     exportGemm("sgemmTN", 128, 128, true, false);
@@ -202,56 +225,44 @@ comptime {
 }
 // ***** elementwise and reductions *****
 
-inline fn elementwiseOf(comptime E: type, a: [*]const E, b: [*]const E, out: [*]E, args: ga.ElementwiseArgs) void {
-    const t = globalIndex();
-    if (t >= args.len) return;
-    var rest = t;
-    var from_a: usize = 0;
-    var from_b: usize = 0;
-    inline for (0..ga.max_rank) |step| {
-        const axis = ga.max_rank - 1 - step;
-        const position = rest % args.dims[axis];
-        rest /= args.dims[axis];
-        from_a += position * args.a_strides[axis];
-        from_b += position * args.b_strides[axis];
-    }
-    const lhs = bf16.load(E, a, from_a);
-    const rhs = bf16.load(E, b, from_b);
-    bf16.store(E, out, t, if (args.multiply != 0) lhs * rhs else lhs + rhs);
+fn elementwiseKernel(comptime E: type) type {
+    return struct {
+        fn run(a: [*]const E, b: [*]const E, out: [*]E, args: ga.ElementwiseArgs) callconv(.nvptx_kernel) void {
+            const t = globalIndex();
+            if (t >= args.len) return;
+            var rest = t;
+            var from_a: usize = 0;
+            var from_b: usize = 0;
+            inline for (0..ga.max_rank) |step| {
+                const axis = ga.max_rank - 1 - step;
+                const position = rest % args.dims[axis];
+                rest /= args.dims[axis];
+                from_a += position * args.a_strides[axis];
+                from_b += position * args.b_strides[axis];
+            }
+            const lhs = bf16.load(E, a, from_a);
+            const rhs = bf16.load(E, b, from_b);
+            bf16.store(E, out, t, if (args.multiply != 0) lhs * rhs else lhs + rhs);
+        }
+    };
 }
 
-export fn elementwise(a: [*]const f32, b: [*]const f32, out: [*]f32, args: ga.ElementwiseArgs) callconv(.nvptx_kernel) void {
-    elementwiseOf(f32, a, b, out, args);
+fn reluKernel(comptime E: type) type {
+    return struct {
+        fn run(x: [*]const E, out: [*]E, n: u32) callconv(.nvptx_kernel) void {
+            const t = globalIndex();
+            if (t < n) bf16.store(E, out, t, @max(bf16.load(E, x, t), 0));
+        }
+    };
 }
 
-export fn elementwiseHalf(a: [*]const u16, b: [*]const u16, out: [*]u16, args: ga.ElementwiseArgs) callconv(.nvptx_kernel) void {
-    elementwiseOf(u16, a, b, out, args);
-}
-
-inline fn reluOf(comptime E: type, x: [*]const E, out: [*]E, n: u32) void {
-    const t = globalIndex();
-    if (t < n) bf16.store(E, out, t, @max(bf16.load(E, x, t), 0));
-}
-
-export fn relu(x: [*]const f32, out: [*]f32, n: u32) callconv(.nvptx_kernel) void {
-    reluOf(f32, x, out, n);
-}
-
-export fn reluHalf(x: [*]const u16, out: [*]u16, n: u32) callconv(.nvptx_kernel) void {
-    reluOf(u16, x, out, n);
-}
-
-inline fn reluBackwardOf(comptime E: type, x: [*]const E, g_out: [*]const E, g_in: [*]E, n: u32) void {
-    const t = globalIndex();
-    if (t < n) bf16.store(E, g_in, t, bf16.load(E, g_in, t) + if (bf16.load(E, x, t) > 0) bf16.load(E, g_out, t) else 0);
-}
-
-export fn reluBackward(x: [*]const f32, g_out: [*]const f32, g_in: [*]f32, n: u32) callconv(.nvptx_kernel) void {
-    reluBackwardOf(f32, x, g_out, g_in, n);
-}
-
-export fn reluBackwardHalf(x: [*]const u16, g_out: [*]const u16, g_in: [*]u16, n: u32) callconv(.nvptx_kernel) void {
-    reluBackwardOf(u16, x, g_out, g_in, n);
+fn reluBackwardKernel(comptime E: type) type {
+    return struct {
+        fn run(x: [*]const E, g_out: [*]const E, g_in: [*]E, n: u32) callconv(.nvptx_kernel) void {
+            const t = globalIndex();
+            if (t < n) bf16.store(E, g_in, t, bf16.load(E, g_in, t) + if (bf16.load(E, x, t) > 0) bf16.load(E, g_out, t) else 0);
+        }
+    };
 }
 
 export fn toHalf(x: [*]const f32, y: [*]u16, n: u32) callconv(.nvptx_kernel) void {
@@ -276,69 +287,61 @@ export fn addToHalf(x: [*]const f32, y: [*]u16, n: u32) callconv(.nvptx_kernel) 
 
 // NOTE: layer norm uses one warp per row (eight rows per block), the lanes striding over the columns and meeting in warpSum,
 // because one thread per row left most of the device idle. The sums run in another order than the CPU loop, so results agree only to rounding.
-inline fn layerNormRowsOf(comptime E: type, x: [*]const E, y: [*]E, gamma: [*]const f32, beta: [*]const f32, mean: [*]f32, inv_std: [*]f32, rows: u32, cols: u32) void {
-    const tid: usize = @workItemId(0);
-    const lane = tid % 32;
-    const r = @as(usize, @workGroupId(0)) * 8 + tid / 32;
-    if (r >= rows) return;
-    const xr = x + r * cols;
-    var sum: f32 = 0;
-    var j = lane;
-    while (j < cols) : (j += 32) sum += bf16.load(E, xr, j);
-    const mu = warpSum(sum) / @as(f32, @floatFromInt(cols));
-    var square: f32 = 0;
-    j = lane;
-    while (j < cols) : (j += 32) square += (bf16.load(E, xr, j) - mu) * (bf16.load(E, xr, j) - mu);
-    const inverse = 1 / @sqrt(warpSum(square) / @as(f32, @floatFromInt(cols)) + ln.eps);
-    j = lane;
-    while (j < cols) : (j += 32) bf16.store(E, y + r * cols, j, gamma[j] * (bf16.load(E, xr, j) - mu) * inverse + beta[j]);
-    if (lane == 0) {
-        mean[r] = mu;
-        inv_std[r] = inverse;
-    }
+fn layerNormRowsKernel(comptime E: type) type {
+    return struct {
+        fn run(x: [*]const E, y: [*]E, gamma: [*]const f32, beta: [*]const f32, mean: [*]f32, inv_std: [*]f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
+            const tid: usize = @workItemId(0);
+            const lane = tid % 32;
+            const r = @as(usize, @workGroupId(0)) * 8 + tid / 32;
+            if (r >= rows) return;
+            const xr = x + r * cols;
+            var sum: f32 = 0;
+            var j = lane;
+            while (j < cols) : (j += 32) sum += bf16.load(E, xr, j);
+            const mu = warpSum(sum) / @as(f32, @floatFromInt(cols));
+            var square: f32 = 0;
+            j = lane;
+            while (j < cols) : (j += 32) square += (bf16.load(E, xr, j) - mu) * (bf16.load(E, xr, j) - mu);
+            const inverse = 1 / @sqrt(warpSum(square) / @as(f32, @floatFromInt(cols)) + ln.eps);
+            j = lane;
+            while (j < cols) : (j += 32) bf16.store(E, y + r * cols, j, gamma[j] * (bf16.load(E, xr, j) - mu) * inverse + beta[j]);
+            if (lane == 0) {
+                mean[r] = mu;
+                inv_std[r] = inverse;
+            }
+        }
+    };
 }
-export fn layerNormRows(x: [*]const f32, y: [*]f32, gamma: [*]const f32, beta: [*]const f32, mean: [*]f32, inv_std: [*]f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
-    layerNormRowsOf(f32, x, y, gamma, beta, mean, inv_std, rows, cols);
+fn layerNormBackwardKernel(comptime E: type) type {
+    return struct {
+        fn run(x: [*]const E, dy: [*]const E, dx: [*]E, gamma: [*]const f32, mean: [*]const f32, inv_std: [*]const f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
+            const tid: usize = @workItemId(0);
+            const lane = tid % 32;
+            const r = @as(usize, @workGroupId(0)) * 8 + tid / 32;
+            if (r >= rows) return;
+            const xr = x + r * cols;
+            const dyr = dy + r * cols;
+            const mu = mean[r];
+            const inverse = inv_std[r];
+            var sum_g: f32 = 0;
+            var sum_gx: f32 = 0;
+            var j = lane;
+            while (j < cols) : (j += 32) {
+                const g = bf16.load(E, dyr, j) * gamma[j];
+                sum_g += g;
+                sum_gx += g * (bf16.load(E, xr, j) - mu) * inverse;
+            }
+            sum_g = warpSum(sum_g);
+            sum_gx = warpSum(sum_gx);
+            const n: f32 = @floatFromInt(cols);
+            j = lane;
+            while (j < cols) : (j += 32) {
+                const g = bf16.load(E, dyr, j) * gamma[j];
+                bf16.store(E, dx + r * cols, j, bf16.load(E, dx + r * cols, j) + inverse * (g - sum_g / n - (bf16.load(E, xr, j) - mu) * inverse * sum_gx / n));
+            }
+        }
+    };
 }
-
-export fn layerNormRowsHalf(x: [*]const u16, y: [*]u16, gamma: [*]const f32, beta: [*]const f32, mean: [*]f32, inv_std: [*]f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
-    layerNormRowsOf(u16, x, y, gamma, beta, mean, inv_std, rows, cols);
-}
-
-inline fn layerNormBackwardOf(comptime E: type, x: [*]const E, dy: [*]const E, dx: [*]E, gamma: [*]const f32, mean: [*]const f32, inv_std: [*]const f32, rows: u32, cols: u32) void {
-    const tid: usize = @workItemId(0);
-    const lane = tid % 32;
-    const r = @as(usize, @workGroupId(0)) * 8 + tid / 32;
-    if (r >= rows) return;
-    const xr = x + r * cols;
-    const dyr = dy + r * cols;
-    const mu = mean[r];
-    const inverse = inv_std[r];
-    var sum_g: f32 = 0;
-    var sum_gx: f32 = 0;
-    var j = lane;
-    while (j < cols) : (j += 32) {
-        const g = bf16.load(E, dyr, j) * gamma[j];
-        sum_g += g;
-        sum_gx += g * (bf16.load(E, xr, j) - mu) * inverse;
-    }
-    sum_g = warpSum(sum_g);
-    sum_gx = warpSum(sum_gx);
-    const n: f32 = @floatFromInt(cols);
-    j = lane;
-    while (j < cols) : (j += 32) {
-        const g = bf16.load(E, dyr, j) * gamma[j];
-        bf16.store(E, dx + r * cols, j, bf16.load(E, dx + r * cols, j) + inverse * (g - sum_g / n - (bf16.load(E, xr, j) - mu) * inverse * sum_gx / n));
-    }
-}
-export fn layerNormBackward(x: [*]const f32, dy: [*]const f32, dx: [*]f32, gamma: [*]const f32, mean: [*]const f32, inv_std: [*]const f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
-    layerNormBackwardOf(f32, x, dy, dx, gamma, mean, inv_std, rows, cols);
-}
-
-export fn layerNormBackwardHalf(x: [*]const u16, dy: [*]const u16, dx: [*]u16, gamma: [*]const f32, mean: [*]const f32, inv_std: [*]const f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
-    layerNormBackwardOf(u16, x, dy, dx, gamma, mean, inv_std, rows, cols);
-}
-
 export fn gruGates(gx: [*]const f32, gh: [*]const f32, h: [*]const f32, update: [*]f32, reset_h: [*]f32, n: u32, hidden: u32) callconv(.nvptx_kernel) void {
     const i = globalIndex();
     if (i < n) gru.gatesForward(gx, gh, h, update, reset_h, i, hidden);
@@ -360,114 +363,98 @@ export fn gruNextBackward(gx: [*]const f32, gc: [*]const f32, update: [*]const f
 }
 
 // The table and its gradient are always f32; only the gathered rows (out) and their gradient (dy) may be bf16 (E).
-inline fn embeddingGatherOf(comptime E: type, table: [*]const f32, ids: [*]const u32, out: [*]E, n: u32, width: u32) void {
-    const t = globalIndex();
-    if (t < @as(usize, n) * width) bf16.store(E, out, t, table[@as(usize, ids[t / width]) * width + t % width]);
+fn embeddingGatherKernel(comptime E: type) type {
+    return struct {
+        fn run(table: [*]const f32, ids: [*]const u32, out: [*]E, n: u32, width: u32) callconv(.nvptx_kernel) void {
+            const t = globalIndex();
+            if (t < @as(usize, n) * width) bf16.store(E, out, t, table[@as(usize, ids[t / width]) * width + t % width]);
+        }
+    };
 }
 
-export fn embeddingGather(table: [*]const f32, ids: [*]const u32, out: [*]f32, n: u32, width: u32) callconv(.nvptx_kernel) void {
-    embeddingGatherOf(f32, table, ids, out, n, width);
-}
-
-export fn embeddingGatherHalf(table: [*]const f32, ids: [*]const u32, out: [*]u16, n: u32, width: u32) callconv(.nvptx_kernel) void {
-    embeddingGatherOf(u16, table, ids, out, n, width);
-}
-
-inline fn embeddingScatterOf(comptime E: type, dy: [*]const E, ids: [*]const u32, dtable: [*]f32, n: u32, width: u32) void {
-    const t = globalIndex();
-    if (t < @as(usize, n) * width) _ = @atomicRmw(f32, &dtable[@as(usize, ids[t / width]) * width + t % width], .Add, bf16.load(E, dy, t), .monotonic);
-}
-
-export fn embeddingScatter(dy: [*]const f32, ids: [*]const u32, dtable: [*]f32, n: u32, width: u32) callconv(.nvptx_kernel) void {
-    embeddingScatterOf(f32, dy, ids, dtable, n, width);
-}
-
-export fn embeddingScatterHalf(dy: [*]const u16, ids: [*]const u32, dtable: [*]f32, n: u32, width: u32) callconv(.nvptx_kernel) void {
-    embeddingScatterOf(u16, dy, ids, dtable, n, width);
+fn embeddingScatterKernel(comptime E: type) type {
+    return struct {
+        fn run(dy: [*]const E, ids: [*]const u32, dtable: [*]f32, n: u32, width: u32) callconv(.nvptx_kernel) void {
+            const t = globalIndex();
+            if (t < @as(usize, n) * width) _ = @atomicRmw(f32, &dtable[@as(usize, ids[t / width]) * width + t % width], .Add, bf16.load(E, dy, t), .monotonic);
+        }
+    };
 }
 
 // NOTE: one warp per row, like layer norm. The masked columns past the causal limit are written as zero.
-inline fn softmaxRowsOf(comptime E: type, x: [*]const E, y: [*]E, rows: u32, cols: u32, period: u32) void {
-    const at = warpRow();
-    if (at.row >= rows) return;
-    const xr = x + at.row * cols;
-    const yr = y + at.row * cols;
-    const limit = soft.limitOf(at.row, cols, period);
-    var largest: f32 = -std.math.inf(f32);
-    var j = at.lane;
-    while (j < limit) : (j += 32) largest = @max(largest, bf16.load(E, xr, j));
-    largest = warpMax(largest);
-    var total: f32 = 0;
-    j = at.lane;
-    while (j < limit) : (j += 32) total += act.exponential(bf16.load(E, xr, j) - largest);
-    const inverse = 1 / warpSum(total);
-    j = at.lane;
-    while (j < cols) : (j += 32) bf16.store(E, yr, j, if (j < limit) act.exponential(bf16.load(E, xr, j) - largest) * inverse else 0);
+fn softmaxRowsKernel(comptime E: type) type {
+    return struct {
+        fn run(x: [*]const E, y: [*]E, rows: u32, cols: u32, period: u32) callconv(.nvptx_kernel) void {
+            const at = warpRow();
+            if (at.row >= rows) return;
+            const xr = x + at.row * cols;
+            const yr = y + at.row * cols;
+            const limit = soft.limitOf(at.row, cols, period);
+            var largest: f32 = -std.math.inf(f32);
+            var j = at.lane;
+            while (j < limit) : (j += 32) largest = @max(largest, bf16.load(E, xr, j));
+            largest = warpMax(largest);
+            var total: f32 = 0;
+            j = at.lane;
+            while (j < limit) : (j += 32) total += act.exponential(bf16.load(E, xr, j) - largest);
+            const inverse = 1 / warpSum(total);
+            j = at.lane;
+            while (j < cols) : (j += 32) bf16.store(E, yr, j, if (j < limit) act.exponential(bf16.load(E, xr, j) - largest) * inverse else 0);
+        }
+    };
 }
-export fn softmaxRows(x: [*]const f32, y: [*]f32, rows: u32, cols: u32, period: u32) callconv(.nvptx_kernel) void {
-    softmaxRowsOf(f32, x, y, rows, cols, period);
+fn softmaxBackwardKernel(comptime E: type) type {
+    return struct {
+        fn run(y: [*]const E, dy: [*]const E, dx: [*]E, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
+            const at = warpRow();
+            if (at.row >= rows) return;
+            const base = at.row * cols;
+            var dot: f32 = 0;
+            var j = at.lane;
+            while (j < cols) : (j += 32) dot += bf16.load(E, y + base, j) * bf16.load(E, dy + base, j);
+            dot = warpSum(dot);
+            j = at.lane;
+            while (j < cols) : (j += 32) bf16.store(E, dx + base, j, bf16.load(E, dx + base, j) + bf16.load(E, y + base, j) * (bf16.load(E, dy + base, j) - dot));
+        }
+    };
 }
-
-export fn softmaxRowsHalf(x: [*]const u16, y: [*]u16, rows: u32, cols: u32, period: u32) callconv(.nvptx_kernel) void {
-    softmaxRowsOf(u16, x, y, rows, cols, period);
-}
-
-inline fn softmaxBackwardOf(comptime E: type, y: [*]const E, dy: [*]const E, dx: [*]E, rows: u32, cols: u32) void {
-    const at = warpRow();
-    if (at.row >= rows) return;
-    const base = at.row * cols;
-    var dot: f32 = 0;
-    var j = at.lane;
-    while (j < cols) : (j += 32) dot += bf16.load(E, y + base, j) * bf16.load(E, dy + base, j);
-    dot = warpSum(dot);
-    j = at.lane;
-    while (j < cols) : (j += 32) bf16.store(E, dx + base, j, bf16.load(E, dx + base, j) + bf16.load(E, y + base, j) * (bf16.load(E, dy + base, j) - dot));
-}
-export fn softmaxBackward(y: [*]const f32, dy: [*]const f32, dx: [*]f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
-    softmaxBackwardOf(f32, y, dy, dx, rows, cols);
-}
-
-export fn softmaxBackwardHalf(y: [*]const u16, dy: [*]const u16, dx: [*]u16, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
-    softmaxBackwardOf(u16, y, dy, dx, rows, cols);
-}
-
-inline fn activationOf(comptime E: type, x: [*]const E, out: [*]E, n: u32, kind: u32) void {
-    const t = globalIndex();
-    if (t < n) bf16.store(E, out, t, act.forward(@fromBackingInt(@intCast(kind)), bf16.load(E, x, t)));
+fn activationKernel(comptime E: type) type {
+    return struct {
+        fn run(x: [*]const E, out: [*]E, n: u32, kind: u32) callconv(.nvptx_kernel) void {
+            const t = globalIndex();
+            if (t < n) bf16.store(E, out, t, act.forward(@fromBackingInt(@intCast(kind)), bf16.load(E, x, t)));
+        }
+    };
 }
 
-export fn activation(x: [*]const f32, out: [*]f32, n: u32, kind: u32) callconv(.nvptx_kernel) void {
-    activationOf(f32, x, out, n, kind);
+fn activationBackwardKernel(comptime E: type) type {
+    return struct {
+        fn run(x: [*]const E, y: [*]const E, g_out: [*]const E, g_in: [*]E, n: u32, kind: u32) callconv(.nvptx_kernel) void {
+            const t = globalIndex();
+            if (t < n) bf16.store(E, g_in, t, bf16.load(E, g_in, t) + bf16.load(E, g_out, t) * act.derivative(@fromBackingInt(@intCast(kind)), bf16.load(E, x, t), bf16.load(E, y, t)));
+        }
+    };
 }
 
-export fn activationHalf(x: [*]const u16, out: [*]u16, n: u32, kind: u32) callconv(.nvptx_kernel) void {
-    activationOf(u16, x, out, n, kind);
+fn addReluKernel(comptime E: type) type {
+    return struct {
+        fn run(a: [*]const E, b: [*]const E, out: [*]E, n: u32) callconv(.nvptx_kernel) void {
+            const t = globalIndex();
+            if (t < n) bf16.store(E, out, t, @max(bf16.load(E, a, t) + bf16.load(E, b, t), 0));
+        }
+    };
 }
 
-inline fn activationBackwardOf(comptime E: type, x: [*]const E, y: [*]const E, g_out: [*]const E, g_in: [*]E, n: u32, kind: u32) void {
-    const t = globalIndex();
-    if (t < n) bf16.store(E, g_in, t, bf16.load(E, g_in, t) + bf16.load(E, g_out, t) * act.derivative(@fromBackingInt(@intCast(kind)), bf16.load(E, x, t), bf16.load(E, y, t)));
-}
-
-export fn activationBackward(x: [*]const f32, y: [*]const f32, g_out: [*]const f32, g_in: [*]f32, n: u32, kind: u32) callconv(.nvptx_kernel) void {
-    activationBackwardOf(f32, x, y, g_out, g_in, n, kind);
-}
-
-export fn activationBackwardHalf(x: [*]const u16, y: [*]const u16, g_out: [*]const u16, g_in: [*]u16, n: u32, kind: u32) callconv(.nvptx_kernel) void {
-    activationBackwardOf(u16, x, y, g_out, g_in, n, kind);
-}
-
-inline fn addReluOf(comptime E: type, a: [*]const E, b: [*]const E, out: [*]E, n: u32) void {
-    const t = globalIndex();
-    if (t < n) bf16.store(E, out, t, @max(bf16.load(E, a, t) + bf16.load(E, b, t), 0));
-}
-
-inline fn addReluBackwardOf(comptime E: type, out: [*]const E, g: [*]const E, grad_a: [*]E, grad_b: [*]E, n: u32, flags: u32) void {
-    const t = globalIndex();
-    if (t >= n) return;
-    const v = if (bf16.load(E, out, t) > 0) bf16.load(E, g, t) else 0;
-    if (flags & 1 != 0) bf16.store(E, grad_a, t, bf16.load(E, grad_a, t) + v);
-    if (flags & 2 != 0) bf16.store(E, grad_b, t, bf16.load(E, grad_b, t) + v);
+fn addReluBackwardKernel(comptime E: type) type {
+    return struct {
+        fn run(out: [*]const E, g: [*]const E, grad_a: [*]E, grad_b: [*]E, n: u32, flags: u32) callconv(.nvptx_kernel) void {
+            const t = globalIndex();
+            if (t >= n) return;
+            const v = if (bf16.load(E, out, t) > 0) bf16.load(E, g, t) else 0;
+            if (flags & 1 != 0) bf16.store(E, grad_a, t, bf16.load(E, grad_a, t) + v);
+            if (flags & 2 != 0) bf16.store(E, grad_b, t, bf16.load(E, grad_b, t) + v);
+        }
+    };
 }
 
 export fn addReluQuad(a: [*]const u16, b: [*]const u16, out: [*]u16, n: u32) callconv(.nvptx_kernel) void {
@@ -484,80 +471,56 @@ export fn addReluBackwardQuad(out: [*]const u16, g: [*]const u16, grad_a: [*]u16
     if (flags & 2 != 0) bf16.storeQuad(u16, grad_b, t * 4, bf16.loadQuad(u16, grad_b, t * 4) + v);
 }
 
-export fn addRelu(a: [*]const f32, b: [*]const f32, out: [*]f32, n: u32) callconv(.nvptx_kernel) void {
-    addReluOf(f32, a, b, out, n);
-}
-
-export fn addReluHalf(a: [*]const u16, b: [*]const u16, out: [*]u16, n: u32) callconv(.nvptx_kernel) void {
-    addReluOf(u16, a, b, out, n);
-}
-
-export fn addReluBackward(out: [*]const f32, g: [*]const f32, grad_a: [*]f32, grad_b: [*]f32, n: u32, flags: u32) callconv(.nvptx_kernel) void {
-    addReluBackwardOf(f32, out, g, grad_a, grad_b, n, flags);
-}
-
-export fn addReluBackwardHalf(out: [*]const u16, g: [*]const u16, grad_a: [*]u16, grad_b: [*]u16, n: u32, flags: u32) callconv(.nvptx_kernel) void {
-    addReluBackwardOf(u16, out, g, grad_a, grad_b, n, flags);
-}
-
-inline fn addInPlaceOf(comptime E: type, dst: [*]E, src: [*]const E, n: u32) void {
-    const t = globalIndex();
-    if (t < n) bf16.store(E, dst, t, bf16.load(E, dst, t) + bf16.load(E, src, t));
-}
-
-export fn addInPlace(dst: [*]f32, src: [*]const f32, n: u32) callconv(.nvptx_kernel) void {
-    addInPlaceOf(f32, dst, src, n);
-}
-
-export fn addInPlaceHalf(dst: [*]u16, src: [*]const u16, n: u32) callconv(.nvptx_kernel) void {
-    addInPlaceOf(u16, dst, src, n);
-}
-
-export fn sumTo(in: [*]const f32, out: [*]f32, args: ga.SumArgs) callconv(.nvptx_kernel) void {
-    sumToOf(f32, in, out, args);
-}
-
-export fn sumToHalf(in: [*]const u16, out: [*]u16, args: ga.SumArgs) callconv(.nvptx_kernel) void {
-    sumToOf(u16, in, out, args);
-}
-
-inline fn sumToOf(comptime E: type, in: [*]const E, out: [*]E, args: ga.SumArgs) void {
-    const t: usize = @workGroupId(0);
-    const tid: usize = @workItemId(0);
-    var d: [ga.max_rank]usize = undefined;
-    var s: [ga.max_rank]usize = undefined;
-    inline for (0..ga.max_rank) |i| {
-        d[i] = args.dims[i];
-        s[i] = args.strides[i];
-    }
-    const rmask = args.mask;
-
-    var base: usize = 0;
-    var rest: usize = t;
-    inline for (0..ga.max_rank) |step| {
-        const axis = ga.max_rank - 1 - step;
-        if ((rmask >> axis) & 1 == 0) {
-            base += (rest % d[axis]) * s[axis];
-            rest /= d[axis];
+fn addInPlaceKernel(comptime E: type) type {
+    return struct {
+        fn run(dst: [*]E, src: [*]const E, n: u32) callconv(.nvptx_kernel) void {
+            const t = globalIndex();
+            if (t < n) bf16.store(E, dst, t, bf16.load(E, dst, t) + bf16.load(E, src, t));
         }
-    }
+    };
+}
 
-    var total: f32 = 0;
-    var q: usize = tid;
-    while (q < args.reduce_count) : (q += threads) {
-        var left = q;
-        var at = base;
-        inline for (0..ga.max_rank) |step| {
-            const axis = ga.max_rank - 1 - step;
-            if ((rmask >> axis) & 1 != 0) {
-                at += (left % d[axis]) * s[axis];
-                left /= d[axis];
+fn sumToKernel(comptime E: type) type {
+    return struct {
+        fn run(in: [*]const E, out: [*]E, args: ga.SumArgs) callconv(.nvptx_kernel) void {
+            const t: usize = @workGroupId(0);
+            const tid: usize = @workItemId(0);
+            var d: [ga.max_rank]usize = undefined;
+            var s: [ga.max_rank]usize = undefined;
+            inline for (0..ga.max_rank) |i| {
+                d[i] = args.dims[i];
+                s[i] = args.strides[i];
             }
+            const rmask = args.mask;
+
+            var base: usize = 0;
+            var rest: usize = t;
+            inline for (0..ga.max_rank) |step| {
+                const axis = ga.max_rank - 1 - step;
+                if ((rmask >> axis) & 1 == 0) {
+                    base += (rest % d[axis]) * s[axis];
+                    rest /= d[axis];
+                }
+            }
+
+            var total: f32 = 0;
+            var q: usize = tid;
+            while (q < args.reduce_count) : (q += threads) {
+                var left = q;
+                var at = base;
+                inline for (0..ga.max_rank) |step| {
+                    const axis = ga.max_rank - 1 - step;
+                    if ((rmask >> axis) & 1 != 0) {
+                        at += (left % d[axis]) * s[axis];
+                        left /= d[axis];
+                    }
+                }
+                total += bf16.load(E, in, at);
+            }
+            const sum = blockSum(total, tid);
+            if (tid == 0) bf16.store(E, out, t, if (args.accumulate != 0) bf16.load(E, out, t) + sum else sum);
         }
-        total += bf16.load(E, in, at);
-    }
-    const sum = blockSum(total, tid);
-    if (tid == 0) bf16.store(E, out, t, if (args.accumulate != 0) bf16.load(E, out, t) + sum else sum);
+    };
 }
 
 // ***** column reductions and batch norm *****
@@ -567,68 +530,64 @@ const column = struct {
     var second: [threads]f32 addrspace(.shared) = undefined;
 };
 
-export fn columnReduce(args: ga.ColumnArgs) callconv(.nvptx_kernel) void {
-    columnReduceOf(f32, args);
-}
-
-export fn columnReduceHalf(args: ga.ColumnArgs) callconv(.nvptx_kernel) void {
-    columnReduceOf(u16, args);
-}
-
-inline fn columnReduceOf(comptime E: type, args: ga.ColumnArgs) void {
-    const a: [*]const E = @ptrCast(args.a);
-    const b: [*]const E = @ptrCast(args.b);
-    const mask: [*]const E = @ptrCast(args.mask);
-    const mean, const inv_std, const out = .{ args.mean, args.inv_std, args.out };
-    const rows, const c, const row_stride, const kind, const scale = .{ args.rows, args.channels, args.row_stride, args.kind, args.scale };
-    const tid: usize = @workItemId(0);
-    const lane = tid % 32;
-    const group = tid / 32;
-    const ch = @as(usize, @workGroupId(1)) * 32 + lane;
-    const valid = ch < c;
-    var first: f32 = 0;
-    var second: f32 = 0;
-    if (valid) {
-        // NOTE: kind 4 (layer norm) has one mean and inverse deviation per row instead of per channel, so they are read inside the loop.
-        const m = if (kind == 2) bf16.load(E, a, ch) else if (kind == 4) 0 else mean[ch] * scale;
-        const s = if (kind == 4) 0 else inv_std[ch];
-        var r = @as(usize, @workGroupId(0)) * 8 + group;
-        while (r < rows) : (r += row_stride) {
-            const v = bf16.load(E, a, r * c + ch);
-            if (kind == 0) {
-                first += v;
-            } else if (kind == 2) {
-                first += v - m;
-                second += (v - m) * (v - m);
-            } else if (kind == 4) {
-                first += v;
-                second += v * ((bf16.load(E, b, r * c + ch) - mean[r]) * inv_std[r]);
-            } else {
-                const g = if (kind == 3 and bf16.load(E, mask, r * c + ch) <= 0) 0 else v;
-                first += g;
-                second += g * ((bf16.load(E, b, r * c + ch) - m) * s);
+fn columnReduceKernel(comptime E: type) type {
+    return struct {
+        fn run(args: ga.ColumnArgs) callconv(.nvptx_kernel) void {
+            const a: [*]const E = @ptrCast(args.a);
+            const b: [*]const E = @ptrCast(args.b);
+            const mask: [*]const E = @ptrCast(args.mask);
+            const mean, const inv_std, const out = .{ args.mean, args.inv_std, args.out };
+            const rows, const c, const row_stride, const kind, const scale = .{ args.rows, args.channels, args.row_stride, args.kind, args.scale };
+            const tid: usize = @workItemId(0);
+            const lane = tid % 32;
+            const group = tid / 32;
+            const ch = @as(usize, @workGroupId(1)) * 32 + lane;
+            const valid = ch < c;
+            var first: f32 = 0;
+            var second: f32 = 0;
+            if (valid) {
+                // NOTE: kind 4 (layer norm) has one mean and inverse deviation per row instead of per channel, so they are read inside the loop.
+                const m = if (kind == 2) bf16.load(E, a, ch) else if (kind == 4) 0 else mean[ch] * scale;
+                const s = if (kind == 4) 0 else inv_std[ch];
+                var r = @as(usize, @workGroupId(0)) * 8 + group;
+                while (r < rows) : (r += row_stride) {
+                    const v = bf16.load(E, a, r * c + ch);
+                    if (kind == 0) {
+                        first += v;
+                    } else if (kind == 2) {
+                        first += v - m;
+                        second += (v - m) * (v - m);
+                    } else if (kind == 4) {
+                        first += v;
+                        second += v * ((bf16.load(E, b, r * c + ch) - mean[r]) * inv_std[r]);
+                    } else {
+                        const g = if (kind == 3 and bf16.load(E, mask, r * c + ch) <= 0) 0 else v;
+                        first += g;
+                        second += g * ((bf16.load(E, b, r * c + ch) - m) * s);
+                    }
+                }
+            }
+            column.first[tid] = first;
+            column.second[tid] = second;
+            barrier();
+            if (group == 0 and valid) {
+                var total_first: f32 = 0;
+                var total_second: f32 = 0;
+                inline for (0..8) |g| {
+                    total_first += column.first[lane + 32 * g];
+                    total_second += column.second[lane + 32 * g];
+                }
+                if (args.ordered != 0) {
+                    const mine = args.partial + @as(usize, @workGroupId(0)) * 2 * c;
+                    mine[ch] = total_first;
+                    mine[c + ch] = total_second;
+                } else {
+                    _ = @atomicRmw(f32, &out[ch], .Add, total_first, .monotonic);
+                    if (kind != 0) _ = @atomicRmw(f32, &out[c + ch], .Add, total_second, .monotonic);
+                }
             }
         }
-    }
-    column.first[tid] = first;
-    column.second[tid] = second;
-    barrier();
-    if (group == 0 and valid) {
-        var total_first: f32 = 0;
-        var total_second: f32 = 0;
-        inline for (0..8) |g| {
-            total_first += column.first[lane + 32 * g];
-            total_second += column.second[lane + 32 * g];
-        }
-        if (args.ordered != 0) {
-            const mine = args.partial + @as(usize, @workGroupId(0)) * 2 * c;
-            mine[ch] = total_first;
-            mine[c + ch] = total_second;
-        } else {
-            _ = @atomicRmw(f32, &out[ch], .Add, total_first, .monotonic);
-            if (kind != 0) _ = @atomicRmw(f32, &out[c + ch], .Add, total_second, .monotonic);
-        }
-    }
+    };
 }
 
 export fn splitCombine(ws: [*]const f32, out: [*]f32, splits: u32, stride: u32, accumulate: u32) callconv(.nvptx_kernel) void {
@@ -647,33 +606,29 @@ export fn columnCombine(partial: [*]const f32, out: [*]f32, blocks: u32, width: 
     out[i] += total;
 }
 
-export fn batchNormFinish(sums: [*]const f32, shift: [*]const f32, st: nm.Stats, l: nm.Layout) callconv(.nvptx_kernel) void {
-    batchNormFinishOf(f32, sums, shift, st, l);
-}
-
-export fn batchNormFinishHalf(sums: [*]const f32, shift: [*]const u16, st: nm.Stats, l: nm.Layout) callconv(.nvptx_kernel) void {
-    batchNormFinishOf(u16, sums, shift, st, l);
-}
-
-inline fn batchNormFinishOf(comptime E: type, sums: [*]const f32, shift: [*]const E, st: nm.Stats, l: nm.Layout) void {
-    const mean, const inv_std, const running_mean, const running_var = .{ st.mean, st.inv_std, st.running_mean, st.running_var };
-    const c = l.channels;
-    const rows = l.len / c;
-    const ch = globalIndex();
-    if (ch >= c) return;
-    if (l.flag == 0) {
-        mean[ch] = running_mean[ch];
-        inv_std[ch] = 1 / @sqrt(running_var[ch] + nm.eps);
-        return;
-    }
-    const n: f32 = @floatFromInt(rows);
-    const offset = sums[ch] / n;
-    const mu = bf16.load(E, shift, ch) + offset;
-    const variance = @max(sums[c + ch] / n - offset * offset, 0);
-    mean[ch] = mu;
-    inv_std[ch] = 1 / @sqrt(variance + nm.eps);
-    running_mean[ch] += nm.momentum * (mu - running_mean[ch]);
-    running_var[ch] += nm.momentum * (variance - running_var[ch]);
+fn batchNormFinishKernel(comptime E: type) type {
+    return struct {
+        fn run(sums: [*]const f32, shift: [*]const E, st: nm.Stats, l: nm.Layout) callconv(.nvptx_kernel) void {
+            const mean, const inv_std, const running_mean, const running_var = .{ st.mean, st.inv_std, st.running_mean, st.running_var };
+            const c = l.channels;
+            const rows = l.len / c;
+            const ch = globalIndex();
+            if (ch >= c) return;
+            if (l.flag == 0) {
+                mean[ch] = running_mean[ch];
+                inv_std[ch] = 1 / @sqrt(running_var[ch] + nm.eps);
+                return;
+            }
+            const n: f32 = @floatFromInt(rows);
+            const offset = sums[ch] / n;
+            const mu = bf16.load(E, shift, ch) + offset;
+            const variance = @max(sums[c + ch] / n - offset * offset, 0);
+            mean[ch] = mu;
+            inv_std[ch] = 1 / @sqrt(variance + nm.eps);
+            running_mean[ch] += nm.momentum * (mu - running_mean[ch]);
+            running_var[ch] += nm.momentum * (variance - running_var[ch]);
+        }
+    };
 }
 
 export fn batchNormGradFinish(sums: [*]const f32, gamma_grad: [*]f32, beta_grad: [*]f32, c: u32) callconv(.nvptx_kernel) void {
