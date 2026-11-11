@@ -10,7 +10,7 @@ const ptx = @embedFile("kernels_ptx");
 
 /// Everything that can fail on the device path. The CUDA driver and cuDNN are loaded at run time,
 /// so a missing library is an error value rather than a link failure.
-pub const Error = Allocator.Error || error{ NoDevice, NoSuchDevice, DriverNotFound, MissingSymbol, CudaFailed, CudnnNotFound, CudnnFailed, NoAlgorithm };
+pub const Error = Allocator.Error || error{ NoDevice, NoGraphSupport, ProfilingWhileCapturing, NoSuchDevice, DriverNotFound, MissingSymbol, CudaFailed, CudnnNotFound, CudnnFailed, NoAlgorithm };
 
 pub const BinaryOp = enum { add, mul };
 
@@ -223,6 +223,8 @@ pub const Gpu = struct {
     cudnn_plans: std.ArrayList(PlanEntry),
     cudnn_workspace: usize,
     cudnn_workspace_bytes: usize,
+    graphs: std.ArrayList(cuda.Handle),
+    capturing: bool,
 
     const PlanEntry = struct { geometry: cudnn.Geometry, plan: cudnn.Plan };
 
@@ -246,6 +248,8 @@ pub const Gpu = struct {
         self.cudnn_plans = .empty;
         self.cudnn_workspace = 0;
         self.cudnn_workspace_bytes = 0;
+        self.graphs = .empty;
+        self.capturing = false;
         self.cu = try cuda.Cuda.open(config.device);
         errdefer self.cu.close();
 
@@ -287,6 +291,8 @@ pub const Gpu = struct {
             lib.close();
         }
         self.cudnn_plans.deinit(self.gpa);
+        for (self.graphs.items) |exec| self.cu.destroyGraph(exec);
+        self.graphs.deinit(self.gpa);
         if (self.cudnn_workspace != 0) self.cu.free(self.cudnn_workspace);
         for (self.owned.items) |ptr| self.cu.free(ptr);
         self.cu.free(self.step_base);
@@ -330,6 +336,34 @@ pub const Gpu = struct {
         try self.cu.memsetD32(self.zero_base, 0, std.mem.alignForward(usize, self.zero_used, 4) / 4);
         try self.timerStop(slot_fill, started);
         self.zero_used = 0;
+    }
+
+    /// A recorded sequence of launches that replay runs again with the same arguments and addresses.
+    pub const Graph = struct { exec: cuda.Handle, zero_bytes: usize };
+
+    /// Starts recording instead of running: every launch and fill until endCapture goes into a graph.
+    /// NOTE: a recording must not read results back (download, scalar), must not run while profiling, and bakes in every
+    /// kernel argument, so anything that changes between steps (a dropout seed, a step offset) has to stay outside the graph.
+    /// Scratch addresses are the same in each step only if resetStep is called first and the same allocations follow.
+    pub fn beginCapture(self: *Gpu) Error!void {
+        if (self.profile != null) return error.ProfilingWhileCapturing;
+        try self.cu.beginCapture();
+        self.capturing = true;
+    }
+
+    /// Ends the recording. Nothing has run yet, so call replay to execute the recorded step the first time too.
+    pub fn endCapture(self: *Gpu) Error!Graph {
+        self.capturing = false;
+        const exec = try self.cu.endCapture();
+        errdefer self.cu.destroyGraph(exec);
+        try self.graphs.append(self.gpa, exec);
+        return .{ .exec = exec, .zero_bytes = self.zero_used };
+    }
+
+    /// Runs a recorded step: clears the zero arena the way resetStep did for it, then launches the whole graph at once.
+    pub fn replay(self: *Gpu, graph: Graph) Error!void {
+        if (graph.zero_bytes != 0) try self.cu.memsetD32(self.zero_base, 0, std.mem.alignForward(usize, graph.zero_bytes, 4) / 4);
+        try self.cu.replay(graph.exec);
     }
 
     /// Loads cuDNN from dir so that convolutions may use it; does nothing if it is already loaded.

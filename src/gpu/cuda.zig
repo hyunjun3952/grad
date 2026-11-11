@@ -36,11 +36,28 @@ const Api = struct {
     cuGetErrorName: *const fn (code: Status, name: *[*:0]const u8) callconv(.c) Status,
 };
 
+// Stream capture and graphs are bound separately, so a driver without them still runs everything else.
+const GraphApi = struct {
+    cuStreamCreate: *const fn (stream: *Handle, flags: c_uint) callconv(.c) Status,
+    cuStreamDestroy_v2: *const fn (stream: Handle) callconv(.c) Status,
+    cuStreamBeginCapture_v2: *const fn (stream: Handle, mode: c_int) callconv(.c) Status,
+    cuStreamEndCapture: *const fn (stream: Handle, graph: *Handle) callconv(.c) Status,
+    cuGraphInstantiateWithFlags: *const fn (exec: *Handle, graph: Handle, flags: c_ulonglong) callconv(.c) Status,
+    cuGraphLaunch: *const fn (exec: Handle, stream: Handle) callconv(.c) Status,
+    cuGraphDestroy: *const fn (graph: Handle) callconv(.c) Status,
+    cuGraphExecDestroy: *const fn (exec: Handle) callconv(.c) Status,
+    cuMemsetD32Async: *const fn (dst: DevicePtr, value: c_uint, count: usize, stream: Handle) callconv(.c) Status,
+};
+
 pub const Cuda = struct {
     lib: dynlib.Library,
     api: Api,
+    graph_api: ?GraphApi,
     device: c_int,
     context: Handle,
+    // The stream that launches go to: null (the default stream) normally, the capture stream while a graph is recorded.
+    stream: Handle = null,
+    capture_stream: Handle = null,
 
     /// Opens the driver and makes the primary context of the device with this ordinal current on the calling thread.
     /// NOTE: the current context is per thread, so a program that drives several devices must call makeCurrent from the thread that uses each one.
@@ -49,7 +66,7 @@ pub const Cuda = struct {
         errdefer lib.close();
         const api = try lib.bind(Api);
 
-        var self: Cuda = .{ .lib = lib, .api = api, .device = 0, .context = null };
+        var self: Cuda = .{ .lib = lib, .api = api, .graph_api = lib.bind(GraphApi) catch null, .device = 0, .context = null };
         try self.check(api.cuInit(0));
         var count: c_int = 0;
         try self.check(api.cuDeviceGetCount(&count));
@@ -77,6 +94,7 @@ pub const Cuda = struct {
     }
 
     pub fn close(self: *Cuda) void {
+        if (self.capture_stream != null) _ = self.graph_api.?.cuStreamDestroy_v2(self.capture_stream);
         self.lib.close();
     }
 
@@ -99,7 +117,38 @@ pub const Cuda = struct {
     }
 
     pub fn memsetD32(self: *const Cuda, dst: DevicePtr, value: u32, count: usize) !void {
+        // NOTE: the synchronous memset is not allowed while a stream is being captured, so a recording uses the stream-ordered one.
+        if (self.stream != null) return self.check(self.graph_api.?.cuMemsetD32Async(dst, value, count, self.stream));
         try self.check(self.api.cuMemsetD32_v2(dst, value, count));
+    }
+
+    /// Starts recording every launch and memset into a graph instead of running them. Fails when the driver has no graph support.
+    pub fn beginCapture(self: *Cuda) !void {
+        const g = self.graph_api orelse return error.NoGraphSupport;
+        if (self.capture_stream == null) try self.check(g.cuStreamCreate(&self.capture_stream, 0));
+        // Relaxed mode: other threads and the ordinary memory calls of the host are not policed.
+        try self.check(g.cuStreamBeginCapture_v2(self.capture_stream, 2));
+        self.stream = self.capture_stream;
+    }
+
+    /// Ends the recording and returns the instantiated graph, which replay can run.
+    pub fn endCapture(self: *Cuda) !Handle {
+        const g = self.graph_api.?;
+        self.stream = null;
+        var graph: Handle = null;
+        try self.check(g.cuStreamEndCapture(self.capture_stream, &graph));
+        defer _ = g.cuGraphDestroy(graph);
+        var exec: Handle = null;
+        try self.check(g.cuGraphInstantiateWithFlags(&exec, graph, 0));
+        return exec;
+    }
+
+    pub fn replay(self: *const Cuda, exec: Handle) !void {
+        try self.check(self.graph_api.?.cuGraphLaunch(exec, null));
+    }
+
+    pub fn destroyGraph(self: *const Cuda, exec: Handle) void {
+        _ = self.graph_api.?.cuGraphExecDestroy(exec);
     }
 
     pub fn upload(self: *const Cuda, dst: DevicePtr, src: anytype) !void {
@@ -129,7 +178,7 @@ pub const Cuda = struct {
     }
 
     pub fn launch(self: *const Cuda, f: Handle, grid: [3]u32, block: [3]u32, args: []?*anyopaque) !void {
-        try self.check(self.api.cuLaunchKernel(f, grid[0], grid[1], grid[2], block[0], block[1], block[2], 0, null, args.ptr, null));
+        try self.check(self.api.cuLaunchKernel(f, grid[0], grid[1], grid[2], block[0], block[1], block[2], 0, self.stream, args.ptr, null));
     }
 
     pub fn sync(self: *const Cuda) !void {

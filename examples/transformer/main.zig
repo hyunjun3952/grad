@@ -179,12 +179,15 @@ pub fn main(init: std.process.Init) !void {
 
     var iterations: usize = 1500;
     var use_gpu = false;
+    var profile = false;
     var path: []const u8 = "data/text/shakespeare.txt";
     var onnx_path: ?[]const u8 = null;
     var positional: usize = 0;
     for ((try init.minimal.args.toSlice(init.arena.allocator()))[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--gpu")) {
             use_gpu = true;
+        } else if (std.mem.eql(u8, arg, "--profile")) {
+            profile = true;
         } else if (std.mem.startsWith(u8, arg, "--onnx=")) {
             onnx_path = arg["--onnx=".len..];
         } else {
@@ -199,6 +202,9 @@ pub fn main(init: std.process.Init) !void {
 
     const gpu: ?*grad.gpu.Gpu = if (use_gpu) try grad.gpu.Gpu.init(gpa, .{ .step_bytes = 1 << 30 }) else null;
     defer if (gpu) |dev| dev.deinit();
+    if (gpu) |dev| {
+        if (profile) dev.startProfile(init.io);
+    }
     const run: Run = .{ .gpu = gpu, .par = .{ .io = init.io, .threads = std.Thread.getCpuCount() catch 1, .gpu = gpu } };
 
     var prng = std.Random.DefaultPrng.init(42);
@@ -262,6 +268,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    if (gpu) |dev| try dev.printProfile(out);
     try out.writeAll("\n--- sample ---\n");
     try generate(run, gpa, model, rng, out, "ROMEO:", 600);
     if (onnx_path) |p| try exportOnnx(run, gpa, init.io, model, text, p, out);

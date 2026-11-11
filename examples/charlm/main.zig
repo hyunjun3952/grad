@@ -104,11 +104,14 @@ pub fn main(init: std.process.Init) !void {
 
     var steps: usize = 1500;
     var use_gpu = false;
+    var profile = false;
     var path: []const u8 = "data/text/shakespeare.txt";
     var positional: usize = 0;
     for ((try init.minimal.args.toSlice(init.arena.allocator()))[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--gpu")) {
             use_gpu = true;
+        } else if (std.mem.eql(u8, arg, "--profile")) {
+            profile = true;
         } else {
             if (positional == 0) steps = try std.fmt.parseInt(usize, arg, 10) else path = arg;
             positional += 1;
@@ -121,6 +124,9 @@ pub fn main(init: std.process.Init) !void {
 
     const gpu: ?*grad.gpu.Gpu = if (use_gpu) try grad.gpu.Gpu.init(gpa, .{ .step_bytes = 1 << 30 }) else null;
     defer if (gpu) |dev| dev.deinit();
+    if (gpu) |dev| {
+        if (profile) dev.startProfile(init.io);
+    }
     const run: Run = .{ .gpu = gpu, .par = .{ .io = init.io, .threads = std.Thread.getCpuCount() catch 1, .gpu = gpu } };
 
     var prng = std.Random.DefaultPrng.init(42);
@@ -149,6 +155,8 @@ pub fn main(init: std.process.Init) !void {
     try out.flush();
 
     var running: f64 = 0;
+    var graph: ?grad.gpu.Gpu.Graph = null;
+    var mean: Var(Tensor(f32, &.{})) = undefined;
     for (0..steps) |iteration| {
         @memset(host_inputs, 0);
         for (0..batch) |row| {
@@ -161,20 +169,29 @@ pub fn main(init: std.process.Init) !void {
         try run.put(inputs, host_inputs);
         try run.put(targets, host_targets);
 
-        _ = arena.reset(.retain_capacity);
-        if (gpu) |dev| try dev.resetStep();
-        var tape: Tape = .{ .gpa = arena.allocator(), .par = run.par, .training = true };
-        try grad.optim.zeroGrad(run.par, params);
-        var state = try tape.constant(try tape.zeroedTensor(State));
-        var total: ?Var(Tensor(f32, &.{})) = null;
-        for (0..unroll) |t| {
-            const next, const scores = try step(model, &tape, .{ .data = inputs[t * batch * vocab ..][0 .. batch * vocab] }, state);
-            const loss = try tape.crossEntropy(scores, targets[t * batch ..][0..batch]);
-            total = if (total) |sum| try tape.add(sum, loss) else loss;
-            state = next;
+        // NOTE: the step is launch-bound (thousands of tiny kernels), so on the GPU it is recorded once into a graph and replayed.
+        // Nothing in it changes between steps: the inputs and targets are refilled in place and the scratch addresses repeat.
+        if (gpu == null or graph == null) {
+            _ = arena.reset(.retain_capacity);
+            if (gpu) |dev| {
+                try dev.resetStep();
+                try dev.beginCapture();
+            }
+            var tape: Tape = .{ .gpa = arena.allocator(), .par = run.par, .training = true };
+            try grad.optim.zeroGrad(run.par, params);
+            var state = try tape.constant(try tape.zeroedTensor(State));
+            var total: ?Var(Tensor(f32, &.{})) = null;
+            for (0..unroll) |t| {
+                const next, const scores = try step(model, &tape, .{ .data = inputs[t * batch * vocab ..][0 .. batch * vocab] }, state);
+                const loss = try tape.crossEntropy(scores, targets[t * batch ..][0..batch]);
+                total = if (total) |sum| try tape.add(sum, loss) else loss;
+                state = next;
+            }
+            mean = try tape.mul(total.?, try tape.constant(try tape.filledTensor(Tensor(f32, &.{}), 1.0 / @as(f32, unroll))));
+            try tape.backward(mean);
+            if (gpu) |dev| graph = try dev.endCapture();
         }
-        const mean = try tape.mul(total.?, try tape.constant(try tape.filledTensor(Tensor(f32, &.{}), 1.0 / @as(f32, unroll))));
-        try tape.backward(mean);
+        if (gpu) |dev| try dev.replay(graph.?);
         adam.lr = grad.optim.cosineLr(0.003, iteration, steps, 50);
         try adam.step(run.par, params);
 
@@ -187,6 +204,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    if (gpu) |dev| try dev.printProfile(out);
     try out.writeAll("\n--- sample ---\n");
     try generate(run, gpa, model, rng, out, "ROMEO:", 600);
     try out.flush();

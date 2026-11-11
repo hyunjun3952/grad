@@ -109,3 +109,44 @@ test "deterministic mode gives bit-identical results on every run, for split-K p
         try testing.expectApproxEqAbs(@as(f32, @floatCast(1 / @sqrt(square / rows + norm.eps))), first_stats[channels + ch], 1e-4);
     }
 }
+
+test "a recorded graph runs only when replayed, zeroes its gradient arena each time, and repeats fills and launches" {
+    const gpu = try Gpu.forTest(16 << 20);
+    defer gpu.deinit();
+    const x = try gpu.alloc(f32, 300);
+    const y = try gpu.alloc(f32, 300);
+    try gpu.fill(y, -1);
+    var host: [300]f32 = undefined;
+    for (&host, 0..) |*v, i| v.* = @floatFromInt(i);
+    try gpu.upload(x, &host);
+
+    try gpu.resetStep();
+    const acc = try gpu.scratchZeroed(f32, 300);
+    gpu.beginCapture() catch |err| switch (err) {
+        error.NoGraphSupport => return error.SkipZigTest,
+        else => return err,
+    };
+    try gpu.addInPlace(acc, x);
+    try gpu.fill(y, 3);
+    const graph = try gpu.endCapture();
+
+    // Recording must not execute anything.
+    var back: [300]f32 = undefined;
+    try gpu.download(&back, y);
+    for (back) |v| try testing.expectEqual(@as(f32, -1), v);
+
+    for (0..3) |round| {
+        for (&host, 0..) |*v, i| v.* = @floatFromInt(i * (round + 1));
+        try gpu.upload(x, &host);
+        try gpu.fill(y, 0);
+        try gpu.replay(graph);
+        // The accumulator holds this round's input alone, so it was cleared before the replay.
+        try gpu.download(&back, acc);
+        try testing.expectEqualSlices(f32, &host, &back);
+        try gpu.download(&back, y);
+        for (back) |v| try testing.expectEqual(@as(f32, 3), v);
+    }
+
+    gpu.startProfile(testing.io);
+    try testing.expectError(error.ProfilingWhileCapturing, gpu.beginCapture());
+}
