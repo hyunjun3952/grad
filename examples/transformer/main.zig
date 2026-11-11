@@ -144,7 +144,7 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(text);
     if (text.len < context + 2) return error.TextTooShort;
 
-    const gpu: ?*grad.gpu.Gpu = if (use_gpu) try grad.gpu.Gpu.init(gpa, 1 << 30) else null;
+    const gpu: ?*grad.gpu.Gpu = if (use_gpu) try grad.gpu.Gpu.init(gpa, .{ .step_bytes = 1 << 30 }) else null;
     defer if (gpu) |dev| dev.deinit();
     const run: Run = .{ .gpu = gpu, .par = .{ .io = init.io, .threads = std.Thread.getCpuCount() catch 1, .gpu = gpu } };
 

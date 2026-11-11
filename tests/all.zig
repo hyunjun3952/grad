@@ -19,6 +19,7 @@ test {
     _ = @import("ops.zig");
     _ = @import("optim.zig");
     _ = @import("parity.zig");
+    _ = @import("replicas.zig");
     _ = @import("runtime.zig");
     _ = @import("softmax.zig");
     _ = @import("tensor.zig");

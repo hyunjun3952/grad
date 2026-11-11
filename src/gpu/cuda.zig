@@ -9,6 +9,7 @@ const Status = c_int;
 const Api = struct {
     cuInit: *const fn (flags: c_uint) callconv(.c) Status,
     cuDeviceGet: *const fn (device: *c_int, ordinal: c_int) callconv(.c) Status,
+    cuDeviceGetCount: *const fn (count: *c_int) callconv(.c) Status,
     cuDevicePrimaryCtxRetain: *const fn (ctx: *Handle, device: c_int) callconv(.c) Status,
     cuCtxSetCurrent: *const fn (ctx: Handle) callconv(.c) Status,
     cuCtxSynchronize: *const fn () callconv(.c) Status,
@@ -39,19 +40,40 @@ pub const Cuda = struct {
     lib: dynlib.Library,
     api: Api,
     device: c_int,
+    context: Handle,
 
-    pub fn open() !Cuda {
+    /// Opens the driver and makes the primary context of the device with this ordinal current on the calling thread.
+    /// NOTE: the current context is per thread, so a program that drives several devices must call makeCurrent from the thread that uses each one.
+    pub fn open(ordinal: usize) !Cuda {
         const lib = dynlib.Library.open(.{ .windows = "nvcuda.dll", .linux = &.{ "libcuda.so.1", "libcuda.so" } }, null) catch return error.DriverNotFound;
         errdefer lib.close();
         const api = try lib.bind(Api);
 
-        var self: Cuda = .{ .lib = lib, .api = api, .device = 0 };
+        var self: Cuda = .{ .lib = lib, .api = api, .device = 0, .context = null };
         try self.check(api.cuInit(0));
-        try self.check(api.cuDeviceGet(&self.device, 0));
-        var ctx: Handle = null;
-        try self.check(api.cuDevicePrimaryCtxRetain(&ctx, self.device));
-        try self.check(api.cuCtxSetCurrent(ctx));
+        var count: c_int = 0;
+        try self.check(api.cuDeviceGetCount(&count));
+        if (ordinal >= count) return error.NoSuchDevice;
+        try self.check(api.cuDeviceGet(&self.device, @intCast(ordinal)));
+        try self.check(api.cuDevicePrimaryCtxRetain(&self.context, self.device));
+        try self.check(api.cuCtxSetCurrent(self.context));
         return self;
+    }
+
+    /// Returns how many CUDA devices the driver reports, or zero when there is no driver.
+    pub fn deviceCount() usize {
+        const lib = dynlib.Library.open(.{ .windows = "nvcuda.dll", .linux = &.{ "libcuda.so.1", "libcuda.so" } }, null) catch return 0;
+        defer lib.close();
+        const api = lib.bind(Api) catch return 0;
+        if (api.cuInit(0) != 0) return 0;
+        var count: c_int = 0;
+        if (api.cuDeviceGetCount(&count) != 0) return 0;
+        return @intCast(count);
+    }
+
+    /// Makes this device's context current on the calling thread.
+    pub fn makeCurrent(self: *const Cuda) !void {
+        try self.check(self.api.cuCtxSetCurrent(self.context));
     }
 
     pub fn close(self: *Cuda) void {

@@ -11,6 +11,7 @@ const kernels = @import("../cpu/kernels.zig");
 const nn = @import("nn.zig");
 const onnx = @import("../onnx/onnx.zig");
 const optim = @import("optim.zig");
+const replicas_mod = @import("replicas.zig");
 const Tensor = @import("../tensor/tensor.zig").Tensor;
 
 const Tape = autograd.Tape;
@@ -74,6 +75,7 @@ const Options = struct {
     warmup_epochs: usize = 0,
     predict: usize = 0,
     batch: ?usize = null,
+    replicas: usize = 1,
     learning_rate: ?f32 = null,
     onnx_path: ?[]const u8 = null,
 
@@ -121,6 +123,8 @@ const Options = struct {
                 o.until = try std.fmt.parseInt(usize, v, 10);
             } else if (valueOf(arg, "--batch")) |v| {
                 o.batch = try std.fmt.parseInt(usize, v, 10);
+            } else if (valueOf(arg, "--replicas")) |v| {
+                o.replicas = try std.fmt.parseInt(usize, v, 10);
             } else if (valueOf(arg, "--lr")) |v| {
                 o.learning_rate = try std.fmt.parseFloat(f32, v);
             } else if (valueOf(arg, "--predict")) |v| {
@@ -303,13 +307,14 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
                 if (self.gpu) |dev| try dev.upload(self.order_device, self.order);
             }
 
-            fn fill(self: Feed, step: usize, augment: augment_math.Config) !void {
-                if (self.gpu) |dev| return dev.gather(.{ .images = self.device.images, .labels = self.device.labels, .order = self.order_device }, .{ .batch = self.batch.data, .labels = self.labels, .other_labels = self.other_labels }, step * batch_size, augment);
-                const rows = self.order[step * batch_size ..][0..batch_size];
+            // Fills the batch with the slice number slice of the shuffled order; slices are batch_size rows long.
+            fn fill(self: Feed, slice: usize, augment: augment_math.Config) !void {
+                if (self.gpu) |dev| return dev.gather(.{ .images = self.device.images, .labels = self.device.labels, .order = self.order_device }, .{ .batch = self.batch.data, .labels = self.labels, .other_labels = self.other_labels }, slice * batch_size, augment);
+                const rows = self.order[slice * batch_size ..][0..batch_size];
                 for (rows, 0..) |idx, row| {
                     const partner = (row + 1) % batch_size;
-                    const own = augment_math.transformOf(step * batch_size + row, augment);
-                    const other = augment_math.transformOf(step * batch_size + partner, augment);
+                    const own = augment_math.transformOf(slice * batch_size + row, augment);
+                    const other = augment_math.transformOf(slice * batch_size + partner, augment);
                     for (self.batch.data[row * pixels ..][0..pixels], 0..) |*v, p| {
                         const pasted = augment.box.contains(p, Spec.side, Spec.channels);
                         const source = self.host.images[(if (pasted) rows[partner] else idx) * pixels ..];
@@ -330,34 +335,47 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
             );
         }
 
-        fn run(init: std.process.Init) !void {
-            const io = init.io;
-            const gpa = init.gpa;
+        // State shared by all replica threads. Datasets are read-only; every replica copies what it needs to its own device.
+        const Shared = struct {
+            gpa: Allocator,
+            io: Io,
+            opts: Options,
+            train: Dataset,
+            test_set: Dataset,
+            group: replicas_mod.Replicas,
+            errors: []?anyerror,
+            out: *Io.Writer,
+        };
 
-            var stdout_buffer: [1024]u8 = undefined;
-            var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-            const out = &stdout_file_writer.interface;
+        fn workMain(shared: *Shared, index: usize) void {
+            work(shared, index) catch |err| {
+                shared.errors[index] = err;
+                shared.group.stop();
+            };
+        }
 
-            kernels.flushDenormals();
-            const args = try init.minimal.args.toSlice(init.arena.allocator());
-            const opts = try Options.parse(args[1..], Spec.channels);
+        // Trains one replica. Replica 0 runs on the main thread, owns the console output, the evaluation and the optional outputs.
+        // NOTE: every replica builds its own Gpu inside its thread, because a CUDA context is current per thread.
+        fn work(shared: *Shared, index: usize) !void {
+            const io = shared.io;
+            const gpa = shared.gpa;
+            const opts = shared.opts;
+            const out = shared.out;
+            const train = shared.train;
+            const test_set = shared.test_set;
+            const replicas = opts.replicas;
 
-            const train = try Spec.Loader.load(gpa, io, opts.data_dir orelse Spec.data_dir, "train");
-            defer train.deinit(gpa);
-            const test_set = try Spec.Loader.load(gpa, io, opts.data_dir orelse Spec.data_dir, "t10k");
-            defer test_set.deinit(gpa);
-            if (train.pixels != pixels) return error.UnexpectedImageSize;
-
-            const gpu: ?*Gpu = if (opts.gpu) try Gpu.init(gpa, Spec.scratch_bytes) else null;
+            const gpu: ?*Gpu = if (opts.gpu) try Gpu.init(gpa, .{ .step_bytes = Spec.scratch_bytes, .device = index % @max(1, Gpu.deviceCount()) }) else null;
             defer if (gpu) |dev| dev.deinit();
             if (gpu) |dev| {
-                if (opts.profile) dev.startProfile(io);
+                if (opts.profile and index == 0) dev.startProfile(io);
                 dev.tensor_cores = opts.tensor_cores;
                 dev.tf32 = opts.tf32;
                 dev.deterministic = opts.deterministic;
-                if (opts.cudnn_dir) |dir| dev.enableCudnn(dir) catch |err| try out.print("cuDNN unavailable ({s}), using the built-in kernels\n", .{@errorName(err)});
+                if (opts.cudnn_dir) |dir| dev.enableCudnn(dir) catch |err| if (index == 0) try out.print("cuDNN unavailable ({s}), using the built-in kernels\n", .{@errorName(err)});
             }
-            const par: kernels.Parallel = .{ .io = io, .threads = std.Thread.getCpuCount() catch 1, .gpu = gpu };
+            // NOTE: replica threads must not share the CPU worker pool, which is a single global one.
+            const par: kernels.Parallel = .{ .io = if (replicas > 1) null else io, .threads = std.Thread.getCpuCount() catch 1, .gpu = gpu };
 
             var prng = std.Random.DefaultPrng.init(1234);
             const host_model = try nn.initAll(Spec.Layers, gpa, prng.random());
@@ -381,7 +399,7 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
 
             const train_data = if (gpu) |dev| try train.toGpu(dev) else train;
             const test_data = if (gpu) |dev| try test_set.toGpu(dev) else test_set;
-            if (opts.load_path != null) try out.print("loaded checkpoint after {d} epochs, test accuracy {d:.2}%\n", .{ start_epoch, try accuracy(gpa, par, model, test_data, false) });
+            if (opts.load_path != null and index == 0) try out.print("loaded checkpoint after {d} epochs, test accuracy {d:.2}%\n", .{ start_epoch, try accuracy(gpa, par, model, test_data, false) });
 
             const feed = try Feed.init(gpa, gpu, train, train_data);
             defer feed.deinit(gpa);
@@ -389,13 +407,17 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
             defer arena.deinit();
             const loss_total: []f32 = if (gpu) |dev| try dev.alloc(f32, 1) else &.{};
 
-            try out.print("{s}, AdamW, batch {d}, {s}, {d} training images\n", .{ Spec.name, batch_size, if (gpu != null) "GPU" else "CPU", train.count() });
-            try out.flush();
+            if (index == 0) {
+                try out.print("{s}, AdamW, batch {d}, {s}, {d} training images", .{ Spec.name, batch_size * replicas, if (gpu != null) "GPU" else "CPU", train.count() });
+                if (replicas > 1) try out.print(", {d} replicas of {d}", .{ replicas, batch_size });
+                try out.writeByte('\n');
+                try out.flush();
+            }
 
             const epochs = opts.epochs;
-            const steps = train.count() / batch_size;
+            const steps = train.count() / (batch_size * replicas);
             const stop_epoch = @min(opts.until orelse epochs, epochs);
-            const live = opts.progress or try Io.File.stdout().isTty(io);
+            const live = index == 0 and (opts.progress or try Io.File.stdout().isTty(io));
             if (live) Io.File.stdout().enableAnsiEscapeCodes(io) catch {};
             const progress_every = @max(1, steps / 100);
             for (start_epoch..@max(start_epoch, stop_epoch)) |epoch| {
@@ -409,16 +431,19 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
                     const global_step = epoch * steps + step;
                     const mix = drawMix(Spec.side, opts.cutmix, 0x5EED0000 + global_step);
                     augment.box = mix.box;
-                    try feed.fill(step, augment);
+                    // NOTE: replica r takes slice step * replicas + r, so together the replicas see the rows a single replica
+                    // with the whole batch would. CutMix pairs rows inside a slice only.
+                    try feed.fill(step * replicas + index, augment);
 
                     _ = arena.reset(.retain_capacity);
                     if (gpu) |dev| try dev.resetStep();
                     adam.lr = optim.cosineLr(learning_rate, global_step, epochs * steps, opts.warmup_epochs * steps);
-                    var tape: Tape = .{ .gpa = arena.allocator(), .par = par, .training = true, .smoothing = opts.smoothing, .seed = global_step * 8 };
+                    var tape: Tape = .{ .gpa = arena.allocator(), .par = par, .training = true, .smoothing = opts.smoothing, .seed = (global_step * replicas + index) * 8 };
                     try optim.zeroGrad(par, params);
                     const logits = try Spec.forward(model, &tape, try tape.constant(feed.batch));
                     const loss = try mixedLoss(&tape, logits, feed.labels, feed.other_labels, mix.kept);
                     try tape.backward(loss);
+                    try shared.group.averageGrads(index, par, params);
                     try adam.step(par, params);
                     if (opts.ema_decay > 0) try average.update(par, adam.t);
                     if (gpu) |dev| try dev.addInPlace(loss_total, loss.value.data) else loss_sum += loss.value.data[0];
@@ -427,6 +452,7 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
                         try printProgress(out, .{ .epoch = epoch, .epochs = epochs, .done = step + 1, .steps = steps, .loss = so_far / @as(f64, @floatFromInt(step + 1)), .elapsed_ns = Io.Clock.awake.now(io).nanoseconds - started.nanoseconds, .epochs_left = stop_epoch - epoch - 1 });
                     }
                 }
+                if (index != 0) continue;
                 if (gpu) |dev| loss_sum = try dev.scalar(loss_total);
 
                 const seconds = @as(f64, @floatFromInt(Io.Clock.awake.now(io).nanoseconds - started.nanoseconds)) / 1e9;
@@ -441,6 +467,9 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
                 try out.print("  ({d:.2} s)\n", .{seconds});
                 try out.flush();
             }
+            // NOTE: only replica 0 evaluates and writes outputs. Its loss is the mean over its own slice, and batch norm
+            // statistics are those of its slices, so they differ slightly from a single replica with the whole batch.
+            if (index != 0) return;
             if (opts.mirrored) {
                 try out.print("final test accuracy {d:.2}%, with mirrored inputs averaged {d:.2}%\n", .{ try accuracy(gpa, par, model, test_data, false), try accuracy(gpa, par, model, test_data, true) });
                 if (opts.ema_decay > 0) {
@@ -462,21 +491,87 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
             if (gpu) |dev| try dev.printProfile(out);
             try out.flush();
         }
+
+        fn run(init: std.process.Init) !void {
+            const io = init.io;
+            const gpa = init.gpa;
+
+            var stdout_buffer: [1024]u8 = undefined;
+            var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
+            const out = &stdout_file_writer.interface;
+
+            kernels.flushDenormals();
+            const args = try init.minimal.args.toSlice(init.arena.allocator());
+            const opts = try Options.parse(args[1..], Spec.channels);
+            if (opts.replicas > 1 and !opts.gpu) return error.ReplicasNeedGpu;
+
+            const train = try Spec.Loader.load(gpa, io, opts.data_dir orelse Spec.data_dir, "train");
+            defer train.deinit(gpa);
+            const test_set = try Spec.Loader.load(gpa, io, opts.data_dir orelse Spec.data_dir, "t10k");
+            defer test_set.deinit(gpa);
+            if (train.pixels != pixels) return error.UnexpectedImageSize;
+
+            // The gradient buffer length comes from a throwaway host model, so the barrier state can exist before any replica does.
+            const grad_len = blk: {
+                var seed = std.Random.DefaultPrng.init(1234);
+                const probe = try nn.initAll(Spec.Layers, gpa, seed.random());
+                defer nn.deinitAll(probe, gpa);
+                break :blk replicas_mod.gradLen(nn.params(probe));
+            };
+            var shared: Shared = .{
+                .gpa = gpa,
+                .io = io,
+                .opts = opts,
+                .train = train,
+                .test_set = test_set,
+                .group = try replicas_mod.Replicas.init(gpa, opts.replicas, grad_len),
+                .errors = try gpa.alloc(?anyerror, opts.replicas),
+                .out = out,
+            };
+            defer shared.group.deinit();
+            defer gpa.free(shared.errors);
+            @memset(shared.errors, null);
+
+            const threads = try gpa.alloc(std.Thread, opts.replicas - 1);
+            defer gpa.free(threads);
+            var spawned: usize = 0;
+            while (spawned < threads.len) : (spawned += 1) {
+                threads[spawned] = std.Thread.spawn(.{}, workMain, .{ &shared, spawned + 1 }) catch |err| {
+                    shared.group.stop();
+                    for (threads[0..spawned]) |t| t.join();
+                    return err;
+                };
+            }
+            workMain(&shared, 0);
+            for (threads) |t| t.join();
+            // Stopped only says that another replica failed, so report the first real error.
+            for (shared.errors) |e| {
+                if (e != null and e.? != error.Stopped) return e.?;
+            }
+            for (shared.errors) |e| {
+                if (e) |err| return err;
+            }
+        }
     };
 }
 
 /// Runs a whole program for a model description: parses the flags, loads data, trains, evaluates and writes the optional outputs.
 /// Spec supplies the layers, the forward pass, the data loader and the batch sizes it was built for; --batch picks one of them.
+/// With --replicas=N (GPU only) the batch is split into N slices, one per replica, so batch / N must be one of the built sizes.
 pub fn run(comptime Spec: type, init: std.process.Init) !void {
     const allowed = if (@hasDecl(Spec, "batches")) Spec.batches else [_]usize{Spec.batch};
-    var wanted: usize = Spec.batch;
+    var total: usize = Spec.batch;
+    var replicas: usize = 1;
     for ((try init.minimal.args.toSlice(init.arena.allocator()))[1..]) |arg| {
-        if (valueOf(arg, "--batch")) |v| wanted = try std.fmt.parseInt(usize, v, 10);
+        if (valueOf(arg, "--batch")) |v| total = try std.fmt.parseInt(usize, v, 10);
+        if (valueOf(arg, "--replicas")) |v| replicas = try std.fmt.parseInt(usize, v, 10);
     }
+    if (replicas == 0 or total % replicas != 0) return error.BatchNotDivisible;
+    const wanted = total / replicas;
     inline for (allowed) |size| {
         if (size == wanted) return Runner(Spec, size).run(init);
     }
-    std.debug.print("--batch={d} is not available in this build; it supports", .{wanted});
+    std.debug.print("--batch={d} with {d} replicas needs a per-replica batch of {d}, which is not available in this build; it supports", .{ total, replicas, wanted });
     inline for (allowed) |size| std.debug.print(" {d}", .{size});
     std.debug.print("\n", .{});
     return error.UnsupportedBatchSize;

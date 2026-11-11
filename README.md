@@ -61,6 +61,7 @@ Build options such as `-Dcnn=true -Dhidden=2048 -Dbatch=256` go before the `--`;
 | `--cutmix=P` | With probability P per batch, paste a random square from the neighbouring image and weight the two labels by the pasted area (CutMix; CPU and GPU). |
 | `--tta` | After training, also report the test accuracy with every test image averaged with its mirror image (about +0.4 points on CIFAR-10). With `--load` and `--until=0` it evaluates a checkpoint. |
 | `--warmup=N` | Ramp the learning rate linearly over the first N epochs, then follow the cosine schedule. |
+| `--replicas=N` | Data parallel training on the GPU: the batch is split into N slices, one replica (thread, own copy of the model) per slice, gradients averaged through host memory before the identical Adam step. Replicas use devices round-robin; on one GPU this is only a correctness check and is slower than a single replica. `--batch` stays the whole batch, so batch / N must be a built size. Not measured on real multi-GPU hardware. Loss, evaluation and batch-norm statistics come from replica 0. |
 | `--ema=D` | Keep an exponential moving average of all weights and batch-norm statistics (decay D, e.g. 0.999) and report its test accuracy next to the raw one. Stored in checkpoints. |
 | `--batch=N` | Training batch size. The shapes are compile-time, so only the sizes listed in the program's Spec.batches exist in the binary (MNIST: 16 to 512, CIFAR: 32, 64, 128); other values are refused. |
 | `--lr=F` | Base learning rate (default: the program's own). |
@@ -227,4 +228,4 @@ A layer is any struct with `init`, `deinit`, `toGpu`, `forward`, `params` and `s
 - Grouped and dilated convolutions use a simple one-thread-per-output kernel (correct but not tuned); only the dense stride-1 shapes get the tensor-core paths.
 - Batch sizes are compile-time constants; a program lists the sizes it is built for (`--batch=N` picks one).
 - ONNX files can be imported for CPU inference only, and only single-input graphs can be exported.
-- Training is single-GPU. The CPU is deterministic, and so is the GPU with `--deterministic` (no split-K, ordered reductions, deterministic cuDNN algorithms, somewhat slower); without it GPU runs differ in the last bits because of atomic accumulation.
+- Multi-GPU training (`--replicas`) exists but has only been run with replicas sharing one GPU. The CPU is deterministic, and so is the GPU with `--deterministic` (no split-K, ordered reductions, deterministic cuDNN algorithms, somewhat slower); without it GPU runs differ in the last bits because of atomic accumulation.

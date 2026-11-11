@@ -11,6 +11,7 @@ pub const nn = @import("nn/nn.zig");
 pub const onnx = @import("onnx/onnx.zig");
 pub const ops = @import("tensor/ops.zig");
 pub const optim = @import("nn/optim.zig");
+pub const replicas = @import("nn/replicas.zig");
 pub const tensor = @import("tensor/tensor.zig");
 pub const trainer = @import("nn/trainer.zig");
 pub const Tensor = tensor.Tensor;

@@ -167,7 +167,7 @@ test "adam weight decay shrinks weights even with zero gradient, and cosineLr de
 
 test "ema averages with a warm-up decay and swap exchanges live and shadow values, on the cpu and the gpu" {
     const gpa = testing.allocator;
-    const gpu = Gpu.init(gpa, 1 << 20) catch |err| switch (err) {
+    const gpu = Gpu.init(gpa, .{ .step_bytes = 1 << 20 }) catch |err| switch (err) {
         error.DriverNotFound => null,
         else => return err,
     };

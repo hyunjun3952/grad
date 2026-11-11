@@ -10,7 +10,7 @@ const ptx = @embedFile("kernels_ptx");
 
 /// Everything that can fail on the device path. The CUDA driver and cuDNN are loaded at run time,
 /// so a missing library is an error value rather than a link failure.
-pub const Error = Allocator.Error || error{ NoDevice, DriverNotFound, MissingSymbol, CudaFailed, CudnnNotFound, CudnnFailed, NoAlgorithm };
+pub const Error = Allocator.Error || error{ NoDevice, NoSuchDevice, DriverNotFound, MissingSymbol, CudaFailed, CudnnNotFound, CudnnFailed, NoAlgorithm };
 
 pub const BinaryOp = enum { add, mul };
 
@@ -225,8 +225,13 @@ pub const Gpu = struct {
 
     const PlanEntry = struct { geometry: cudnn.Geometry, plan: cudnn.Plan };
 
+    /// Where and how big a Gpu is: the CUDA device ordinal and the scratch bytes per step.
+    pub const Config = struct { step_bytes: usize, device: usize = 0 };
+
     /// Opens the driver, loads the kernels and reserves step_bytes for scratch plus a quarter of that for the zero arena.
-    pub fn init(gpa: Allocator, step_bytes: usize) Error!*Gpu {
+    /// The device context becomes current on the calling thread; use makeCurrent when another thread takes over.
+    pub fn init(gpa: Allocator, config: Config) Error!*Gpu {
+        const step_bytes = config.step_bytes;
         const self = try gpa.create(Gpu);
         errdefer gpa.destroy(self);
         self.gpa = gpa;
@@ -240,7 +245,7 @@ pub const Gpu = struct {
         self.cudnn_plans = .empty;
         self.cudnn_workspace = 0;
         self.cudnn_workspace_bytes = 0;
-        self.cu = try cuda.Cuda.open();
+        self.cu = try cuda.Cuda.open(config.device);
         errdefer self.cu.close();
 
         const module = try self.cu.loadModule(gpa, ptx);
@@ -259,10 +264,20 @@ pub const Gpu = struct {
 
     /// Same as init, but skips the calling test when no driver is installed.
     pub fn forTest(step_bytes: usize) !*Gpu {
-        return init(std.testing.allocator, step_bytes) catch |err| switch (err) {
+        return init(std.testing.allocator, .{ .step_bytes = step_bytes }) catch |err| switch (err) {
             error.DriverNotFound => error.SkipZigTest,
             else => err,
         };
+    }
+
+    /// Returns how many CUDA devices are installed (zero without a driver).
+    pub fn deviceCount() usize {
+        return cuda.Cuda.deviceCount();
+    }
+
+    /// Makes this device current on the calling thread, which a thread must do once before it uses a Gpu created elsewhere.
+    pub fn makeCurrent(self: *Gpu) Error!void {
+        try self.cu.makeCurrent();
     }
 
     pub fn deinit(self: *Gpu) void {

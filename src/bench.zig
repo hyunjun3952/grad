@@ -266,7 +266,7 @@ fn stepProfile(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, rng: std.Random,
 }
 
 fn gpuMatmul(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
-    const dev = grad.gpu.Gpu.init(gpa, 1 << 20) catch |err| switch (err) {
+    const dev = grad.gpu.Gpu.init(gpa, .{ .step_bytes = 1 << 20 }) catch |err| switch (err) {
         error.DriverNotFound => return out.writeAll("no NVIDIA driver\n"),
         else => return err,
     };
@@ -296,7 +296,7 @@ fn gpuMatmul(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
 }
 
 fn cudnnConvolutions(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, dir: [:0]const u8) !void {
-    const dev = grad.gpu.Gpu.init(gpa, 1 << 20) catch |err| switch (err) {
+    const dev = grad.gpu.Gpu.init(gpa, .{ .step_bytes = 1 << 20 }) catch |err| switch (err) {
         error.DriverNotFound => return,
         else => return err,
     };
@@ -366,7 +366,7 @@ fn cudnnConvolutions(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, dir: [:0]c
 }
 
 fn implicitGemm(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
-    const dev = grad.gpu.Gpu.init(gpa, 2 << 30) catch |err| switch (err) {
+    const dev = grad.gpu.Gpu.init(gpa, .{ .step_bytes = 2 << 30 }) catch |err| switch (err) {
         error.DriverNotFound => return,
         else => return err,
     };
@@ -429,7 +429,7 @@ fn implicitGemm(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
 }
 
 fn gpuTensorCore(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
-    const dev = grad.gpu.Gpu.init(gpa, 1 << 30) catch |err| switch (err) {
+    const dev = grad.gpu.Gpu.init(gpa, .{ .step_bytes = 1 << 30 }) catch |err| switch (err) {
         error.DriverNotFound => return out.writeAll("no NVIDIA driver\n"),
         else => return err,
     };
