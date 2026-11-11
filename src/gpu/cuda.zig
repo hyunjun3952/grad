@@ -8,7 +8,6 @@ const Status = c_int;
 const Api = struct {
     cuInit: *const fn (flags: c_uint) callconv(.c) Status,
     cuDeviceGet: *const fn (device: *c_int, ordinal: c_int) callconv(.c) Status,
-    cuDeviceGetName: *const fn (name: [*]u8, len: c_int, device: c_int) callconv(.c) Status,
     cuDevicePrimaryCtxRetain: *const fn (ctx: *Handle, device: c_int) callconv(.c) Status,
     cuCtxSetCurrent: *const fn (ctx: Handle) callconv(.c) Status,
     cuCtxSynchronize: *const fn () callconv(.c) Status,
@@ -73,11 +72,6 @@ pub const Cuda = struct {
         _ = self.api.cuGetErrorName(status, &name);
         std.debug.print("CUDA driver call failed: {d} ({s})\n", .{ status, name });
         return error.CudaFailed;
-    }
-
-    pub fn deviceName(self: *const Cuda, buf: *[128]u8) ![]const u8 {
-        try self.check(self.api.cuDeviceGetName(buf, buf.len, self.device));
-        return std.mem.sliceTo(buf, 0);
     }
 
     pub fn alloc(self: *const Cuda, bytes: usize) !DevicePtr {

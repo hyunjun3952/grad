@@ -45,6 +45,7 @@ const Cifar = struct {
     pub const channels = 3;
     pub const classes = categories;
     pub const batch = 64;
+    pub const batches = [_]usize{ 32, 64, 128 };
     pub const eval_batch = 100;
     pub const learning_rate = 0.002;
     pub const weight_decay = 0.01;
@@ -55,12 +56,12 @@ const Cifar = struct {
         const n = @TypeOf(x.value).shape[0];
         const image = grad.autograd.reshape(x, &.{ n, 32, 32, 3 });
 
-        const stage1 = try tape.maxPool(try residual(tape, a2, b2, try residual(tape, a1, b1, try stem.forwardRelu(tape, image))));
+        const stage1 = try tape.maxPool(try residual(tape, a2, b2, try residual(tape, a1, b1, try stem.forwardRelu(tape, image))), .{});
         const down2 = try tape.addRelu(try b3.forward(tape, try a3.forwardRelu(tape, stage1)), try skip3.forward(tape, stage1));
-        const stage2 = try tape.maxPool(try residual(tape, a4, b4, down2));
+        const stage2 = try tape.maxPool(try residual(tape, a4, b4, down2), .{});
         const down3 = try tape.addRelu(try b5.forward(tape, try a5.forwardRelu(tape, stage2)), try skip5.forward(tape, stage2));
-        const stage3 = try tape.maxPool(try residual(tape, a6, b6, down3));
-        const pooled = try tape.avgPool(try tape.avgPool(stage3));
+        const stage3 = try tape.maxPool(try residual(tape, a6, b6, down3), .{});
+        const pooled = try tape.avgPool(try tape.avgPool(stage3, .{}), .{});
         return fc.forward(tape, try tape.dropout(grad.autograd.reshape(pooled, &.{ n, w3 }), 0.2));
     }
 };

@@ -6,9 +6,12 @@ const kernels = @import("../cpu/kernels.zig");
 const gpu_mod = @import("../gpu/gpu.zig");
 const ga = @import("../gpu/args.zig");
 const conv = @import("../gpu/math/conv.zig");
+const activation_math = @import("../gpu/math/activation.zig");
 const drop = @import("../gpu/math/dropout.zig");
 const norm = @import("../gpu/math/norm.zig");
 const Tensor = tensor.Tensor;
+const trace_mod = @import("trace.zig");
+pub const Trace = trace_mod.Trace;
 
 pub const Error = gpu_mod.Error;
 
@@ -49,23 +52,29 @@ pub fn reshape(x: anytype, comptime shape: []const usize) Var(Tensor(@TypeOf(x.v
     return .{ .value = .{ .data = x.value.data }, .grad = .{ .data = x.grad.data }, .needs_grad = x.needs_grad };
 }
 
-pub const ConvOpts = struct { stride: usize = 1, pad: usize = 0 };
+pub const Activation = activation_math.Kind;
+pub const ConvOpts = struct { stride: usize = 1, pad: usize = 0, dilation: usize = 1, groups: usize = 1 };
+pub const PoolOpts = struct { kernel: usize = 2, stride: usize = 2, pad: usize = 0 };
+const ConvPath = enum { direct, packed_im2col, implicit, tf32, cudnn, grouped };
+const Packed = gpu_mod.Gpu.Packed;
 
-fn kernelSize(comptime In: type, comptime W: type) usize {
-    if (In.rank != 4 or W.rank != 2) @compileError("conv2d expects (n, h, w, c) input and (k*k*c, out) weights");
-    const k = std.math.sqrt(W.shape[0] / In.shape[3]);
-    if (k * k * In.shape[3] != W.shape[0]) @compileError("conv2d weights must have k*k*c rows");
+fn kernelSize(comptime In: type, comptime W: type, comptime groups: usize) usize {
+    if (In.rank != 4 or W.rank != 2) @compileError("conv2d expects (n, h, w, c) input and (k*k*c/groups, out) weights");
+    if (In.shape[3] % groups != 0 or W.shape[1] % groups != 0) @compileError("conv2d groups must divide the input and output channels");
+    const per_group = In.shape[3] / groups;
+    const k = std.math.sqrt(W.shape[0] / per_group);
+    if (k * k * per_group != W.shape[0]) @compileError("conv2d weights must have k*k*c/groups rows");
     return k;
 }
 
 fn ConvOut(comptime In: type, comptime W: type, comptime opts: ConvOpts) type {
-    const k = kernelSize(In, W);
-    return Tensor(f32, &.{ In.shape[0], (In.shape[1] + 2 * opts.pad - k) / opts.stride + 1, (In.shape[2] + 2 * opts.pad - k) / opts.stride + 1, W.shape[1] });
+    const span = opts.dilation * (kernelSize(In, W, opts.groups) - 1) + 1;
+    return Tensor(f32, &.{ In.shape[0], (In.shape[1] + 2 * opts.pad - span) / opts.stride + 1, (In.shape[2] + 2 * opts.pad - span) / opts.stride + 1, W.shape[1] });
 }
 
-fn PoolOut(comptime In: type) type {
-    if (In.rank != 4) @compileError("maxPool expects (n, h, w, c) input");
-    return Tensor(f32, &.{ In.shape[0], In.shape[1] / 2, In.shape[2] / 2, In.shape[3] });
+fn PoolOut(comptime In: type, comptime opts: PoolOpts) type {
+    if (In.rank != 4) @compileError("pooling expects (n, h, w, c) input");
+    return Tensor(f32, &.{ In.shape[0], (In.shape[1] + 2 * opts.pad - opts.kernel) / opts.stride + 1, (In.shape[2] + 2 * opts.pad - opts.kernel) / opts.stride + 1, In.shape[3] });
 }
 
 const Node = struct {
@@ -80,6 +89,11 @@ pub const Tape = struct {
     training: bool = false,
     smoothing: f32 = 0,
     seed: u64 = 0,
+    trace: ?*Trace = null,
+
+    fn note(self: *Tape, op: trace_mod.Op, inputs: anytype, output: anytype, attrs: trace_mod.Attrs) Error!void {
+        if (self.trace) |t| try t.add(op, inputs, output, attrs);
+    }
 
     fn newTensor(self: *Tape, comptime Tn: type) Error!Tn {
         if (self.par.gpu) |dev| return .{ .data = try dev.scratch(Tn.Elem, Tn.len) };
@@ -175,6 +189,7 @@ pub const Tape = struct {
 
     pub fn add(self: *Tape, a: anytype, b: anytype) Error!Var(ops.BroadcastResult(@TypeOf(a.value), @TypeOf(b.value))) {
         const out = try self.makeVar(try self.elementwise(.add, a.value, b.value), a.needs_grad or b.needs_grad);
+        try self.note(.add, .{ a, b }, out, .{});
         const Ctx = struct { a: @TypeOf(a), b: @TypeOf(b), out: @TypeOf(out) };
         if (out.needs_grad) try self.recordBackward(Ctx{ .a = a, .b = b, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
@@ -195,6 +210,7 @@ pub const Tape = struct {
             for (value.data, a.value.data, b.value.data) |*o, x, y| o.* = @max(x + y, 0);
         }
         const out = try self.makeVar(value, a.needs_grad or b.needs_grad);
+        try self.note(.add_relu, .{ a, b }, out, .{});
         const Ctx = struct { a: @TypeOf(a), b: @TypeOf(b), out: @TypeOf(out) };
         if (out.needs_grad) try self.recordBackward(Ctx{ .a = a, .b = b, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
@@ -211,6 +227,7 @@ pub const Tape = struct {
 
     pub fn mul(self: *Tape, a: anytype, b: anytype) Error!Var(ops.BroadcastResult(@TypeOf(a.value), @TypeOf(b.value))) {
         const out = try self.makeVar(try self.elementwise(.mul, a.value, b.value), a.needs_grad or b.needs_grad);
+        try self.note(.mul, .{ a, b }, out, .{});
         const Ctx = struct { a: @TypeOf(a), b: @TypeOf(b), out: @TypeOf(out) };
         if (out.needs_grad) try self.recordBackward(Ctx{ .a = a, .b = b, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
@@ -225,6 +242,7 @@ pub const Tape = struct {
         const value = try self.newTensor(tensor.MatmulResult(@TypeOf(a.value), @TypeOf(b.value), .{}));
         try tensor.matmulInto(self.gpa, self.par, a.value, b.value, value, .{});
         const out = try self.makeVar(value, a.needs_grad or b.needs_grad);
+        try self.note(.matmul, .{ a, b }, out, .{});
         const Ctx = struct { a: @TypeOf(a), b: @TypeOf(b), out: @TypeOf(out) };
         if (out.needs_grad) try self.recordBackward(Ctx{ .a = a, .b = b, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
@@ -244,6 +262,7 @@ pub const Tape = struct {
             value = try ops.relu(self.gpa, x.value);
         }
         const out = try self.makeVar(value, x.needs_grad);
+        try self.note(.relu, .{x}, out, .{});
         const Ctx = struct { x: @TypeOf(x), out: @TypeOf(out) };
         if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
@@ -251,6 +270,26 @@ pub const Tape = struct {
                 for (c.x.grad.data, c.x.value.data, c.out.grad.data) |*gx, v, g| {
                     gx.* += if (v > 0) g else 0;
                 }
+            }
+        }.run);
+        return out;
+    }
+
+    pub fn activate(self: *Tape, x: anytype, comptime kind: Activation) Error!Var(@TypeOf(x.value)) {
+        const value = try self.newTensor(@TypeOf(x.value));
+        const Job = struct { x: []const f32, y: []f32 };
+        if (self.par.gpu) |dev| try dev.activation(x.value.data, value.data, kind) else kernels.parallelFor(self.par, value.data.len, 1 << 14, Job{ .x = x.value.data, .y = value.data }, struct {
+            fn run(job: Job, lo: usize, hi: usize) void {
+                activation_math.apply(job.x, job.y, kind, lo, hi);
+            }
+        }.run);
+        const out = try self.makeVar(value, x.needs_grad);
+        try self.note(@field(trace_mod.Op, @tagName(kind)), .{x}, out, .{});
+        const Ctx = struct { x: @TypeOf(x), out: @TypeOf(out) };
+        if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .out = out }, struct {
+            fn run(t: *Tape, c: *const Ctx) Error!void {
+                if (t.par.gpu) |dev| return dev.activationBackward(c.x.value.data, c.out.value.data, c.out.grad.data, c.x.grad.data, kind);
+                activation_math.applyBackward(c.x.value.data, c.out.value.data, c.out.grad.data, c.x.grad.data, kind, 0, c.x.grad.data.len);
             }
         }.run);
         return out;
@@ -300,6 +339,7 @@ pub const Tape = struct {
             kernels.parallelEach(self.par, In.len, norm.apply, .{ x.value.data, value.data, c, mean.data, inv_std.data, gamma.value.data, beta.value.data, fuse_relu });
         }
         const out = try self.makeVar(value, x.needs_grad or gamma.needs_grad or beta.needs_grad);
+        try self.note(if (fuse_relu) .batch_norm_relu else .batch_norm, .{ x, gamma, beta, running.mean, running.variance }, out, .{});
 
         const Ctx = struct { x: @TypeOf(x), gamma: @TypeOf(gamma), beta: @TypeOf(beta), mean: Channels, inv_std: Channels, out: @TypeOf(out) };
         if (out.needs_grad and self.training) try self.recordBackward(Ctx{ .x = x, .gamma = gamma, .beta = beta, .mean = mean, .inv_std = inv_std, .out = out }, struct {
@@ -318,12 +358,13 @@ pub const Tape = struct {
         return out;
     }
 
-    pub fn avgPool(self: *Tape, x: anytype) Error!Var(PoolOut(@TypeOf(x.value))) {
+    pub fn avgPool(self: *Tape, x: anytype, comptime opts: PoolOpts) Error!Var(PoolOut(@TypeOf(x.value), opts)) {
         const In = @TypeOf(x.value);
-        const d: conv.Dims = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = In.shape[3], .k = 2 };
-        const value = try self.newTensor(PoolOut(In));
+        const d: conv.Dims = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = In.shape[3], .k = opts.kernel, .stride = opts.stride, .pad = opts.pad };
+        const value = try self.newTensor(PoolOut(In, opts));
         try self.convKernel(.avgPool, .{ x.value.data, value.data }, d);
         const out = try self.makeVar(value, x.needs_grad);
+        try self.note(.avg_pool, .{x}, out, .{ .kernel = opts.kernel, .stride = opts.stride, .pad = opts.pad });
         const Ctx = struct { x: @TypeOf(x), out: @TypeOf(out) };
         if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .out = out }, struct {
             fn run(t: *Tape, k: *const Ctx) Error!void {
@@ -340,133 +381,140 @@ pub const Tape = struct {
     pub fn conv2d(self: *Tape, x: anytype, w: anytype, comptime opts: ConvOpts) Error!Var(ConvOut(@TypeOf(x.value), @TypeOf(w.value), opts)) {
         const In = @TypeOf(x.value);
         const Out = ConvOut(In, @TypeOf(w.value), opts);
-        const k = comptime kernelSize(In, @TypeOf(w.value));
-        const d: conv.Dims = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = In.shape[3], .k = k, .stride = opts.stride, .pad = opts.pad };
-        const rows = Out.len / Out.shape[3];
-        const Col = Tensor(f32, &.{ rows, k * k * In.shape[3] });
-        const Flat = Tensor(f32, &.{ rows, Out.shape[3] });
+        const k = comptime kernelSize(In, @TypeOf(w.value), opts.groups);
+        const c_in = In.shape[3];
+        const c_out = Out.shape[3];
+        const d: conv.Dims = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = c_in, .k = k, .stride = opts.stride, .pad = opts.pad, .dilation = opts.dilation, .groups = opts.groups, .c_out = c_out };
+        const rows = Out.len / c_out;
+        const kc = k * k * c_in;
+        const Col = Tensor(f32, &.{ rows, kc });
+        const Flat = Tensor(f32, &.{ rows, c_out });
+        const geometry: ga.ConvGeometry = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = c_in, .k = k, .stride = opts.stride, .pad = opts.pad, .out_h = Out.shape[1], .out_w = Out.shape[2], .positions = rows };
+        const reverse: ga.ConvGeometry = .{ .n = In.shape[0], .h = Out.shape[1], .w = Out.shape[2], .c = c_out, .k = k, .stride = 1, .pad = k - 1 - opts.pad, .out_h = In.shape[1], .out_w = In.shape[2], .positions = In.len / c_in };
+        const cudnn_geometry: gpu_mod.cudnn.Geometry = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = c_in, .k = c_out, .r = k, .pad = opts.pad, .stride = opts.stride };
+        const aligned_out = std.mem.alignForward(usize, c_out, 64);
 
-        const channels_out = Out.shape[3];
-        const kc = k * k * In.shape[3];
         const dev = self.par.gpu;
-        const use_cudnn = if (dev) |g| g.cudnn_lib != null else false;
-        const cudnn_geometry: gpu_mod.cudnn.Geometry = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = In.shape[3], .k = channels_out, .r = k, .pad = opts.pad, .stride = opts.stride };
-        const packed_path = if (dev) |g| g.tensorWorthwhile(rows, channels_out, kc) and !use_cudnn else false;
-        const implicit_shape = opts.stride == 1 and In.shape[3] % 64 == 0 and channels_out % 32 == 0;
-        const tf32_shape = opts.stride == 1 and In.shape[3] % 64 == 0 and channels_out % 16 == 0;
-        const tf32_path = tf32_shape and !use_cudnn and !packed_path and (if (dev) |g| g.tf32Worthwhile(rows, channels_out, kc) else false);
-        const implicit_path = implicit_shape and packed_path;
-        const geometry: ga.ConvGeometry = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = In.shape[3], .k = k, .stride = opts.stride, .pad = opts.pad, .out_h = Out.shape[1], .out_w = Out.shape[2], .positions = rows };
+        const unit_stride_blocks = opts.stride == 1 and c_in % 64 == 0;
+        const general = opts.groups > 1 or opts.dilation > 1;
+        const path: ConvPath = if (general) .grouped else if (dev == null) .direct else if (dev.?.cudnn_lib != null) .cudnn else if (dev.?.tensorWorthwhile(rows, c_out, kc)) (if (unit_stride_blocks and c_out % 32 == 0) .implicit else .packed_im2col) else if (unit_stride_blocks and c_out % 16 == 0 and dev.?.tf32Worthwhile(rows, c_out, kc)) .tf32 else .direct;
+
         const value = try self.newTensor(Out);
         var col: Col = undefined;
-        var col_half: ?gpu_mod.Gpu.Packed = null;
+        var col_half: Packed = .{ .data = &.{}, .rows_padded = 0, .cols_padded = 0 };
         var x_half: []const u16 = &.{};
-        if (tf32_path) {
-            try dev.?.convTf32Forward(x.value.data, w.value.data, channels_out, value.data, geometry, channels_out, false);
-        } else if (use_cudnn) {
-            const g = dev.?;
-            const mark = g.step_used;
-            defer g.step_used = mark;
-            try g.cudnnForward(cudnn_geometry, x.value.data, try g.weightsToKrsc(w.value.data, k, In.shape[3], channels_out), value.data);
-        } else if (implicit_path) {
-            const g = dev.?;
-            x_half = (try g.packMatrix(x.value.data, In.len / In.shape[3], In.shape[3], In.len / In.shape[3], In.shape[3], false)).data;
-            const w_half = try g.packMatrix(w.value.data, kc, channels_out, kc, std.mem.alignForward(usize, channels_out, 64), false);
-            try g.convImplicitForward(x_half, w_half, value.data, geometry, channels_out, false);
-        } else if (packed_path) {
-            const g = dev.?;
-            const half = try g.im2colPacked(x.value.data, d);
-            const w_half = try g.packMatrix(w.value.data, kc, channels_out, half.cols_padded, std.mem.alignForward(usize, channels_out, 64), false);
-            try g.matmulPacked(half, w_half, value.data, .{ .m = rows, .n = channels_out, .k = kc }, false, false);
-            col_half = half;
-        } else {
-            col = try self.newTensor(Col);
-            try self.convKernel(.im2col, .{ x.value.data, col.data }, d);
-            try tensor.matmulInto(self.gpa, self.par, col, w.value, Flat{ .data = value.data }, .{});
+        switch (path) {
+            .grouped => try self.convKernel(.groupedForward, .{ x.value.data, w.value.data, value.data }, d),
+            .direct => {
+                col = try self.newTensor(Col);
+                try self.convKernel(.im2col, .{ x.value.data, col.data }, d);
+                try tensor.matmulInto(self.gpa, self.par, col, w.value, Flat{ .data = value.data }, .{});
+            },
+            .packed_im2col => {
+                const g = dev.?;
+                col_half = try g.im2colPacked(x.value.data, d);
+                const w_half = try g.packMatrix(w.value.data, kc, c_out, col_half.cols_padded, aligned_out, false);
+                try g.matmulPacked(col_half, w_half, value.data, .{ .m = rows, .n = c_out, .k = kc }, false, false);
+            },
+            .implicit => {
+                const g = dev.?;
+                x_half = (try g.packMatrix(x.value.data, In.len / c_in, c_in, In.len / c_in, c_in, false)).data;
+                const w_half = try g.packMatrix(w.value.data, kc, c_out, kc, aligned_out, false);
+                try g.convImplicitForward(x_half, w_half, value.data, geometry, c_out, false);
+            },
+            .tf32 => try dev.?.convTf32Forward(x.value.data, w.value.data, c_out, value.data, geometry, c_out, false),
+            .cudnn => {
+                const g = dev.?;
+                const mark = g.step_used;
+                defer g.step_used = mark;
+                try g.cudnnForward(cudnn_geometry, x.value.data, try g.weightsToKrsc(w.value.data, k, c_in, c_out), value.data);
+            },
         }
         const out = try self.makeVar(value, x.needs_grad or w.needs_grad);
+        try self.note(.conv, .{ x, w }, out, .{ .kernel = k, .stride = opts.stride, .pad = opts.pad, .dilation = opts.dilation, .groups = opts.groups });
 
-        const Ctx = struct { x: @TypeOf(x), w: @TypeOf(w), col: Col, col_half: ?gpu_mod.Gpu.Packed, x_half: []const u16, use_cudnn: bool, use_tf32: bool, out: @TypeOf(out) };
-        if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .w = w, .col = col, .col_half = col_half, .x_half = x_half, .use_cudnn = use_cudnn, .use_tf32 = tf32_path, .out = out }, struct {
+        const Ctx = struct { x: @TypeOf(x), w: @TypeOf(w), path: ConvPath, col: Col, col_half: Packed, x_half: []const u16, out: @TypeOf(out) };
+        if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .w = w, .path = path, .col = col, .col_half = col_half, .x_half = x_half, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
                 const grad: Flat = .{ .data = c.out.grad.data };
-                if (c.use_tf32) {
-                    const g = t.par.gpu.?;
-                    const mark = g.step_used;
-                    defer g.step_used = mark;
-                    if (c.x.needs_grad) {
-                        const rotated = try g.rotateWeightsF32(c.w.value.data, k, In.shape[3], channels_out);
-                        const reverse: ga.ConvGeometry = .{ .n = In.shape[0], .h = Out.shape[1], .w = Out.shape[2], .c = channels_out, .k = k, .stride = 1, .pad = k - 1 - opts.pad, .out_h = In.shape[1], .out_w = In.shape[2], .positions = In.len / In.shape[3] };
-                        try g.convTf32Forward(grad.data, rotated, std.mem.alignForward(usize, In.shape[3], 64), c.x.grad.data, reverse, In.shape[3], true);
-                    }
-                    if (c.w.needs_grad) {
-                        const positions_padded = std.mem.alignForward(usize, rows, 32);
-                        const grad_t = try g.transposeF32(grad.data, channels_out, rows, std.mem.alignForward(usize, channels_out, 32), positions_padded);
-                        try g.convTf32WeightGrad(grad_t, positions_padded, c.x.value.data, c.w.grad.data, geometry, channels_out, kc);
-                    }
-                    return;
-                }
-                if (c.use_cudnn) {
-                    const g = t.par.gpu.?;
-                    const mark = g.step_used;
-                    defer g.step_used = mark;
-                    const w_krsc = try g.weightsToKrsc(c.w.value.data, k, In.shape[3], channels_out);
-                    if (c.x.needs_grad) try g.cudnnBackwardData(cudnn_geometry, w_krsc, c.out.grad.data, c.x.grad.data);
-                    if (c.w.needs_grad) {
-                        const dw_krsc = try g.scratch(f32, w_krsc.len);
-                        try g.cudnnBackwardFilter(cudnn_geometry, c.x.value.data, c.out.grad.data, dw_krsc);
-                        try g.addKrscGradient(dw_krsc, c.w.grad.data, k, In.shape[3], channels_out);
-                    }
-                    return;
-                }
-                if (c.x.needs_grad and c.x_half.len != 0) {
-                    const g = t.par.gpu.?;
-                    const mark = g.step_used;
-                    defer g.step_used = mark;
-                    const grad_half = try g.packMatrix(grad.data, rows, channels_out, rows, channels_out, false);
-                    const rotated = try g.packRotatedWeights(c.w.value.data, k, In.shape[3], channels_out);
-                    const reverse: ga.ConvGeometry = .{ .n = In.shape[0], .h = Out.shape[1], .w = Out.shape[2], .c = channels_out, .k = k, .stride = 1, .pad = k - 1 - opts.pad, .out_h = In.shape[1], .out_w = In.shape[2], .positions = In.len / In.shape[3] };
-                    try g.convImplicitForward(grad_half.data, rotated, c.x.grad.data, reverse, In.shape[3], true);
-                } else if (c.x.needs_grad and c.col_half != null) {
-                    const g = t.par.gpu.?;
-                    const mark = g.step_used;
-                    defer g.step_used = mark;
-                    const grad_packed = try g.packMatrix(grad.data, rows, channels_out, std.mem.alignForward(usize, rows, 128), std.mem.alignForward(usize, channels_out, 32), false);
-                    const weight_packed = try g.packMatrix(c.w.value.data, channels_out, kc, std.mem.alignForward(usize, channels_out, 32), std.mem.alignForward(usize, kc, 64), true);
-                    const dcol_half = try g.scratch(u16, rows * kc);
-                    try g.matmulPacked(grad_packed, weight_packed, dcol_half, .{ .m = rows, .n = kc, .k = channels_out }, false, false);
-                    try t.convKernel(.col2imHalf, .{ dcol_half, c.x.grad.data }, d);
-                } else if (c.x.needs_grad) {
-                    const dcol = try t.newTensor(Col);
-                    try tensor.matmulInto(t.gpa, t.par, grad, c.w.value, dcol, .{ .trans_b = true });
-                    try t.convKernel(.col2im, .{ dcol.data, c.x.grad.data }, d);
-                }
-                if (!c.w.needs_grad) return;
-                if (c.x_half.len != 0) {
-                    const g = t.par.gpu.?;
-                    const mark = g.step_used;
-                    defer g.step_used = mark;
-                    const grad_t = try g.packMatrix(grad.data, channels_out, rows, std.mem.alignForward(usize, channels_out, 128), std.mem.alignForward(usize, rows, 32), true);
-                    try g.convImplicitWeightGrad(grad_t, c.x_half, c.w.grad.data, geometry, channels_out, kc);
-                } else if (c.col_half) |half| {
-                    const g = t.par.gpu.?;
-                    const mark = g.step_used;
-                    defer g.step_used = mark;
-                    const grad_t = try g.packMatrix(grad.data, channels_out, rows, std.mem.alignForward(usize, channels_out, 128), half.rows_padded, true);
-                    try g.matmulPacked(grad_t, half, c.w.grad.data, .{ .m = channels_out, .n = kc, .k = rows }, true, true);
-                } else {
-                    try tensor.matmulInto(t.gpa, t.par, c.col, grad, c.w.grad, .{ .trans_a = true, .accumulate = true });
+                const device = t.par.gpu;
+                const mark = if (device) |g| g.step_used else 0;
+                defer if (device) |g| {
+                    g.step_used = mark;
+                };
+                switch (if (general) ConvPath.grouped else c.path) {
+                    .grouped => {
+                        if (c.x.needs_grad) try t.convKernel(.groupedInputGrad, .{ grad.data, c.w.value.data, c.x.grad.data }, d);
+                        if (c.w.needs_grad) try t.convKernel(.groupedWeightGrad, .{ c.x.value.data, grad.data, c.w.grad.data }, d);
+                    },
+                    .direct => {
+                        if (c.x.needs_grad) {
+                            const dcol = try t.newTensor(Col);
+                            try tensor.matmulInto(t.gpa, t.par, grad, c.w.value, dcol, .{ .trans_b = true });
+                            try t.convKernel(.col2im, .{ dcol.data, c.x.grad.data }, d);
+                        }
+                        if (c.w.needs_grad) try tensor.matmulInto(t.gpa, t.par, c.col, grad, c.w.grad, .{ .trans_a = true, .accumulate = true });
+                    },
+                    .packed_im2col => {
+                        const g = t.par.gpu.?;
+                        if (c.x.needs_grad) {
+                            const grad_packed = try g.packMatrix(grad.data, rows, c_out, std.mem.alignForward(usize, rows, 128), std.mem.alignForward(usize, c_out, 32), false);
+                            const weight_packed = try g.packMatrix(c.w.value.data, c_out, kc, std.mem.alignForward(usize, c_out, 32), std.mem.alignForward(usize, kc, 64), true);
+                            const dcol_half = try g.scratch(u16, rows * kc);
+                            try g.matmulPacked(grad_packed, weight_packed, dcol_half, .{ .m = rows, .n = kc, .k = c_out }, false, false);
+                            try t.convKernel(.col2imHalf, .{ dcol_half, c.x.grad.data }, d);
+                        }
+                        if (c.w.needs_grad) {
+                            const grad_t = try g.packMatrix(grad.data, c_out, rows, std.mem.alignForward(usize, c_out, 128), c.col_half.rows_padded, true);
+                            try g.matmulPacked(grad_t, c.col_half, c.w.grad.data, .{ .m = c_out, .n = kc, .k = rows }, true, true);
+                        }
+                    },
+                    .implicit => {
+                        const g = t.par.gpu.?;
+                        if (c.x.needs_grad) {
+                            const grad_half = try g.packMatrix(grad.data, rows, c_out, rows, c_out, false);
+                            const rotated = try g.packRotatedWeights(c.w.value.data, k, c_in, c_out);
+                            try g.convImplicitForward(grad_half.data, rotated, c.x.grad.data, reverse, c_in, true);
+                        }
+                        if (c.w.needs_grad) {
+                            const grad_t = try g.packMatrix(grad.data, c_out, rows, std.mem.alignForward(usize, c_out, 128), std.mem.alignForward(usize, rows, 32), true);
+                            try g.convImplicitWeightGrad(grad_t, c.x_half, c.w.grad.data, geometry, c_out, kc);
+                        }
+                    },
+                    .tf32 => {
+                        const g = t.par.gpu.?;
+                        if (c.x.needs_grad) {
+                            const rotated = try g.rotateWeightsF32(c.w.value.data, k, c_in, c_out);
+                            try g.convTf32Forward(grad.data, rotated, std.mem.alignForward(usize, c_in, 64), c.x.grad.data, reverse, c_in, true);
+                        }
+                        if (c.w.needs_grad) {
+                            const positions_padded = std.mem.alignForward(usize, rows, 32);
+                            const grad_t = try g.transposeF32(grad.data, c_out, rows, std.mem.alignForward(usize, c_out, 32), positions_padded);
+                            try g.convTf32WeightGrad(grad_t, positions_padded, c.x.value.data, c.w.grad.data, geometry, c_out, kc);
+                        }
+                    },
+                    .cudnn => {
+                        const g = t.par.gpu.?;
+                        const w_krsc = try g.weightsToKrsc(c.w.value.data, k, c_in, c_out);
+                        if (c.x.needs_grad) try g.cudnnBackwardData(cudnn_geometry, w_krsc, c.out.grad.data, c.x.grad.data);
+                        if (c.w.needs_grad) {
+                            const dw_krsc = try g.scratch(f32, w_krsc.len);
+                            try g.cudnnBackwardFilter(cudnn_geometry, c.x.value.data, c.out.grad.data, dw_krsc);
+                            try g.addKrscGradient(dw_krsc, c.w.grad.data, k, c_in, c_out);
+                        }
+                    },
                 }
             }
         }.run);
         return out;
     }
-    pub fn maxPool(self: *Tape, x: anytype) Error!Var(PoolOut(@TypeOf(x.value))) {
+    pub fn maxPool(self: *Tape, x: anytype, comptime opts: PoolOpts) Error!Var(PoolOut(@TypeOf(x.value), opts)) {
         const In = @TypeOf(x.value);
-        const d: conv.Dims = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = In.shape[3], .k = 2 };
-        const value = try self.newTensor(PoolOut(In));
+        const d: conv.Dims = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = In.shape[3], .k = opts.kernel, .stride = opts.stride, .pad = opts.pad };
+        const value = try self.newTensor(PoolOut(In, opts));
         try self.convKernel(.maxPool, .{ x.value.data, value.data }, d);
         const out = try self.makeVar(value, x.needs_grad);
+        try self.note(.max_pool, .{x}, out, .{ .kernel = opts.kernel, .stride = opts.stride, .pad = opts.pad });
         const Ctx = struct { x: @TypeOf(x), out: @TypeOf(out) };
         if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
@@ -519,6 +567,19 @@ pub const Tape = struct {
             }
         }.run);
         return out;
+    }
+
+    pub fn mse(self: *Tape, prediction: anytype, target: anytype) Error!Var(Tensor(@TypeOf(prediction.value).Elem, &.{})) {
+        const P = @TypeOf(prediction.value);
+        comptime {
+            if (P.rank != 2 or !std.mem.eql(usize, P.shape, @TypeOf(target.value).shape)) @compileError("mse expects two (batch, features) tensors of the same shape");
+        }
+        const minus_one = try self.constant(try self.filledTensor(Tensor(P.Elem, &.{}), -1));
+        const difference = try self.add(prediction, try self.mul(target, minus_one));
+        const squared = try self.mul(difference, difference);
+        const row_means = try self.matmul(squared, try self.constant(try self.filledTensor(Tensor(P.Elem, &.{ P.shape[1], 1 }), 1.0 / @as(f32, P.shape[1]))));
+        const mean = try self.matmul(try self.constant(try self.filledTensor(Tensor(P.Elem, &.{ 1, P.shape[0] }), 1.0 / @as(f32, P.shape[0]))), row_means);
+        return reshape(mean, &.{});
     }
 
     pub fn backward(self: *Tape, loss: anytype) Error!void {
@@ -738,6 +799,75 @@ const SmallNet = struct {
     }
 };
 
+const MseNet = struct {
+    const X = Tensor(f32, &.{ 4, 3 });
+    const W = Tensor(f32, &.{ 3, 2 });
+    const Y = Tensor(f32, &.{ 4, 2 });
+
+    pub const Inputs = struct { x: X, w: W, y: Y };
+    pub const names = .{ "x", "w", "y" };
+    pub const labels = [_]u8{ 0, 0, 0, 0 };
+    const Result = struct { loss: Var(Tensor(f32, &.{})), x: Var(X), w: Var(W), y: Var(Y) };
+
+    pub fn build(t: *Tape, p: Inputs, _: []const u8) !Result {
+        const x = try t.leaf(p.x);
+        const w = try t.leaf(p.w);
+        const y = try t.leaf(p.y);
+        return .{ .loss = try t.mse(try t.matmul(x, w), y), .x = x, .w = w, .y = y };
+    }
+
+    pub fn acceptable(_: Allocator, _: Inputs) !bool {
+        return true;
+    }
+};
+
+const ActivationNet = struct {
+    const X = Tensor(f32, &.{ 4, 3 });
+    const W = Tensor(f32, &.{ 3, 5 });
+    const Y = Tensor(f32, &.{ 4, 5 });
+
+    pub const Inputs = struct { x: X, w: W, y: Y };
+    pub const names = .{ "x", "w", "y" };
+    pub const labels = [_]u8{ 0, 0, 0, 0 };
+    const Result = struct { loss: Var(Tensor(f32, &.{})), x: Var(X), w: Var(W), y: Var(Y) };
+
+    pub fn build(t: *Tape, p: Inputs, _: []const u8) !Result {
+        const x = try t.leaf(p.x);
+        const w = try t.leaf(p.w);
+        const y = try t.leaf(p.y);
+        const h = try t.activate(try t.activate(try t.activate(try t.matmul(x, w), .gelu), .tanh), .sigmoid);
+        return .{ .loss = try t.mse(h, y), .x = x, .w = w, .y = y };
+    }
+
+    pub fn acceptable(_: Allocator, _: Inputs) !bool {
+        return true;
+    }
+};
+
+fn PoolCase(comptime opts: PoolOpts) type {
+    return struct {
+        const X = Tensor(f32, &.{ 2, 7, 6, 3 });
+        const Pooled = PoolOut(X, opts);
+        const Y = Tensor(f32, &.{ 2, Pooled.shape[1] * Pooled.shape[2] * 3 });
+
+        pub const Inputs = struct { x: X, y: Y };
+        pub const names = .{ "x", "y" };
+        pub const labels = [_]u8{ 0, 0 };
+        const Result = struct { loss: Var(Tensor(f32, &.{})), x: Var(X), y: Var(Y) };
+
+        pub fn build(t: *Tape, p: Inputs, _: []const u8) !Result {
+            const x = try t.leaf(p.x);
+            const y = try t.leaf(p.y);
+            const flat = reshape(try t.add(try t.maxPool(x, opts), try t.avgPool(x, opts)), &.{ 2, Y.shape[1] });
+            return .{ .loss = try t.mse(flat, y), .x = x, .y = y };
+        }
+
+        pub fn acceptable(_: Allocator, _: Inputs) !bool {
+            return true;
+        }
+    };
+}
+
 const SmoothedNet = struct {
     pub const Inputs = SmallNet.Inputs;
     pub const names = SmallNet.names;
@@ -771,7 +901,7 @@ const ConvPoolNet = struct {
         const b = try t.leaf(p.b);
         const v = try t.leaf(p.v);
         const act = try t.add(try t.conv2d(x, w, .{}), b);
-        const flat = reshape(try t.maxPool(act), &.{ 2, 12 });
+        const flat = reshape(try t.maxPool(act, .{}), &.{ 2, 12 });
         const loss = try t.crossEntropy(try t.matmul(flat, v), label_slice);
         return .{ .loss = loss, .act = act, .x = x, .w = w, .b = b, .v = v };
     }
@@ -805,7 +935,7 @@ const ConvPoolNet = struct {
 fn ConvCase(comptime opts: ConvOpts, comptime k: usize, comptime c_in: usize, comptime c_out: usize) type {
     return struct {
         const In = Tensor(f32, &.{ 2, 5, 5, c_in });
-        const Wt = Tensor(f32, &.{ k * k * c_in, c_out });
+        const Wt = Tensor(f32, &.{ k * k * c_in / opts.groups, c_out });
         const Out = ConvOut(In, Wt, opts);
 
         pub const Inputs = struct { x: In, w: Wt };
@@ -835,13 +965,15 @@ fn ConvCase(comptime opts: ConvOpts, comptime k: usize, comptime c_in: usize, co
                     for (0..ow) |ox| {
                         for (0..c_out) |oc| {
                             var want: f32 = 0;
+                            const per_group = c_in / opts.groups;
+                            const group = oc / (c_out / opts.groups);
                             for (0..k) |ky| {
                                 for (0..k) |kx| {
-                                    const py = oy * opts.stride + ky;
-                                    const px = ox * opts.stride + kx;
+                                    const py = oy * opts.stride + ky * opts.dilation;
+                                    const px = ox * opts.stride + kx * opts.dilation;
                                     if (py < opts.pad or px < opts.pad or py - opts.pad >= 5 or px - opts.pad >= 5) continue;
-                                    for (0..c_in) |c| {
-                                        want += p.x.data[((n * 5 + py - opts.pad) * 5 + px - opts.pad) * c_in + c] * p.w.data[((ky * k + kx) * c_in + c) * c_out + oc];
+                                    for (0..per_group) |c| {
+                                        want += p.x.data[((n * 5 + py - opts.pad) * 5 + px - opts.pad) * c_in + group * per_group + c] * p.w.data[((ky * k + kx) * per_group + c) * c_out + oc];
                                     }
                                 }
                             }
@@ -1035,6 +1167,101 @@ test "gpu and cpu agree on a small network" {
     try gradcheck.expectTensorCoresClose(SmallNet, 21, 3e-2);
 }
 
+test "mse is the mean squared difference and its gradients point towards the target" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var t: Tape = .{ .gpa = arena.allocator() };
+    const prediction = try t.leaf(try Tensor(f32, &.{ 2, 2 }).fromSlice(t.gpa, &.{ 1, 2, 3, 4 }));
+    const target = try t.leaf(try Tensor(f32, &.{ 2, 2 }).fromSlice(t.gpa, &.{ 0, 0, 0, 0 }));
+    const loss = try t.mse(prediction, target);
+    try t.backward(loss);
+
+    try testing.expectEqual(@as(f32, 7.5), loss.value.data[0]);
+    try testing.expectEqualSlices(f32, &.{ 0.5, 1, 1.5, 2 }, prediction.grad.data);
+    try testing.expectEqualSlices(f32, &.{ -0.5, -1, -1.5, -2 }, target.grad.data);
+}
+
+test "gradients of the mse loss match finite differences and the gpu" {
+    try gradcheck.expectFiniteDifferences(MseNet, 7, 5e-3, 3e-3);
+    try gradcheck.expectGpuMatchesCpu(MseNet, 21, 1e-5);
+}
+
+test "gradients through gelu, tanh and sigmoid match finite differences and the gpu" {
+    try gradcheck.expectFiniteDifferences(ActivationNet, 7, 5e-3, 3e-3);
+    try gradcheck.expectGpuMatchesCpu(ActivationNet, 21, 2e-5);
+}
+
+fn expectPoolingMatchesReference(comptime opts: PoolOpts) !void {
+    const X = Tensor(f32, &.{ 2, 7, 6, 3 });
+    const P = PoolOut(X, opts);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const x_values = try a.alloc(f32, X.len);
+    for (x_values, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i * 37 % X.len)) * 0.05;
+    const targets = try a.alloc(f32, P.len);
+    for (targets, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 7)) * 0.3;
+
+    var t: Tape = .{ .gpa = a };
+    const x = try t.leaf(try X.fromSlice(a, x_values));
+    const pooled = try t.add(try t.maxPool(x, opts), try t.avgPool(x, opts));
+    const loss = try t.mse(reshape(pooled, &.{ 2, P.len / 2 }), try t.constant(try Tensor(f32, &.{ 2, P.len / 2 }).fromSlice(a, targets)));
+    try t.backward(loss);
+
+    const reference = try a.alloc(f32, P.len);
+    const upstream = try a.alloc(f32, P.len);
+    const expected_grad = try a.alloc(f32, X.len);
+    @memset(expected_grad, 0);
+    var oy: usize = 0;
+    const side_y = X.shape[1];
+    const side_x = X.shape[2];
+    const out_h = P.shape[1];
+    const out_w = P.shape[2];
+    for (0..2) |n| {
+        oy = 0;
+        while (oy < out_h) : (oy += 1) {
+            for (0..out_w) |ox| {
+                for (0..3) |ch| {
+                    var best: ?usize = null;
+                    var total: f32 = 0;
+                    var count: f32 = 0;
+                    for (0..opts.kernel) |ky| {
+                        for (0..opts.kernel) |kx| {
+                            const yy = oy * opts.stride + ky;
+                            const xx = ox * opts.stride + kx;
+                            if (yy < opts.pad or xx < opts.pad or yy - opts.pad >= side_y or xx - opts.pad >= side_x) continue;
+                            const at = ((n * side_y + yy - opts.pad) * side_x + xx - opts.pad) * 3 + ch;
+                            if (best == null or x_values[at] > x_values[best.?]) best = at;
+                            total += x_values[at];
+                            count += 1;
+                        }
+                    }
+                    const j = ((n * out_h + oy) * out_w + ox) * 3 + ch;
+                    reference[j] = x_values[best.?] + total / count;
+                    upstream[j] = 2 * (reference[j] - targets[j]) / @as(f32, @floatFromInt(P.len));
+                    expected_grad[best.?] += upstream[j];
+                    for (0..opts.kernel) |ky| {
+                        for (0..opts.kernel) |kx| {
+                            const yy = oy * opts.stride + ky;
+                            const xx = ox * opts.stride + kx;
+                            if (yy < opts.pad or xx < opts.pad or yy - opts.pad >= side_y or xx - opts.pad >= side_x) continue;
+                            expected_grad[((n * side_y + yy - opts.pad) * side_x + xx - opts.pad) * 3 + ch] += upstream[j] / count;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (reference, pooled.value.data) |want, got| try testing.expectApproxEqAbs(want, got, 1e-5);
+    for (expected_grad, x.grad.data) |want, got| try testing.expectApproxEqAbs(want, got, 1e-5);
+}
+
+test "pooling with other windows, strides and padding matches a brute-force reference, also on the gpu" {
+    inline for (.{ PoolOpts{}, PoolOpts{ .kernel = 3, .stride = 2 }, PoolOpts{ .kernel = 3, .stride = 2, .pad = 1 }, PoolOpts{ .kernel = 3, .stride = 1, .pad = 1 }, PoolOpts{ .kernel = 2, .stride = 1 } }) |opts| {
+        try expectPoolingMatchesReference(opts);
+        try gradcheck.expectGpuMatchesCpu(PoolCase(opts), 6, 1e-5);
+    }
+}
 test "label smoothing blends the target and its gradient with the uniform distribution" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1076,6 +1303,21 @@ test "conv2d with padding and stride matches a direct convolution, finite differ
     }
 }
 
+test "grouped, depthwise and dilated convolutions match a direct convolution, finite differences and the gpu" {
+    inline for (.{
+        .{ ConvOpts{ .pad = 1, .groups = 2 }, 3, 4, 6 },
+        .{ ConvOpts{ .pad = 1, .groups = 4 }, 3, 4, 4 },
+        .{ ConvOpts{ .pad = 2, .dilation = 2 }, 3, 3, 4 },
+        .{ ConvOpts{ .stride = 2, .pad = 2, .dilation = 2, .groups = 2 }, 3, 4, 2 },
+        .{ ConvOpts{ .dilation = 2, .groups = 2 }, 2, 2, 4 },
+    }) |config| {
+        const Case = ConvCase(config[0], config[1], config[2], config[3]);
+        try Case.expectDirectConvolution();
+        try gradcheck.expectFiniteDifferences(Case, 34, 1e-3, 3e-3);
+        try gradcheck.expectGpuMatchesCpu(Case, 35, 1e-5);
+    }
+}
+
 test "implicit-GEMM convolutions on tensor cores match a direct convolution and the cpu" {
     inline for (.{ .{ ConvOpts{ .pad = 1 }, 3, 64, 32 }, .{ ConvOpts{}, 3, 64, 64 }, .{ ConvOpts{ .pad = 1 }, 3, 128, 64 }, .{ ConvOpts{}, 1, 64, 128 } }) |config| {
         const Case = ConvCase(config[0], config[1], config[2], config[3]);
@@ -1103,7 +1345,7 @@ test "average pooling takes window means and spreads gradients evenly, also on t
 
     var t: Tape = .{ .gpa = arena.allocator() };
     const x = try t.leaf(try Img.fromSlice(t.gpa, &values));
-    const y = try t.avgPool(x);
+    const y = try t.avgPool(x, .{});
     try testing.expectEqualSlices(f32, &.{ 2.5, 25, 6.5, 0 }, y.value.data);
     @memset(y.grad.data, 4);
     try t.nodes.items[0].run(&t, t.nodes.items[0].ctx);
@@ -1114,7 +1356,7 @@ test "average pooling takes window means and spreads gradients evenly, also on t
     try gpu.upload(dev_x, &values);
     try gpu.fill(dx, 0);
     var gpu_tape: Tape = .{ .gpa = arena.allocator(), .par = .{ .gpu = gpu } };
-    const gy = try gpu_tape.avgPool(Var(Img){ .value = .{ .data = dev_x }, .grad = .{ .data = dx }, .needs_grad = true });
+    const gy = try gpu_tape.avgPool(Var(Img){ .value = .{ .data = dev_x }, .grad = .{ .data = dx }, .needs_grad = true }, .{});
     var back: [4]f32 = undefined;
     try gpu.download(&back, gy.value.data);
     try testing.expectEqualSlices(f32, y.value.data, &back);

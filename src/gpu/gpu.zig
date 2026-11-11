@@ -12,6 +12,7 @@ pub const Error = Allocator.Error || error{ DriverNotFound, MissingSymbol, CudaF
 pub const BinaryOp = enum { add, mul };
 
 pub const Augment = @import("math/augment.zig").Config;
+pub const Activation = @import("math/activation.zig").Kind;
 
 pub const MatmulOpts = struct { trans_a: bool = false, trans_b: bool = false, accumulate: bool = false };
 
@@ -55,6 +56,8 @@ const Kernel = enum {
     elementwise,
     relu,
     reluBackward,
+    activation,
+    activationBackward,
     addRelu,
     addReluBackward,
     addInPlace,
@@ -69,6 +72,9 @@ const Kernel = enum {
     im2col,
     col2im,
     col2imHalf,
+    groupedForward,
+    groupedInputGrad,
+    groupedWeightGrad,
     maxPool,
     maxPoolBackward,
     avgPool,
@@ -508,6 +514,14 @@ pub const Gpu = struct {
 
     pub fn reluBackward(self: *Gpu, x: []const f32, g_out: []const f32, g_in: []f32) Error!void {
         try self.launchFlat(.reluBackward, x.len, .{ x, g_out, g_in, x.len });
+    }
+
+    pub fn activation(self: *Gpu, x: []const f32, out: []f32, kind: Activation) Error!void {
+        try self.launchFlat(.activation, x.len, .{ x, out, x.len, kind });
+    }
+
+    pub fn activationBackward(self: *Gpu, x: []const f32, y: []const f32, g_out: []const f32, g_in: []f32, kind: Activation) Error!void {
+        try self.launchFlat(.activationBackward, x.len, .{ x, y, g_out, g_in, x.len, kind });
     }
 
     pub fn addRelu(self: *Gpu, a: []const f32, b: []const f32, out: []f32) Error!void {

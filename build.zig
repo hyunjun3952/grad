@@ -31,7 +31,7 @@ pub fn build(b: *std.Build) void {
 
     config.addOption(bool, "cifar100", b.option(bool, "cifar100", "cifar example: train on CIFAR-100 (data/cifar100) instead of CIFAR-10") orelse false);
 
-    inline for (.{ "mnist", "cifar" }) |name| {
+    inline for (.{ "mnist", "cifar", "regression", "charlm", "onnx" }) |name| {
         const exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{

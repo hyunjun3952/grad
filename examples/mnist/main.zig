@@ -22,6 +22,7 @@ const Mnist = struct {
     pub const channels = 1;
     pub const classes = digits;
     pub const batch = config.batch;
+    pub const batches = [_]usize{ 16, 32, 64, 128, 256, 512 };
     pub const eval_batch = 1000;
     pub const learning_rate = 0.002;
     pub const weight_decay = 0.01;
@@ -35,8 +36,8 @@ const Mnist = struct {
         const c1, const n1, const c2, const n2, const fc = model;
         const n = @TypeOf(x.value).shape[0];
         const image = grad.autograd.reshape(x, &.{ n, 28, 28, 1 });
-        const a = try tape.maxPool(try tape.relu(try n1.forward(tape, try c1.forward(tape, image))));
-        const b = try tape.maxPool(try tape.relu(try n2.forward(tape, try c2.forward(tape, a))));
+        const a = try tape.maxPool(try tape.relu(try n1.forward(tape, try c1.forward(tape, image))), .{});
+        const b = try tape.maxPool(try tape.relu(try n2.forward(tape, try c2.forward(tape, a))), .{});
         return fc.forward(tape, try tape.dropout(grad.autograd.reshape(b, &.{ n, 512 }), 0.7));
     }
 };

@@ -144,7 +144,7 @@ pub fn BatchNorm(comptime c: usize) type {
 }
 
 pub fn Conv2d(comptime c_in: usize, comptime c_out: usize, comptime k: usize, comptime opts: autograd.ConvOpts) type {
-    const Inner = Linear(k * k * c_in, c_out);
+    const Inner = Linear(k * k * c_in / opts.groups, c_out);
 
     return struct {
         const Self = @This();
@@ -220,6 +220,62 @@ pub fn ConvBn(comptime c_in: usize, comptime c_out: usize, comptime k: usize, co
     };
 }
 
+pub fn Gru(comptime n_in: usize, comptime hidden: usize) type {
+    const Input = Linear(n_in, hidden);
+    const Recurrent = Linear(hidden, hidden);
+
+    return struct {
+        const Self = @This();
+
+        update_x: Input,
+        update_h: Recurrent,
+        reset_x: Input,
+        reset_h: Recurrent,
+        candidate_x: Input,
+        candidate_h: Recurrent,
+
+        pub fn init(gpa: Allocator, rng: std.Random) Allocator.Error!Self {
+            const update_x = try Input.init(gpa, rng);
+            errdefer update_x.deinit(gpa);
+            const update_h = try Recurrent.init(gpa, rng);
+            errdefer update_h.deinit(gpa);
+            const reset_x = try Input.init(gpa, rng);
+            errdefer reset_x.deinit(gpa);
+            const reset_h = try Recurrent.init(gpa, rng);
+            errdefer reset_h.deinit(gpa);
+            const candidate_x = try Input.init(gpa, rng);
+            errdefer candidate_x.deinit(gpa);
+            return .{ .update_x = update_x, .update_h = update_h, .reset_x = reset_x, .reset_h = reset_h, .candidate_x = candidate_x, .candidate_h = try Recurrent.init(gpa, rng) };
+        }
+
+        pub fn deinit(self: Self, gpa: Allocator) void {
+            inline for (@typeInfo(Self).@"struct".field_names) |name| @field(self, name).deinit(gpa);
+        }
+
+        pub fn toGpu(self: Self, gpu: *Gpu) autograd.Error!Self {
+            var out: Self = undefined;
+            inline for (@typeInfo(Self).@"struct".field_names) |name| @field(out, name) = try @field(self, name).toGpu(gpu);
+            return out;
+        }
+
+        pub fn forward(self: Self, tape: *Tape, x: anytype, h: anytype) autograd.Error!@TypeOf(h) {
+            const update = try tape.activate(try tape.add(try self.update_x.forward(tape, x), try self.update_h.forward(tape, h)), .sigmoid);
+            const reset = try tape.activate(try tape.add(try self.reset_x.forward(tape, x), try self.reset_h.forward(tape, h)), .sigmoid);
+            const candidate = try tape.activate(try tape.add(try self.candidate_x.forward(tape, x), try self.candidate_h.forward(tape, try tape.mul(reset, h))), .tanh);
+            const minus_one = try tape.constant(try tape.filledTensor(Tensor(f32, &.{}), -1));
+            return tape.add(candidate, try tape.mul(update, try tape.add(h, try tape.mul(candidate, minus_one))));
+        }
+
+        pub fn params(self: Self) @TypeOf(self.update_x.params() ++ self.update_h.params() ++ self.reset_x.params() ++ self.reset_h.params() ++ self.candidate_x.params() ++ self.candidate_h.params()) {
+            return self.update_x.params() ++ self.update_h.params() ++ self.reset_x.params() ++ self.reset_h.params() ++ self.candidate_x.params() ++ self.candidate_h.params();
+        }
+
+        pub fn state(self: Self) @TypeOf(self.update_x.state() ++ self.update_h.state() ++ self.reset_x.state() ++ self.reset_h.state() ++ self.candidate_x.state() ++ self.candidate_h.state()) {
+            return self.update_x.state() ++ self.update_h.state() ++ self.reset_x.state() ++ self.reset_h.state() ++ self.candidate_x.state() ++ self.candidate_h.state();
+        }
+    };
+}
+
 fn Gathered(comptime Layers: type, comptime method: []const u8) type {
     comptime var types: []const type = &.{};
     inline for (@typeInfo(Layers).@"struct".field_types) |Layer| {
@@ -288,6 +344,78 @@ test "layer tuples initialise, concatenate parameters and state in order, and fr
     try testing.expectEqual(@as(usize, 13), all_state.len);
     try testing.expectEqual(layers[1].variance.data.ptr, all_state[5].ptr);
     try testing.expectEqual(@as(usize, 2 * 3), all_state[0].len);
+}
+
+test "a gru with zero weights halves the state, and its gradients match finite differences and the gpu" {
+    const gpa = testing.allocator;
+    const Cell = Gru(3, 4);
+    var prng = std.Random.DefaultPrng.init(5);
+    const cell = try Cell.init(gpa, prng.random());
+    defer cell.deinit(gpa);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const x_values = [_]f32{ 0.5, -1, 0.25, 1, 0.3, -0.7 };
+    const h_values = [_]f32{ 0.2, -0.4, 0.6, 0.1, -0.3, 0.5, 0.9, -0.8 };
+    const target_values = [_]f32{ 0.1, 0.2, -0.3, 0.4, 0.5, -0.6, 0.7, 0.0 };
+
+    {
+        var zeroed = cell;
+        inline for (@typeInfo(Cell).@"struct".field_names) |name| {
+            @memset(@field(zeroed, name).w.value.data, 0);
+        }
+        var tape: Tape = .{ .gpa = arena.allocator() };
+        const h = try tape.constant(try Tensor(f32, &.{ 2, 4 }).fromSlice(arena.allocator(), &h_values));
+        const x = try tape.constant(try Tensor(f32, &.{ 2, 3 }).fromSlice(arena.allocator(), &x_values));
+        const next = try zeroed.forward(&tape, x, h);
+        for (next.value.data, h_values) |got, old| try testing.expectApproxEqAbs(0.5 * old, got, 1e-6);
+    }
+
+    const loss_at = struct {
+        fn run(a: Allocator, c: Cell, h_data: []const f32) !f32 {
+            var tape: Tape = .{ .gpa = a };
+            const h = try tape.leaf(try Tensor(f32, &.{ 2, 4 }).fromSlice(a, h_data));
+            const x = try tape.constant(try Tensor(f32, &.{ 2, 3 }).fromSlice(a, &x_values));
+            const target = try tape.constant(try Tensor(f32, &.{ 2, 4 }).fromSlice(a, &target_values));
+            const loss = try tape.mse(try c.forward(&tape, x, h), target);
+            return loss.value.data[0];
+        }
+    }.run;
+
+    var tape: Tape = .{ .gpa = arena.allocator() };
+    const h = try tape.leaf(try Tensor(f32, &.{ 2, 4 }).fromSlice(arena.allocator(), &h_values));
+    const x = try tape.constant(try Tensor(f32, &.{ 2, 3 }).fromSlice(arena.allocator(), &x_values));
+    const target = try tape.constant(try Tensor(f32, &.{ 2, 4 }).fromSlice(arena.allocator(), &target_values));
+    const loss = try tape.mse(try cell.forward(&tape, x, h), target);
+    try tape.backward(loss);
+    for (0..h_values.len) |i| {
+        var plus = h_values;
+        var minus = h_values;
+        plus[i] += 1e-2;
+        minus[i] -= 1e-2;
+        const numeric = (try loss_at(arena.allocator(), cell, &plus) - try loss_at(arena.allocator(), cell, &minus)) / 2e-2;
+        try testing.expectApproxEqAbs(numeric, h.grad.data[i], 2e-3);
+    }
+
+    const gpu = Gpu.init(gpa, 1 << 22) catch |err| switch (err) {
+        error.DriverNotFound => return,
+        else => return err,
+    };
+    defer gpu.deinit();
+    const on_gpu = try cell.toGpu(gpu);
+    var gpu_tape: Tape = .{ .gpa = arena.allocator(), .par = .{ .gpu = gpu } };
+    const gpu_h = try gpu_tape.leaf(Tensor(f32, &.{ 2, 4 }){ .data = try gpu.alloc(f32, h_values.len) });
+    try gpu.upload(gpu_h.value.data, &h_values);
+    try gpu.fill(gpu_h.grad.data, 0);
+    const gpu_x = try gpu_tape.constant(Tensor(f32, &.{ 2, 3 }){ .data = try gpu.alloc(f32, x_values.len) });
+    try gpu.upload(gpu_x.value.data, &x_values);
+    const gpu_target = try gpu_tape.constant(Tensor(f32, &.{ 2, 4 }){ .data = try gpu.alloc(f32, target_values.len) });
+    try gpu.upload(gpu_target.value.data, &target_values);
+    const gpu_loss = try gpu_tape.mse(try on_gpu.forward(&gpu_tape, gpu_x, gpu_h), gpu_target);
+    try gpu_tape.backward(gpu_loss);
+    var back: [8]f32 = undefined;
+    try gpu.download(&back, gpu_h.grad.data);
+    for (back, h.grad.data) |got, want| try testing.expectApproxEqAbs(want, got, 1e-5);
 }
 
 test "a failing layer initialisation releases the layers built before it" {

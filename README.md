@@ -11,12 +11,12 @@ The goal is an engine that sits between "C with pointers" and "PyTorch": plain s
 | CIFAR-10 | ResNet-14, widths 64-128-256 | 94.1% (50 epochs) to 94.9% (100 epochs); flip + shift + CutMix + label smoothing + EMA, +0.4 with `--tta` | 17.2 s GPU (bf16 tensor cores), 24.6 s (TF32), 52.8 s (strict f32) |
 | CIFAR-10 | ResNet-14, widths 64-192-384 (`-Dwide=true`) | 94.8% / 95.3% with `--tta` (50 epochs), 95.4% / **96.2%** with `--tta` (100 epochs); same recipe | 24.7 s GPU (bf16 tensor cores) |
 
-Measured on an i5-8500 (6 cores) and an RTX 3060 12 GB. About 5,200 lines including 66 tests, with no comments except for explained magic numbers.
+Measured on an i5-8500 (6 cores) and an RTX 3060 12 GB. About 7,600 lines including 81 tests, with no comments except for explained magic numbers.
 
 ## Highlights
 
 - **Compile-time shapes.** `Tensor(f32, &.{ 64, 784 })` carries its shape in the type, so a wrong `matmul`, `add` or `reshape` is a compile error. Data lives on the heap.
-- **Small autograd.** A type-erased `Tape` records closures; `Var{ value, grad, needs_grad }` is a plain struct. Ops: `add`, `mul`, `matmul`, `relu`, `conv2d`, `maxPool`, `avgPool`, `batchNorm`, `dropout`, `crossEntropy`, `reshape`.
+- **Small autograd.** A type-erased `Tape` records closures; `Var{ value, grad, needs_grad }` is a plain struct. Ops: `add`, `mul`, `matmul`, `relu`, `conv2d`, `maxPool`, `avgPool`, `batchNorm`, `dropout`, `crossEntropy`, `mse`, `sigmoid`/`tanh`/`gelu` (`Tape.activate`), `reshape`. Layers: `Linear`, `Conv2d` (stride, padding, dilation, groups), `BatchNorm`, `ConvBn`, `Gru`. `maxPool`/`avgPool` take a window, stride and padding (`PoolOpts`).
 - **One code path for CPU and GPU.** Pass `kernels.Parallel{ .io, .threads, .gpu }` and everything (tape, optimizers, matmul) dispatches to the CPU worker pool or to the device. Per-element math such as `im2col`, dropout, batch-norm and augmentation is written once and shared by both backends.
 - **GPU without a toolkit.** `src/gpu/device.zig` is compiled for `nvptx64-cuda` / `sm_86`, embedded as PTX and loaded with `cuModuleLoadData`. It contains tiled FP32 GEMM (about 5 TFLOPS), a bf16 tensor-core GEMM using `cp.async`, `ldmatrix` and `mma.sync` with a three-stage pipeline (about 21 TFLOPS at 4096, 23.7 without operand packing), reductions, fused multi-tensor Adam, and so on. Convolutions with 64 or more input channels run as implicit GEMMs: the tensor-core kernel gathers its operand tiles straight from the NHWC activations with zero-filled `cp.async` (forward, input gradient via rotated weights, and weight gradient), so no im2col buffer is ever written. Batch norm + ReLU and add + ReLU are fused ops. On the CIFAR ResNet-14 the bf16 path makes an epoch 3.1x faster than FP32 with the same accuracy.
 - **Tested against references.** Every GPU op is compared with the CPU, gradients with finite differences, convolutions with a direct implementation, and bf16 GEMM with a CPU reference built from the same rounded inputs. Resuming from a checkpoint reproduces uninterrupted training bit for bit.
@@ -31,8 +31,10 @@ Measured on an i5-8500 (6 cores) and an RTX 3060 12 GB. About 5,200 lines includ
 
 ```powershell
 zig build test
-powershell -File scripts/fetch-data.ps1            # MNIST, Fashion-MNIST, CIFAR-10 and CIFAR-100 into data/ (or -Dataset NAME)
+powershell -File scripts/fetch-data.ps1            # MNIST, Fashion-MNIST, CIFAR-10, CIFAR-100 and Tiny Shakespeare into data/ (or -Dataset NAME)
 
+zig build regression                                # fit a curve with a small MLP (library API without the trainer)
+zig build charlm -- 1500 --gpu                      # character-level GRU on Tiny Shakespeare, then sample text
 zig build mnist -- 5                                # MLP on the CPU
 zig build mnist -- 5 --gpu                          # MLP on the GPU
 zig build mnist -Dcnn=true -- 30 --gpu --shift=1 --rotate=8 --zoom=0.05
@@ -59,6 +61,10 @@ Build options such as `-Dcnn=true -Dhidden=2048 -Dbatch=256` go before the `--`;
 | `--tta` | After training, also report the test accuracy with every test image averaged with its mirror image (about +0.4 points on CIFAR-10). With `--load` and `--until=0` it evaluates a checkpoint. |
 | `--warmup=N` | Ramp the learning rate linearly over the first N epochs, then follow the cosine schedule. |
 | `--ema=D` | Keep an exponential moving average of all weights and batch-norm statistics (decay D, e.g. 0.999) and report its test accuracy next to the raw one. Stored in checkpoints. |
+| `--batch=N` | Training batch size. The shapes are compile-time, so only the sizes listed in the program's Spec.batches exist in the binary (MNIST: 16 to 512, CIFAR: 32, 64, 128); other values are refused. |
+| `--lr=F` | Base learning rate (default: the program's own). |
+| `--predict=N` | Print the prediction and confidence for the first N test images (and the logits of image 0). With `--load` this classifies with a saved checkpoint. |
+| `--onnx=PATH` | Export the model as an ONNX file (see below). |
 | `--smoothing=F` | Label smoothing for the cross-entropy loss (CPU and GPU). |
 | `--save=PATH`, `--load=PATH` | Write or read a checkpoint (weights, batch-norm statistics, Adam state, progress). |
 | `--until=N` | Stop after epoch `N` but keep the schedule of the full run, so that a later `--load` continues exactly. |
@@ -66,6 +72,18 @@ Build options such as `-Dcnn=true -Dhidden=2048 -Dbatch=256` go before the `--`;
 | `--profile` | Print per-kernel GPU timings (every op is synchronised, so absolute numbers are inflated). |
 
 The optimizer is AdamW with a cosine schedule. Checkpoints are portable between CPU and GPU.
+
+## ONNX export
+
+`--onnx=PATH` writes the trained (or loaded) network as an ONNX model (opset 20, no dependencies, hand-written protobuf). The network is run once in evaluation mode while the tape records every op (`Tape.trace`); the recording is turned into a graph with the weights as initialisers. Convolutions and pools are wrapped in layout transposes because the engine is NHWC and ONNX is NCHW, batch norm becomes a per-channel scale and shift, dropout disappears, and reshapes are inserted where a tensor is viewed with another shape. Supported ops: `add`, `mul`, `matmul`, `relu`, `sigmoid`, `tanh`, `gelu`, `conv2d`, `maxPool`, `avgPool`, `batchNorm`, `addRelu`.
+
+```powershell
+zig build cifar -- 1 --gpu --predict=1 --onnx=model.onnx
+pip install numpy onnx
+python scripts/check-onnx.py model.onnx cifar <the ten logits printed above>
+```
+
+The script runs the model in the ONNX reference evaluator and compares it with the engine; the MLP, the MNIST CNN and the CIFAR ResNet-14 agree to 5e-6, so the file can be loaded by onnxruntime, OpenVINO and so on, from Python or any other language. Importing is a separate, run-time-shaped inference engine (grad.onnx.Model, src/onnx/runtime.zig), because a graph read at run time has no compile-time type to live in. It runs on the CPU and supports Conv (strides, pads, dilations, groups), MaxPool, AveragePool, GlobalAveragePool, BatchNormalization, Gemm, MatMul, Add/Sub/Mul/Div with broadcasting, Relu, Sigmoid, Tanh, Gelu, Softmax, Flatten, Reshape, Transpose, Concat, Identity, Dropout. zig build onnx -- model.onnx mnist|cifar 1000 loads a model and measures its accuracy; it reproduces the logits of the engine that exported it to 5 digits. Training an imported graph is not possible.
 
 ## Optional cuDNN backend
 
@@ -91,13 +109,17 @@ src/
   tensor/                Tensor(T, shape), broadcasting ops
   cpu/kernels.zig        worker pool, tiled matmul, flush-denormals
   autograd/              Tape and Var, finite-difference / GPU-vs-CPU test helpers
-  nn/                    Linear, Conv2d, BatchNorm, ConvBn, Adam, checkpoints, trainer
-  data/                  MNIST and CIFAR-10 loaders
+  nn/                    Linear, Conv2d, BatchNorm, ConvBn, Gru, Adam, checkpoints, trainer
+  onnx/                  ONNX export from a recorded tape
+  data/                  MNIST / Fashion-MNIST and CIFAR-10 / CIFAR-100 loaders
   gpu/                   driver loader, runtime, device kernels (PTX), parity tests
     math/                per-element math shared by the CPU and the device
 examples/
-  mnist/  cifar/         the two training programs
+  mnist/  cifar/         image-classification programs built on the trainer
+  regression/            a hand-written training loop: MLP, mse, Adam
+  charlm/                a character-level GRU unrolled over 64 steps, with text generation
 scripts/fetch-data.ps1   dataset download with checksum verification
+scripts/check-onnx.py    compare an exported ONNX file with the engine (needs numpy and onnx)
 ```
 
 ## A complete training program
@@ -140,6 +162,7 @@ A layer is any struct with `init`, `deinit`, `toGpu`, `forward`, `params` and `s
 ## Limitations
 
 - Windows-only GPU loader, f32 tensors (bf16 only inside GEMM), activations in NHWC, tensors of rank 4 or less on the GPU.
-- 2x2 pooling only; convolutions have stride and padding but no dilation or groups.
-- Batch sizes are compile-time constants.
+- Grouped and dilated convolutions use a simple one-thread-per-output kernel (correct but not tuned); only the dense stride-1 shapes get the tensor-core paths.
+- Batch sizes are compile-time constants; a program lists the sizes it is built for (`--batch=N` picks one).
+- ONNX files can be imported for CPU inference only, and only single-input graphs can be exported.
 - Training is single-GPU and deterministic on the CPU; GPU runs differ in the last bits because of atomic accumulation.

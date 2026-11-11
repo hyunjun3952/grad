@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('mnist', 'fashion', 'cifar', 'cifar100', 'all')] [string] $Dataset = 'all',
+    [ValidateSet('mnist', 'fashion', 'cifar', 'cifar100', 'text', 'all')] [string] $Dataset = 'all',
     [string] $Root = 'data'
 )
 
@@ -49,6 +49,18 @@ if ($Dataset -in 'fashion', 'all') {
         Remove-Item $archive
     }
     Write-Host "Fashion-MNIST ready in $dir"
+}
+
+if ($Dataset -in 'text', 'all') {
+    $dir = Join-Path $Root 'text'
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    $target = Join-Path $dir 'shakespeare.txt'
+    if (-not (Test-Path $target)) {
+        Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt' -OutFile $target
+        $hash = (Get-FileHash $target -Algorithm MD5).Hash.ToLower()
+        if ($hash -ne '6fb458f1232090904fb40fe944165e91') { throw "unexpected Tiny Shakespeare checksum $hash" }
+    }
+    Write-Host "Tiny Shakespeare ready in $dir"
 }
 
 if ($Dataset -in 'cifar100', 'all') {
