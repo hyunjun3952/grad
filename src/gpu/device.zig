@@ -281,9 +281,31 @@ export fn columnReduce(args: ga.ColumnArgs) callconv(.nvptx_kernel) void {
             total_first += column.first[lane + 32 * g];
             total_second += column.second[lane + 32 * g];
         }
-        _ = @atomicRmw(f32, &out[ch], .Add, total_first, .monotonic);
-        if (kind != 0) _ = @atomicRmw(f32, &out[c + ch], .Add, total_second, .monotonic);
+        if (args.ordered != 0) {
+            const mine = args.partial + @as(usize, @workGroupId(0)) * 2 * c;
+            mine[ch] = total_first;
+            mine[c + ch] = total_second;
+        } else {
+            _ = @atomicRmw(f32, &out[ch], .Add, total_first, .monotonic);
+            if (kind != 0) _ = @atomicRmw(f32, &out[c + ch], .Add, total_second, .monotonic);
+        }
     }
+}
+
+export fn splitCombine(ws: [*]const f32, out: [*]f32, splits: u32, stride: u32, accumulate: u32) callconv(.nvptx_kernel) void {
+    const i = globalIndex();
+    if (i >= stride) return;
+    var total: f32 = 0;
+    for (0..splits) |z| total += ws[z * stride + i];
+    out[i] = (if (accumulate != 0) out[i] else 0) + total;
+}
+
+export fn columnCombine(partial: [*]const f32, out: [*]f32, blocks: u32, width: u32, stride: u32) callconv(.nvptx_kernel) void {
+    const i = globalIndex();
+    if (i >= width) return;
+    var total: f32 = 0;
+    for (0..blocks) |b| total += partial[b * stride + i];
+    out[i] += total;
 }
 
 export fn batchNormFinish(sums: [*]const f32, shift: [*]const f32, st: nm.Stats, l: nm.Layout) callconv(.nvptx_kernel) void {
@@ -815,6 +837,8 @@ inline fn storeTile(comptime kind: GemmKind, c: [*]f32, acc: *const Acc, shape: 
                     if (half_output and shape.output_half != 0) {
                         const half_out: [*]u16 = @ptrCast(@alignCast(c));
                         half_out[at] = bf16.encode(acc[mi][ni][q]);
+                    } else if (shape.split_stride != 0) {
+                        c[@as(usize, @workGroupId(2)) * shape.split_stride + at] = acc[mi][ni][q];
                     } else if (shape.chunk < shape.k_padded) {
                         _ = @atomicRmw(f32, &c[at], .Add, acc[mi][ni][q], .monotonic);
                     } else {

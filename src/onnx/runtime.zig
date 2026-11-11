@@ -468,6 +468,32 @@ fn pair(list: []const i64, index: usize, default: usize) usize {
     return if (index < list.len) @intCast(list[index]) else default;
 }
 
+const Window = struct { c: usize, h: usize, w: usize, kh: usize, kw: usize, sy: usize, sx: usize, py: usize, px: usize, dy: usize, dx: usize, oh: usize, ow: usize };
+
+fn planarColumns(x: []const f32, col: []f32, v: Window) void {
+    const positions = v.oh * v.ow;
+    for (0..v.c) |ic| {
+        for (0..v.kh) |ky| {
+            for (0..v.kw) |kx| {
+                const row = col[((ic * v.kh + ky) * v.kw + kx) * positions ..][0..positions];
+                for (0..v.oh) |oy| {
+                    const iy = oy * v.sy + ky * v.dy;
+                    const line = row[oy * v.ow ..][0..v.ow];
+                    if (iy < v.py or iy - v.py >= v.h) {
+                        @memset(line, 0);
+                        continue;
+                    }
+                    const source = x[(ic * v.h + iy - v.py) * v.w ..][0..v.w];
+                    for (line, 0..) |*o, ox| {
+                        const ix = ox * v.sx + kx * v.dx;
+                        o.* = if (ix < v.px or ix - v.px >= v.w) 0 else source[ix - v.px];
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn convolve(a: Allocator, par: kernels.Parallel, node: Node, x: Array, w: Array, bias: ?Array) Error!Array {
     if (x.dims.len != 4 or w.dims.len != 4) return error.UnsupportedOp;
     const n = x.dims[0];
@@ -492,6 +518,24 @@ fn convolve(a: Allocator, par: kernels.Parallel, node: Node, x: Array, w: Array,
     const ow = (width + 2 * px - dx * (kw - 1) - 1) / sx + 1;
     if (w.dims[1] != per_group) return error.ShapeMismatch;
     const out = try make(a, &.{ n, m, oh, ow });
+    if (groups == 1) {
+        const taps = c * kh * kw;
+        const positions = oh * ow;
+        const col = try a.alloc(f32, taps * positions);
+        const work = try a.alloc(f32, kernels.matmulTiledWorkLen(f32, .{}, par, m, taps, positions));
+        const view: Window = .{ .c = c, .h = h, .w = width, .kh = kh, .kw = kw, .sy = sy, .sx = sx, .py = py, .px = px, .dy = dy, .dx = dx, .oh = oh, .ow = ow };
+        for (0..n) |b| {
+            planarColumns(x.data[b * c * h * width ..], col, view);
+            const image = out.data[b * m * positions ..][0 .. m * positions];
+            kernels.matmulTiled(f32, .{}, par, .{ .m = m, .k = taps, .n = positions, .a = w.data, .b = col, .out = image }, work);
+            if (bias) |extra| {
+                for (0..m) |oc| {
+                    for (image[oc * positions ..][0..positions]) |*v| v.* += extra.data[oc];
+                }
+            }
+        }
+        return out;
+    }
 
     const Job = struct {
         x: []const f32,

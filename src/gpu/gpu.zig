@@ -84,6 +84,8 @@ const Kernel = enum {
     avgPoolBackward,
     dropout,
     columnReduce,
+    columnCombine,
+    splitCombine,
     batchNormFinish,
     batchNormApply,
     batchNormGradFinish,
@@ -457,7 +459,7 @@ pub const Gpu = struct {
         const c_out: usize = geo.c_out;
         const m = @as(usize, geo.n) * geo.out_h * geo.out_w;
         const k_total = @as(usize, geo.k) * geo.k * geo.c;
-        const kernel_shape = pack(ga.TensorShape, .{ .m = m, .n = c_out, .k_padded = k_total, .n_padded = w_pitch, .accumulate = accumulate, .chunk = k_total, .transpose_out = false, .output_half = false });
+        const kernel_shape = pack(ga.TensorShape, .{ .m = m, .n = c_out, .k_padded = k_total, .n_padded = w_pitch, .accumulate = accumulate, .chunk = k_total, .transpose_out = false, .output_half = false, .split_stride = 0 });
         try self.launch(.convTf32Forward, .{ ceilDiv(c_out, 64), ceilDiv(m, 128), 1 }, .{ x, w, out, kernel_shape, geo });
     }
 
@@ -469,11 +471,16 @@ pub const Gpu = struct {
         const tile_rows: usize = if (short) 64 else 128;
         const tile_cols: usize = if (short) 128 else 64;
         const blocks = @as(usize, ceilDiv(c_out, tile_rows)) * ceilDiv(taps, tile_cols);
-        const splits = self.splitCount(@max(1, @min(positions_padded / 256, (128 + blocks - 1) / blocks)));
+        const splits = @max(1, @min(positions_padded / 256, (128 + blocks - 1) / blocks));
         const chunk = std.mem.alignForward(usize, (positions_padded + splits - 1) / splits, 16);
-        const kernel_shape = pack(ga.TensorShape, .{ .m = c_out, .n = taps, .k_padded = positions_padded, .n_padded = taps, .accumulate = true, .chunk = chunk, .transpose_out = true, .output_half = false });
+        const kernel_shape = pack(ga.TensorShape, .{ .m = c_out, .n = taps, .k_padded = positions_padded, .n_padded = taps, .accumulate = true, .chunk = chunk, .transpose_out = true, .output_half = false, .split_stride = 0 });
         const kernel: Kernel = if (short) .convTf32WeightGradShort else .convTf32WeightGrad;
-        try self.launch(kernel, .{ ceilDiv(taps, tile_cols), ceilDiv(c_out, tile_rows), ceilDiv(positions_padded, chunk) }, .{ dy_t, x, out, kernel_shape, geo });
+        const mark = self.step_used;
+        defer self.step_used = mark;
+        const parts = ceilDiv(positions_padded, chunk);
+        const target, const shape = try self.orderedTarget(out, kernel_shape, parts);
+        try self.launch(kernel, .{ ceilDiv(taps, tile_cols), ceilDiv(c_out, tile_rows), parts }, .{ dy_t, x, target, shape, geo });
+        try self.combineSplits(target, out, shape, parts, true);
     }
 
     pub fn packRotatedWeights(self: *Gpu, w: []const f32, k: usize, c_in: usize, c_out: usize) Error!Packed {
@@ -487,7 +494,7 @@ pub const Gpu = struct {
     pub fn convImplicitForward(self: *Gpu, x_half: []const u16, w: Packed, out: []f32, geo: ga.ConvGeometry, accumulate: bool) Error!void {
         const c_out: usize = geo.c_out;
         const m = @as(usize, geo.n) * geo.out_h * geo.out_w;
-        const kernel_shape = pack(ga.TensorShape, .{ .m = m, .n = c_out, .k_padded = w.rows_padded, .n_padded = w.cols_padded, .accumulate = accumulate, .chunk = w.rows_padded, .transpose_out = false, .output_half = false });
+        const kernel_shape = pack(ga.TensorShape, .{ .m = m, .n = c_out, .k_padded = w.rows_padded, .n_padded = w.cols_padded, .accumulate = accumulate, .chunk = w.rows_padded, .transpose_out = false, .output_half = false, .split_stride = 0 });
         const wide = c_out % 128 == 0 and ceilDiv(m, 128) * (c_out / 128) >= 96;
         try self.launch(if (wide) .convGemmForwardWide else .convGemmForward, .{ ceilDiv(c_out, if (wide) 128 else 64), ceilDiv(m, 128), 1 }, .{ x_half, w.data, out, kernel_shape, geo });
     }
@@ -501,23 +508,45 @@ pub const Gpu = struct {
         const tile_cols: usize = if (short or wide) 128 else 64;
         const n_padded = std.mem.alignForward(usize, taps, tile_cols);
         const blocks = ceilDiv(c_out, tile_rows) * (n_padded / tile_cols);
-        const splits = self.splitCount(@max(1, @min(dy_t.cols_padded / 256, (128 + blocks - 1) / blocks)));
+        const splits = @max(1, @min(dy_t.cols_padded / 256, (128 + blocks - 1) / blocks));
         const chunk = std.mem.alignForward(usize, (dy_t.cols_padded + splits - 1) / splits, 32);
-        const kernel_shape = pack(ga.TensorShape, .{ .m = c_out, .n = taps, .k_padded = dy_t.cols_padded, .n_padded = n_padded, .accumulate = true, .chunk = chunk, .transpose_out = true, .output_half = false });
+        const kernel_shape = pack(ga.TensorShape, .{ .m = c_out, .n = taps, .k_padded = dy_t.cols_padded, .n_padded = n_padded, .accumulate = true, .chunk = chunk, .transpose_out = true, .output_half = false, .split_stride = 0 });
         const kernel: Kernel = if (short) .convGemmWeightGradShort else if (wide) .convGemmWeightGradWide else .convGemmWeightGrad;
-        try self.launch(kernel, .{ toU32(n_padded / tile_cols), ceilDiv(c_out, tile_rows), ceilDiv(dy_t.cols_padded, chunk) }, .{ dy_t.data, x_half, out, kernel_shape, geo });
+        const mark = self.step_used;
+        defer self.step_used = mark;
+        const parts = ceilDiv(dy_t.cols_padded, chunk);
+        const target, const shape = try self.orderedTarget(out, kernel_shape, parts);
+        try self.launch(kernel, .{ toU32(n_padded / tile_cols), ceilDiv(c_out, tile_rows), parts }, .{ dy_t.data, x_half, target, shape, geo });
+        try self.combineSplits(target, out, shape, parts, true);
+    }
+
+    fn orderedTarget(self: *Gpu, out: anytype, shape: ga.TensorShape, parts: u32) Error!struct { @TypeOf(out), ga.TensorShape } {
+        if (!self.deterministic or parts == 1) return .{ out, shape };
+        var ordered = shape;
+        ordered.split_stride = @intCast(out.len);
+        return .{ try self.scratch(f32, @as(usize, parts) * out.len), ordered };
+    }
+
+    fn combineSplits(self: *Gpu, workspace: []f32, out: []f32, shape: ga.TensorShape, parts: u32, accumulate: bool) Error!void {
+        if (shape.split_stride == 0) return;
+        try self.launchFlat(.splitCombine, out.len, .{ workspace, out, parts, shape.split_stride, accumulate });
     }
 
     pub fn matmulPacked(self: *Gpu, a: Packed, b: Packed, out: anytype, shape: MatmulShape, accumulate: bool, transpose_out: bool) Error!void {
         const half_out = @typeInfo(@TypeOf(out)).pointer.child == u16;
         std.debug.assert(a.cols_padded == b.rows_padded and a.rows_padded % 128 == 0 and b.cols_padded % 64 == 0 and a.cols_padded % 32 == 0);
         const blocks = (a.rows_padded / 128) * (b.cols_padded / 64);
-        const splits = self.splitCount(@max(1, @min(a.cols_padded / 256, (128 + blocks - 1) / blocks)));
+        const splits = @max(1, @min(a.cols_padded / 256, (128 + blocks - 1) / blocks));
         const chunk = std.mem.alignForward(usize, (a.cols_padded + splits - 1) / splits, 32);
         std.debug.assert(!half_out or (chunk >= a.cols_padded and !accumulate and !transpose_out));
         if (!half_out and chunk < a.cols_padded and !accumulate) try self.fill(out, 0);
-        const kernel_shape = pack(ga.TensorShape, .{ .m = shape.m, .n = shape.n, .k_padded = a.cols_padded, .n_padded = b.cols_padded, .accumulate = accumulate, .chunk = chunk, .transpose_out = transpose_out, .output_half = half_out });
-        try self.launch(.sgemmTensor, .{ toU32(b.cols_padded / 64), toU32(a.rows_padded / 128), ceilDiv(a.cols_padded, chunk) }, .{ a.data, b.data, out, kernel_shape });
+        const kernel_shape = pack(ga.TensorShape, .{ .m = shape.m, .n = shape.n, .k_padded = a.cols_padded, .n_padded = b.cols_padded, .accumulate = accumulate, .chunk = chunk, .transpose_out = transpose_out, .output_half = half_out, .split_stride = 0 });
+        const mark = self.step_used;
+        defer self.step_used = mark;
+        const parts = ceilDiv(a.cols_padded, chunk);
+        const target, const launched = if (half_out) .{ out, kernel_shape } else try self.orderedTarget(out, kernel_shape, parts);
+        try self.launch(.sgemmTensor, .{ toU32(b.cols_padded / 64), toU32(a.rows_padded / 128), parts }, .{ a.data, b.data, target, launched });
+        if (!half_out) try self.combineSplits(target, out, launched, parts, accumulate);
     }
 
     fn matmulTensor(self: *Gpu, a: []const f32, b: []const f32, out: []f32, shape: MatmulShape, opts: MatmulOpts) Error!void {
@@ -592,14 +621,23 @@ pub const Gpu = struct {
     const ColumnKind = enum(u32) { sum, gradient_sums, shifted_moments, masked_gradient_sums };
 
     fn columnReduce(self: *Gpu, args: ga.ColumnArgs) Error!void {
-        const blocks: u32 = if (self.deterministic) 1 else @min(256, ceilDiv(args.rows, 8 * 16));
+        const blocks: u32 = @min(256, ceilDiv(args.rows, 8 * 16));
         var launched = args;
         launched.row_stride = blocks * 8;
+        launched.ordered = @intFromBool(self.deterministic);
+        const mark = self.step_used;
+        defer self.step_used = mark;
+        const partial: []f32 = if (self.deterministic) try self.scratch(f32, @as(usize, blocks) * 2 * args.channels) else &.{};
+        launched.partial = partial.ptr;
         try self.launch(.columnReduce, .{ blocks, ceilDiv(args.channels, 32), 1 }, .{launched});
+        if (self.deterministic) {
+            const width = args.channels * @as(usize, if (args.kind == 0) 1 else 2);
+            try self.launchFlat(.columnCombine, width, .{ partial, args.out[0..width], blocks, width, 2 * args.channels });
+        }
     }
 
     fn columns(a: []const f32, out: []f32, kind: ColumnKind) ga.ColumnArgs {
-        return .{ .a = a.ptr, .b = a.ptr, .mean = a.ptr, .inv_std = a.ptr, .mask = a.ptr, .out = out.ptr, .rows = @intCast(a.len / (if (kind == .sum) out.len else out.len / 2)), .channels = @intCast(if (kind == .sum) out.len else out.len / 2), .row_stride = 0, .kind = @backingInt(kind), .scale = 1 };
+        return .{ .a = a.ptr, .b = a.ptr, .mean = a.ptr, .inv_std = a.ptr, .mask = a.ptr, .out = out.ptr, .rows = @intCast(a.len / (if (kind == .sum) out.len else out.len / 2)), .channels = @intCast(if (kind == .sum) out.len else out.len / 2), .partial = out.ptr, .ordered = 0, .row_stride = 0, .kind = @backingInt(kind), .scale = 1 };
     }
 
     pub fn columnSums(self: *Gpu, in: []const f32, out: []f32) Error!void {
@@ -757,5 +795,22 @@ test "deterministic mode gives bit-identical results on every run, for split-K p
                 try testing.expectEqualSlices(f32, &first_stats, &stats);
             }
         }
+        const tolerance: f32 = if (tensor_cores == 1) 2.0 else 0.05;
+        for (0..4) |i| {
+            for (0..n) |j| {
+                var want: f64 = 0;
+                for (0..k) |p| want += @as(f64, a[i * k + p]) * b[p * n + j];
+                try testing.expectApproxEqAbs(@as(f32, @floatCast(want)), first_product[i * n + j], tolerance);
+            }
+        }
+    }
+    for (0..channels) |ch| {
+        var sum: f64 = 0;
+        var square: f64 = 0;
+        for (0..rows) |r| sum += x[r * channels + ch];
+        const mu = sum / rows;
+        for (0..rows) |r| square += (x[r * channels + ch] - mu) * (x[r * channels + ch] - mu);
+        try testing.expectApproxEqAbs(@as(f32, @floatCast(mu)), first_stats[ch], 1e-4);
+        try testing.expectApproxEqAbs(@as(f32, @floatCast(1 / @sqrt(square / rows + norm.eps))), first_stats[channels + ch], 1e-4);
     }
 }
