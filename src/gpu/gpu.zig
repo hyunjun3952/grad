@@ -75,8 +75,6 @@ const Kernel = enum {
     layerNormRowsHalf,
     layerNormBackward,
     layerNormBackwardHalf,
-    layerNormParameters,
-    layerNormParametersHalf,
     softmaxRows,
     softmaxRowsHalf,
     softmaxBackward,
@@ -728,7 +726,16 @@ pub const Gpu = struct {
         const cols = p.gamma.len;
         const half = isHalf(p.x);
         if (dx) |out| try self.launchFlat(if (half) .layerNormBackwardHalf else .layerNormBackward, rows, .{ p.x, dy, out, p.gamma, p.mean, p.inv_std, rows, cols });
-        if (dgamma) |g| try self.launchFlat(if (half) .layerNormParametersHalf else .layerNormParameters, cols, .{ p.x, dy, p.mean, p.inv_std, g, dbeta.?, rows, cols });
+        if (dgamma) |g| {
+            // The sums over the rows go through the column reduction, which spreads the rows over many blocks.
+            const sums = try self.scratchZeroed(f32, 2 * cols);
+            var args = columns(dy, sums, .row_gradient_sums);
+            args.b = @ptrCast(@alignCast(p.x.ptr));
+            args.mean = p.mean.ptr;
+            args.inv_std = p.inv_std.ptr;
+            try self.columnReduce(@typeInfo(@TypeOf(p.x)).pointer.child, args);
+            try self.launchFlat(.batchNormGradFinish, cols, .{ sums, g, dbeta.?, cols });
+        }
     }
 
     pub fn softmax(self: *Gpu, x: anytype, y: anytype, cols: usize, period: usize) Error!void {
@@ -808,7 +815,7 @@ pub const Gpu = struct {
         try self.launchFlat(@field(Kernel, @tagName(op)), len, slices ++ .{ len, d });
     }
 
-    const ColumnKind = enum(u32) { sum, gradient_sums, shifted_moments, masked_gradient_sums };
+    const ColumnKind = enum(u32) { sum, gradient_sums, shifted_moments, masked_gradient_sums, row_gradient_sums };
 
     fn columnReduce(self: *Gpu, comptime E: type, args: ga.ColumnArgs) Error!void {
         const blocks: u32 = @min(256, ceilDiv(args.rows, 8 * 16));

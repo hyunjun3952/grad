@@ -262,19 +262,6 @@ export fn layerNormBackwardHalf(x: [*]const u16, dy: [*]const u16, dx: [*]u16, g
     layerNormBackwardOf(u16, x, dy, dx, gamma, mean, inv_std, rows, cols);
 }
 
-inline fn layerNormParametersOf(comptime E: type, x: [*]const E, dy: [*]const E, mean: [*]const f32, inv_std: [*]const f32, dgamma: [*]f32, dbeta: [*]f32, rows: u32, cols: u32) void {
-    const j = globalIndex();
-    if (j < cols) ln.parameterGradient(E, x, dy, mean, inv_std, dgamma, dbeta, rows, cols, j);
-}
-
-export fn layerNormParameters(x: [*]const f32, dy: [*]const f32, mean: [*]const f32, inv_std: [*]const f32, dgamma: [*]f32, dbeta: [*]f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
-    layerNormParametersOf(f32, x, dy, mean, inv_std, dgamma, dbeta, rows, cols);
-}
-
-export fn layerNormParametersHalf(x: [*]const u16, dy: [*]const u16, mean: [*]const f32, inv_std: [*]const f32, dgamma: [*]f32, dbeta: [*]f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
-    layerNormParametersOf(u16, x, dy, mean, inv_std, dgamma, dbeta, rows, cols);
-}
-
 // The table and its gradient are always f32; only the gathered rows (out) and their gradient (dy) may be bf16 (E).
 inline fn embeddingGatherOf(comptime E: type, table: [*]const f32, ids: [*]const u32, out: [*]E, n: u32, width: u32) void {
     const t = globalIndex();
@@ -483,8 +470,9 @@ inline fn columnReduceOf(comptime E: type, args: ga.ColumnArgs) void {
     var first: f32 = 0;
     var second: f32 = 0;
     if (valid) {
-        const m = if (kind == 2) bf16.load(E, a, ch) else mean[ch] * scale;
-        const s = inv_std[ch];
+        // NOTE: kind 4 (layer norm) has one mean and inverse deviation per row instead of per channel, so they are read inside the loop.
+        const m = if (kind == 2) bf16.load(E, a, ch) else if (kind == 4) 0 else mean[ch] * scale;
+        const s = if (kind == 4) 0 else inv_std[ch];
         var r = @as(usize, @workGroupId(0)) * 8 + group;
         while (r < rows) : (r += row_stride) {
             const v = bf16.load(E, a, r * c + ch);
@@ -493,6 +481,9 @@ inline fn columnReduceOf(comptime E: type, args: ga.ColumnArgs) void {
             } else if (kind == 2) {
                 first += v - m;
                 second += (v - m) * (v - m);
+            } else if (kind == 4) {
+                first += v;
+                second += v * ((bf16.load(E, b, r * c + ch) - mean[r]) * inv_std[r]);
             } else {
                 const g = if (kind == 3 and bf16.load(E, mask, r * c + ch) <= 0) 0 else v;
                 first += g;
