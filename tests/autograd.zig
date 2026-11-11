@@ -356,6 +356,36 @@ const LayerNormNet = struct {
     }
 };
 
+// Both halves of a GRU step chained: every input of gruGates and gruNext receives a gradient, and the update gate feeds both.
+const GruOpsNet = struct {
+    const Wide = Tensor(f32, &.{ 3, 15 });
+    const Recurrent = Tensor(f32, &.{ 3, 10 });
+    const State = Tensor(f32, &.{ 3, 5 });
+
+    pub const Inputs = struct { gx: Wide, gh: Recurrent, gc: State, h: State, y: State };
+    pub const names = .{ "gx", "gh", "gc", "h", "y" };
+    pub const labels: [3]u8 = @splat(0);
+    const Result = struct { loss: Var(Tensor(f32, &.{})), gx: Var(Wide), gh: Var(Recurrent), gc: Var(State), h: Var(State), y: Var(State) };
+
+    pub fn build(t: *Tape, p: Inputs, _: []const u8) !Result {
+        const gx = try t.leaf(p.gx);
+        const gh = try t.leaf(p.gh);
+        const gc = try t.leaf(p.gc);
+        const h = try t.leaf(p.h);
+        const y = try t.leaf(p.y);
+        const update, const reset_h = try t.gruGates(gx, gh, h);
+        // The reset state and the candidate projection are independent leaves here, so their sum stands in for the candidate matmul.
+        const next = try t.gruNext(gx, try t.add(gc, reset_h), update, h);
+        // NOTE: the loss is scaled up so that an error of a few percent in one gate stays above the tolerance.
+        const scale = try t.constant(try t.filledTensor(Tensor(f32, &.{}), 100));
+        return .{ .loss = try t.mul(try t.mse(next, y), scale), .gx = gx, .gh = gh, .gc = gc, .h = h, .y = y };
+    }
+
+    pub fn acceptable(_: Allocator, _: Inputs) !bool {
+        return true;
+    }
+};
+
 fn BatchedNet(comptime trans_b: bool) type {
     return struct {
         const A = Tensor(f32, &.{ 3, 4, 5 });
@@ -1005,6 +1035,11 @@ test "softmax rows, with and without a causal mask, have correct values and grad
         try gradcheck.expectFiniteDifferences(SoftmaxNet(period), 7, 1e-2, 3e-3);
         try gradcheck.expectGpuMatchesCpu(SoftmaxNet(period), 8, 1e-5);
     }
+}
+
+test "the fused gru ops have correct gradients for every input, on the cpu and the gpu" {
+    try gradcheck.expectFiniteDifferences(GruOpsNet, 11, 1e-2, 5e-3);
+    try gradcheck.expectGpuMatchesCpu(GruOpsNet, 12, 1e-5);
 }
 
 test "layer norm has correct gradients for the input, the scale and the shift, on the cpu and the gpu" {

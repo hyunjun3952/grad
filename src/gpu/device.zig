@@ -1,6 +1,7 @@
 const act = @import("math/activation.zig");
 const aug = @import("math/augment.zig");
 const bf16 = @import("math/bf16.zig");
+const gru = @import("math/gru.zig");
 const ga = @import("args.zig");
 const cv = @import("math/conv.zig");
 const drop = @import("math/dropout.zig");
@@ -260,6 +261,26 @@ export fn layerNormBackward(x: [*]const f32, dy: [*]const f32, dx: [*]f32, gamma
 
 export fn layerNormBackwardHalf(x: [*]const u16, dy: [*]const u16, dx: [*]u16, gamma: [*]const f32, mean: [*]const f32, inv_std: [*]const f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
     layerNormBackwardOf(u16, x, dy, dx, gamma, mean, inv_std, rows, cols);
+}
+
+export fn gruGates(gx: [*]const f32, gh: [*]const f32, h: [*]const f32, update: [*]f32, reset_h: [*]f32, n: u32, hidden: u32) callconv(.nvptx_kernel) void {
+    const i = globalIndex();
+    if (i < n) gru.gatesForward(gx, gh, h, update, reset_h, i, hidden);
+}
+
+export fn gruGatesBackward(gx: [*]const f32, gh: [*]const f32, h: [*]const f32, d_update: [*]const f32, d_reset_h: [*]const f32, grad: gru.GatesGrad, flags: u32, n: u32, hidden: u32) callconv(.nvptx_kernel) void {
+    const i = globalIndex();
+    if (i < n) gru.gatesBackward(gx, gh, h, d_update, d_reset_h, grad, flags, i, hidden);
+}
+
+export fn gruNext(gx: [*]const f32, gc: [*]const f32, update: [*]const f32, h: [*]const f32, next: [*]f32, n: u32, hidden: u32) callconv(.nvptx_kernel) void {
+    const i = globalIndex();
+    if (i < n) gru.nextForward(gx, gc, update, h, next, i, hidden);
+}
+
+export fn gruNextBackward(gx: [*]const f32, gc: [*]const f32, update: [*]const f32, h: [*]const f32, d_next: [*]const f32, grad: gru.NextGrad, flags: u32, n: u32, hidden: u32) callconv(.nvptx_kernel) void {
+    const i = globalIndex();
+    if (i < n) gru.nextBackward(gx, gc, update, h, d_next, grad, flags, i, hidden);
 }
 
 // The table and its gradient are always f32; only the gathered rows (out) and their gradient (dy) may be bf16 (E).

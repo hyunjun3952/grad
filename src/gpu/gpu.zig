@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 const cuda = @import("cuda.zig");
 const conv = @import("math/conv.zig");
 const ga = @import("args.zig");
+const gru_math = @import("math/gru.zig");
 const norm = @import("math/norm.zig");
 
 const ptx = @embedFile("kernels_ptx");
@@ -73,6 +74,10 @@ const Kernel = enum {
     embeddingScatterHalf,
     layerNormRows,
     layerNormRowsHalf,
+    gruGates,
+    gruGatesBackward,
+    gruNext,
+    gruNextBackward,
     layerNormBackward,
     layerNormBackwardHalf,
     softmaxRows,
@@ -736,6 +741,25 @@ pub const Gpu = struct {
             try self.columnReduce(@typeInfo(@TypeOf(p.x)).pointer.child, args);
             try self.launchFlat(.batchNormGradFinish, cols, .{ sums, g, dbeta.?, cols });
         }
+    }
+
+    /// The update gate and the reset gate times h of a GRU step; math/gru.zig describes the layouts.
+    pub fn gruGates(self: *Gpu, gx: []const f32, gh: []const f32, h: []const f32, update: []f32, reset_h: []f32, hidden: usize) Error!void {
+        try self.launchFlat(.gruGates, h.len, .{ gx, gh, h, update, reset_h, h.len, hidden });
+    }
+
+    /// Adds the gradients of the gates to the gradients named by grad; flags (gru.needs_*) tell which of them exist.
+    pub fn gruGatesBackward(self: *Gpu, gx: []const f32, gh: []const f32, h: []const f32, d_update: []const f32, d_reset_h: []const f32, grad: gru_math.GatesGrad, flags: u32, hidden: usize) Error!void {
+        try self.launchFlat(.gruGatesBackward, h.len, .{ gx, gh, h, d_update, d_reset_h, grad, flags, h.len, hidden });
+    }
+
+    /// The new state of a GRU step from the candidate part of gx, the candidate projection gc, the update gate and the old state.
+    pub fn gruNext(self: *Gpu, gx: []const f32, gc: []const f32, update: []const f32, h: []const f32, next: []f32, hidden: usize) Error!void {
+        try self.launchFlat(.gruNext, h.len, .{ gx, gc, update, h, next, h.len, hidden });
+    }
+
+    pub fn gruNextBackward(self: *Gpu, gx: []const f32, gc: []const f32, update: []const f32, h: []const f32, d_next: []const f32, grad: gru_math.NextGrad, flags: u32, hidden: usize) Error!void {
+        try self.launchFlat(.gruNextBackward, h.len, .{ gx, gc, update, h, d_next, grad, flags, h.len, hidden });
     }
 
     pub fn softmax(self: *Gpu, x: anytype, y: anytype, cols: usize, period: usize) Error!void {

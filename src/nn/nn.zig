@@ -233,32 +233,22 @@ pub fn ConvBn(comptime c_in: usize, comptime c_out: usize, comptime k: usize, co
 }
 
 /// A gated recurrent unit. forward takes the input and the previous hidden state and returns the next hidden state.
+/// The projections are fused: one product maps the input to the update, reset and candidate parts (3 * hidden columns), one maps the
+/// state to the update and reset parts, and one maps the reset state to the candidate; two kernels do the gate arithmetic.
 pub fn Gru(comptime n_in: usize, comptime hidden: usize) type {
-    const Input = Linear(n_in, hidden);
-    const Recurrent = Linear(hidden, hidden);
-
     return struct {
         const Self = @This();
 
-        update_x: Input,
-        update_h: Recurrent,
-        reset_x: Input,
-        reset_h: Recurrent,
-        candidate_x: Input,
-        candidate_h: Recurrent,
+        input: Linear(n_in, 3 * hidden),
+        recurrent: Linear(hidden, 2 * hidden),
+        candidate: Linear(hidden, hidden),
 
         pub fn init(gpa: Allocator, rng: std.Random) Allocator.Error!Self {
-            const update_x = try Input.init(gpa, rng);
-            errdefer update_x.deinit(gpa);
-            const update_h = try Recurrent.init(gpa, rng);
-            errdefer update_h.deinit(gpa);
-            const reset_x = try Input.init(gpa, rng);
-            errdefer reset_x.deinit(gpa);
-            const reset_h = try Recurrent.init(gpa, rng);
-            errdefer reset_h.deinit(gpa);
-            const candidate_x = try Input.init(gpa, rng);
-            errdefer candidate_x.deinit(gpa);
-            return .{ .update_x = update_x, .update_h = update_h, .reset_x = reset_x, .reset_h = reset_h, .candidate_x = candidate_x, .candidate_h = try Recurrent.init(gpa, rng) };
+            const input = try Linear(n_in, 3 * hidden).init(gpa, rng);
+            errdefer input.deinit(gpa);
+            const recurrent = try Linear(hidden, 2 * hidden).init(gpa, rng);
+            errdefer recurrent.deinit(gpa);
+            return .{ .input = input, .recurrent = recurrent, .candidate = try Linear(hidden, hidden).init(gpa, rng) };
         }
 
         pub fn deinit(self: Self, gpa: Allocator) void {
@@ -272,23 +262,21 @@ pub fn Gru(comptime n_in: usize, comptime hidden: usize) type {
         }
 
         pub fn forward(self: Self, tape: *Tape, x: anytype, h: anytype) autograd.Error!@TypeOf(h) {
-            const update = try tape.activate(try tape.add(try self.update_x.forward(tape, x), try self.update_h.forward(tape, h)), .sigmoid);
-            const reset = try tape.activate(try tape.add(try self.reset_x.forward(tape, x), try self.reset_h.forward(tape, h)), .sigmoid);
-            const candidate = try tape.activate(try tape.add(try self.candidate_x.forward(tape, x), try self.candidate_h.forward(tape, try tape.mul(reset, h))), .tanh);
-            const minus_one = try tape.constant(try tape.filledTensor(Tensor(f32, &.{}), -1));
-            return tape.add(candidate, try tape.mul(update, try tape.add(h, try tape.mul(candidate, minus_one))));
+            const gx = try self.input.forward(tape, x);
+            const gh = try self.recurrent.forward(tape, h);
+            const update, const reset_h = try tape.gruGates(gx, gh, h);
+            return tape.gruNext(gx, try self.candidate.forward(tape, reset_h), update, h);
         }
 
-        pub fn params(self: Self) @TypeOf(self.update_x.params() ++ self.update_h.params() ++ self.reset_x.params() ++ self.reset_h.params() ++ self.candidate_x.params() ++ self.candidate_h.params()) {
-            return self.update_x.params() ++ self.update_h.params() ++ self.reset_x.params() ++ self.reset_h.params() ++ self.candidate_x.params() ++ self.candidate_h.params();
+        pub fn params(self: Self) @TypeOf(self.input.params() ++ self.recurrent.params() ++ self.candidate.params()) {
+            return self.input.params() ++ self.recurrent.params() ++ self.candidate.params();
         }
 
-        pub fn state(self: Self) @TypeOf(self.update_x.state() ++ self.update_h.state() ++ self.reset_x.state() ++ self.reset_h.state() ++ self.candidate_x.state() ++ self.candidate_h.state()) {
-            return self.update_x.state() ++ self.update_h.state() ++ self.reset_x.state() ++ self.reset_h.state() ++ self.candidate_x.state() ++ self.candidate_h.state();
+        pub fn state(self: Self) @TypeOf(self.input.state() ++ self.recurrent.state() ++ self.candidate.state()) {
+            return self.input.state() ++ self.recurrent.state() ++ self.candidate.state();
         }
     };
 }
-
 // ***** transformer *****
 
 /// Layer normalization over the last axis of c features, with learned scale (starts at one) and shift (starts at zero).

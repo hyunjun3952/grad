@@ -155,6 +155,8 @@ pub fn main(init: std.process.Init) !void {
     try out.flush();
 
     var running: f64 = 0;
+    // NOTE: profiling synchronizes after every launch, which a recording cannot do, so a profiled run launches normally.
+    const use_graph = gpu != null and !profile;
     var graph: ?grad.gpu.Gpu.Graph = null;
     var mean: Var(Tensor(f32, &.{})) = undefined;
     for (0..steps) |iteration| {
@@ -171,11 +173,11 @@ pub fn main(init: std.process.Init) !void {
 
         // NOTE: the step is launch-bound (thousands of tiny kernels), so on the GPU it is recorded once into a graph and replayed.
         // Nothing in it changes between steps: the inputs and targets are refilled in place and the scratch addresses repeat.
-        if (gpu == null or graph == null) {
+        if (!use_graph or graph == null) {
             _ = arena.reset(.retain_capacity);
             if (gpu) |dev| {
                 try dev.resetStep();
-                try dev.beginCapture();
+                if (use_graph) try dev.beginCapture();
             }
             var tape: Tape = .{ .gpa = arena.allocator(), .par = run.par, .training = true };
             try grad.optim.zeroGrad(run.par, params);
@@ -189,9 +191,9 @@ pub fn main(init: std.process.Init) !void {
             }
             mean = try tape.mul(total.?, try tape.constant(try tape.filledTensor(Tensor(f32, &.{}), 1.0 / @as(f32, unroll))));
             try tape.backward(mean);
-            if (gpu) |dev| graph = try dev.endCapture();
+            if (use_graph) graph = try grad.gpu.Gpu.endCapture(gpu.?);
         }
-        if (gpu) |dev| try dev.replay(graph.?);
+        if (use_graph) try gpu.?.replay(graph.?);
         adam.lr = grad.optim.cosineLr(0.003, iteration, steps, 50);
         try adam.step(run.par, params);
 

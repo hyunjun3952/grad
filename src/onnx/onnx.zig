@@ -166,6 +166,20 @@ const Builder = struct {
         return name;
     }
 
+    // Takes the columns start..end of a matrix, the way a fused GRU projection is cut into its gates.
+    fn columns(self: *Builder, source: []const u8, start: usize, end: usize) ![]const u8 {
+        const name = try self.fresh("part");
+        const bounds = [_]i64{ @intCast(start), @intCast(end), 1 };
+        const starts = try self.fresh("starts");
+        try self.tensor(starts, &.{1}, int64_type, std.mem.sliceAsBytes(bounds[0..1]));
+        const ends = try self.fresh("ends");
+        try self.tensor(ends, &.{1}, int64_type, std.mem.sliceAsBytes(bounds[1..2]));
+        const axes = try self.fresh("axes");
+        try self.tensor(axes, &.{1}, int64_type, std.mem.sliceAsBytes(bounds[2..3]));
+        try self.node("Slice", &.{ source, starts, ends, axes }, name, &.{});
+        return name;
+    }
+
     fn boundary(self: *Builder, comptime prefix: []const u8, index: usize, count: usize) ![]const u8 {
         if (count == 1) return prefix;
         return std.fmt.allocPrint(self.names.allocator(), prefix ++ "{d}", .{index});
@@ -194,6 +208,33 @@ const Builder = struct {
             .add => try self.node("Add", &.{ try self.use(e.inputs[0]), try self.use(e.inputs[1]) }, out, &.{}),
             .mul => try self.node("Mul", &.{ try self.use(e.inputs[0]), try self.use(e.inputs[1]) }, out, &.{}),
             .matmul => try self.node("MatMul", &.{ try self.use(e.inputs[0]), try self.use(e.inputs[1]) }, out, &.{}),
+            .gru_update, .gru_reset_h => {
+                // NOTE: the fused kernel is written out as the gate arithmetic it replaces, so any ONNX runtime can read it.
+                const hidden = e.output.dims[1];
+                const first: usize = if (e.op == .gru_update) 0 else hidden;
+                const pre = try self.fresh("pre");
+                try self.node("Add", &.{ try self.columns(try self.use(e.inputs[0]), first, first + hidden), try self.columns(try self.use(e.inputs[1]), first, first + hidden) }, pre, &.{});
+                if (e.op == .gru_update) {
+                    try self.node("Sigmoid", &.{pre}, out, &.{});
+                } else {
+                    const gate = try self.fresh("gate");
+                    try self.node("Sigmoid", &.{pre}, gate, &.{});
+                    try self.node("Mul", &.{ gate, try self.use(e.inputs[2]) }, out, &.{});
+                }
+            },
+            .gru_next => {
+                const hidden = e.output.dims[1];
+                const state = try self.use(e.inputs[3]);
+                const pre = try self.fresh("pre");
+                try self.node("Add", &.{ try self.columns(try self.use(e.inputs[0]), 2 * hidden, 3 * hidden), try self.use(e.inputs[1]) }, pre, &.{});
+                const candidate = try self.fresh("candidate");
+                try self.node("Tanh", &.{pre}, candidate, &.{});
+                const difference = try self.fresh("difference");
+                try self.node("Sub", &.{ state, candidate }, difference, &.{});
+                const kept = try self.fresh("kept");
+                try self.node("Mul", &.{ try self.use(e.inputs[2]), difference }, kept, &.{});
+                try self.node("Add", &.{ candidate, kept }, out, &.{});
+            },
             .batched_matmul => {
                 var right = try self.use(e.inputs[1]);
                 if (e.trans_b) {

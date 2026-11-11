@@ -8,6 +8,7 @@ const ga = @import("../gpu/args.zig");
 const conv = @import("../gpu/math/conv.zig");
 const cpu = @import("../cpu/ops.zig");
 const activation_math = @import("../gpu/math/activation.zig");
+const gru_math = @import("../gpu/math/gru.zig");
 const softmax_math = @import("../gpu/math/softmax.zig");
 const layernorm_math = @import("../gpu/math/layernorm.zig");
 const drop = @import("../gpu/math/dropout.zig");
@@ -449,6 +450,70 @@ pub const Tape = struct {
         return out;
     }
 
+    fn gruChecks(comptime Gx: type, comptime Other: type, comptime H: type, comptime other_columns: usize) void {
+        comptime {
+            if (H.rank != 2 or H.Elem != f32 or Gx.Elem != f32 or Other.Elem != f32) @compileError("the GRU ops work on f32 matrices");
+            if (Gx.shape[0] != H.shape[0] or Gx.shape[1] != 3 * H.shape[1] or Other.shape[0] != H.shape[0] or Other.shape[1] != other_columns * H.shape[1]) @compileError("GRU shapes: gx is (rows, 3 * hidden), the other projection (rows, columns * hidden), the state (rows, hidden)");
+        }
+    }
+
+    /// First half of a GRU step. gx is the input projection (rows, 3 * hidden: update | reset | candidate), gh the recurrent
+    /// projection (rows, 2 * hidden: update | reset) and h the state (rows, hidden). Returns the update gate and the reset gate times h.
+    /// NOTE: one kernel replaces the six slices, additions and activations of the same step; backward recomputes the gates.
+    pub fn gruGates(self: *Tape, gx: anytype, gh: anytype, h: anytype) Error!struct { Var(@TypeOf(h.value)), Var(@TypeOf(h.value)) } {
+        const H = @TypeOf(h.value);
+        gruChecks(@TypeOf(gx.value), @TypeOf(gh.value), H, 2);
+        const hidden = H.shape[1];
+        const update_value = try self.newTensor(H);
+        const reset_value = try self.newTensor(H);
+        if (self.par.gpu) |dev| {
+            try dev.gruGates(gx.value.data, gh.value.data, h.value.data, update_value.data, reset_value.data, hidden);
+        } else {
+            for (0..H.len) |i| gru_math.gatesForward(gx.value.data.ptr, gh.value.data.ptr, h.value.data.ptr, update_value.data.ptr, reset_value.data.ptr, i, hidden);
+        }
+        const needs = gx.needs_grad or gh.needs_grad or h.needs_grad;
+        const update = try self.makeVar(update_value, needs);
+        const reset_h = try self.makeVar(reset_value, needs);
+        try self.note(.gru_update, .{ gx, gh }, update, .{});
+        try self.note(.gru_reset_h, .{ gx, gh, h }, reset_h, .{});
+        const Ctx = struct { gx: @TypeOf(gx), gh: @TypeOf(gh), h: @TypeOf(h), update: @TypeOf(update), reset_h: @TypeOf(reset_h) };
+        if (needs) try self.recordBackward(Ctx{ .gx = gx, .gh = gh, .h = h, .update = update, .reset_h = reset_h }, struct {
+            fn run(t: *Tape, c: *const Ctx) Error!void {
+                const flags: u32 = (if (c.gx.needs_grad) gru_math.needs_gx else 0) | (if (c.gh.needs_grad) gru_math.needs_gh else 0) | (if (c.h.needs_grad) gru_math.needs_h else 0);
+                const grad: gru_math.GatesGrad = .{ .gx = c.gx.grad.data.ptr, .gh = c.gh.grad.data.ptr, .h = c.h.grad.data.ptr };
+                if (t.par.gpu) |dev| return dev.gruGatesBackward(c.gx.value.data, c.gh.value.data, c.h.value.data, c.update.grad.data, c.reset_h.grad.data, grad, flags, hidden);
+                for (0..H.len) |i| gru_math.gatesBackward(c.gx.value.data.ptr, c.gh.value.data.ptr, c.h.value.data.ptr, c.update.grad.data.ptr, c.reset_h.grad.data.ptr, grad, flags, i, hidden);
+            }
+        }.run);
+        return .{ update, reset_h };
+    }
+
+    /// Second half of a GRU step: the new state c + update * (h - c), where c = tanh(candidate part of gx + gc) and gc is the
+    /// candidate projection of the reset state (rows, hidden).
+    pub fn gruNext(self: *Tape, gx: anytype, gc: anytype, update: anytype, h: anytype) Error!Var(@TypeOf(h.value)) {
+        const H = @TypeOf(h.value);
+        gruChecks(@TypeOf(gx.value), @TypeOf(gc.value), H, 1);
+        comptime if (@TypeOf(update.value) != H) @compileError("the update gate must have the shape of the state");
+        const hidden = H.shape[1];
+        const value = try self.newTensor(H);
+        if (self.par.gpu) |dev| {
+            try dev.gruNext(gx.value.data, gc.value.data, update.value.data, h.value.data, value.data, hidden);
+        } else {
+            for (0..H.len) |i| gru_math.nextForward(gx.value.data.ptr, gc.value.data.ptr, update.value.data.ptr, h.value.data.ptr, value.data.ptr, i, hidden);
+        }
+        const out = try self.makeVar(value, gx.needs_grad or gc.needs_grad or update.needs_grad or h.needs_grad);
+        try self.note(.gru_next, .{ gx, gc, update, h }, out, .{});
+        const Ctx = struct { gx: @TypeOf(gx), gc: @TypeOf(gc), update: @TypeOf(update), h: @TypeOf(h), out: @TypeOf(out) };
+        if (out.needs_grad) try self.recordBackward(Ctx{ .gx = gx, .gc = gc, .update = update, .h = h, .out = out }, struct {
+            fn run(t: *Tape, c: *const Ctx) Error!void {
+                const flags: u32 = (if (c.gx.needs_grad) gru_math.needs_gx else 0) | (if (c.gc.needs_grad) gru_math.needs_gc else 0) | (if (c.update.needs_grad) gru_math.needs_update else 0) | (if (c.h.needs_grad) gru_math.needs_h else 0);
+                const grad: gru_math.NextGrad = .{ .gx = c.gx.grad.data.ptr, .gc = c.gc.grad.data.ptr, .update = c.update.grad.data.ptr, .h = c.h.grad.data.ptr };
+                if (t.par.gpu) |dev| return dev.gruNextBackward(c.gx.value.data, c.gc.value.data, c.update.value.data, c.h.value.data, c.out.grad.data, grad, flags, hidden);
+                for (0..H.len) |i| gru_math.nextBackward(c.gx.value.data.ptr, c.gc.value.data.ptr, c.update.value.data.ptr, c.h.value.data.ptr, c.out.grad.data.ptr, grad, flags, i, hidden);
+            }
+        }.run);
+        return out;
+    }
     /// Converts the element type (f32 to bf16 and back); the gradient is converted the other way.
     pub fn cast(self: *Tape, x: anytype, comptime To: type) Error!Var(Tensor(To, @TypeOf(x.value).shape)) {
         const X = @TypeOf(x.value);

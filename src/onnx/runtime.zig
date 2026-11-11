@@ -383,7 +383,7 @@ fn normalizeAxis(axis: i64, rank: usize) usize {
 }
 
 fn execute(a: Allocator, par: kernels.Parallel, node: Node, values: *std.StringHashMap(Array)) Error![]const Array {
-    const Kind = enum { Add, Sub, Mul, Div, Relu, Sigmoid, Tanh, Gelu, Sqrt, MatMul, Gemm, Conv, MaxPool, AveragePool, GlobalAveragePool, BatchNormalization, Flatten, Reshape, Transpose, Concat, Softmax, Identity, Dropout, Gather, LayerNormalization };
+    const Kind = enum { Add, Sub, Mul, Div, Relu, Sigmoid, Tanh, Gelu, Sqrt, MatMul, Gemm, Conv, MaxPool, AveragePool, GlobalAveragePool, BatchNormalization, Flatten, Reshape, Transpose, Concat, Softmax, Identity, Dropout, Gather, LayerNormalization, Slice };
     const kind = std.meta.stringToEnum(Kind, node.op) orelse return error.UnsupportedOp;
     const out = try a.alloc(Array, 1);
     out[0] = switch (kind) {
@@ -413,6 +413,7 @@ fn execute(a: Allocator, par: kernels.Parallel, node: Node, values: *std.StringH
         .Concat => try concat(a, node, values),
         .Softmax => try softmax(a, node, try input(values, node, 0)),
         .Gather => try gather(a, node, try input(values, node, 0), try input(values, node, 1)),
+        .Slice => try slice(a, try input(values, node, 0), try input(values, node, 1), try input(values, node, 2), maybeInput(values, node, 3), maybeInput(values, node, 4)),
         .LayerNormalization => try layerNorm(a, node, try input(values, node, 0), try input(values, node, 1), maybeInput(values, node, 2)),
     };
     return out;
@@ -776,6 +777,49 @@ fn layerNorm(a: Allocator, node: Node, x: Array, scale: Array, bias: ?Array) Err
         for (row) |v| square += (v - mean) * (v - mean);
         const inverse = 1 / @sqrt(square / @as(f32, @floatFromInt(cols)) + eps);
         for (out.data[r * cols ..][0..cols], row, 0..) |*o, v, j| o.* = scale.data[j] * (v - mean) * inverse + (if (bias) |b| b.data[j] else 0);
+    }
+    return out;
+}
+
+// Cuts a range out of some axes (default: the first ones) with the given steps; negative and oversized bounds are clamped as in ONNX.
+fn slice(a: Allocator, x: Array, starts: Array, ends: Array, axes: ?Array, steps: ?Array) Error!Array {
+    const rank = x.dims.len;
+    var first: [max_rank]usize = @splat(0);
+    var step: [max_rank]usize = @splat(1);
+    var dims: [max_rank]usize = undefined;
+    @memcpy(dims[0..rank], x.dims);
+    for (0..starts.ints.len) |k| {
+        const axis = if (axes) |given| normalizeAxis(given.ints[k], rank) else k;
+        const stride: i64 = if (steps) |given| given.ints[k] else 1;
+        if (stride < 1) return error.UnsupportedOp;
+        const size: i64 = @intCast(x.dims[axis]);
+        const lo = std.math.clamp(if (starts.ints[k] < 0) starts.ints[k] + size else starts.ints[k], 0, size);
+        const hi = std.math.clamp(if (ends.ints[k] < 0) ends.ints[k] + size else ends.ints[k], 0, size);
+        first[axis] = @intCast(lo);
+        step[axis] = @intCast(stride);
+        dims[axis] = if (hi > lo) @intCast(@divTrunc(hi - lo + stride - 1, stride)) else 0;
+    }
+    const out = try make(a, dims[0..rank]);
+    var source_strides: [max_rank]usize = undefined;
+    var stride: usize = 1;
+    var i = rank;
+    while (i > 0) {
+        i -= 1;
+        source_strides[i] = stride;
+        stride *= x.dims[i];
+    }
+    var index: [max_rank]usize = @splat(0);
+    for (out.data) |*v| {
+        var offset: usize = 0;
+        for (0..rank) |d| offset += (first[d] + index[d] * step[d]) * source_strides[d];
+        v.* = x.data[offset];
+        var d = rank;
+        while (d > 0) {
+            d -= 1;
+            index[d] += 1;
+            if (index[d] < dims[d]) break;
+            index[d] = 0;
+        }
     }
     return out;
 }
