@@ -73,6 +73,15 @@ fn sliceOf(comptime Tn: type, data: anytype, index: usize) Tn {
     return .{ .data = data[index * Tn.len ..][0..Tn.len] };
 }
 
+// Multiplies batch consecutive matrices of the given types: one launch with a batch axis on the device, one product per matrix on the CPU.
+fn batchedInto(gpa: Allocator, par: kernels.Parallel, comptime batch: usize, comptime Am: type, comptime Bm: type, comptime Cm: type, a: anytype, b: anytype, c: anytype, comptime opts: gpu_mod.MatmulOpts) Error!void {
+    if (par.gpu) |dev| {
+        const k = if (opts.trans_a) Am.shape[0] else Am.shape[1];
+        return dev.matmul(a, b, c, .{ .m = Cm.shape[0], .n = Cm.shape[1], .k = k, .batch = batch }, opts);
+    }
+    for (0..batch) |i| try tensor.matmulInto(gpa, par, sliceOf(Am, a, i), sliceOf(Bm, b, i), sliceOf(Cm, c, i), opts);
+}
+
 fn kernelSize(comptime In: type, comptime W: type, comptime groups: usize) usize {
     if (In.rank != 4 or W.rank != 2) @compileError("conv2d expects (n, h, w, c) input and (k*k*c/groups, out) weights");
     if (In.shape[3] % groups != 0 or W.shape[1] % groups != 0) @compileError("conv2d groups must divide the input and output channels");
@@ -326,20 +335,17 @@ pub const Tape = struct {
         const Cm = Tensor(A.Elem, &.{ m, n });
         const C = Tensor(A.Elem, &.{ batch, m, n });
         const value = try self.newTensor(C);
-        for (0..batch) |i| try tensor.matmulInto(self.gpa, self.par, sliceOf(Am, a.value.data, i), sliceOf(Bm, b.value.data, i), sliceOf(Cm, value.data, i), .{ .trans_b = trans_b });
+        try batchedInto(self.gpa, self.par, batch, Am, Bm, Cm, a.value.data, b.value.data, value.data, .{ .trans_b = trans_b });
         const out = try self.makeVar(value, a.needs_grad or b.needs_grad);
         const Ctx = struct { a: @TypeOf(a), b: @TypeOf(b), out: @TypeOf(out) };
         if (out.needs_grad) try self.recordBackward(Ctx{ .a = a, .b = b, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
-                for (0..batch) |i| {
-                    const dc = sliceOf(Cm, c.out.grad.data, i);
-                    if (c.a.needs_grad) try tensor.matmulInto(t.gpa, t.par, dc, sliceOf(Bm, c.b.value.data, i), sliceOf(Am, c.a.grad.data, i), .{ .trans_b = !trans_b, .accumulate = true });
-                    if (c.b.needs_grad) {
-                        if (trans_b) {
-                            try tensor.matmulInto(t.gpa, t.par, dc, sliceOf(Am, c.a.value.data, i), sliceOf(Bm, c.b.grad.data, i), .{ .trans_a = true, .accumulate = true });
-                        } else {
-                            try tensor.matmulInto(t.gpa, t.par, sliceOf(Am, c.a.value.data, i), dc, sliceOf(Bm, c.b.grad.data, i), .{ .trans_a = true, .accumulate = true });
-                        }
+                if (c.a.needs_grad) try batchedInto(t.gpa, t.par, batch, Cm, Bm, Am, c.out.grad.data, c.b.value.data, c.a.grad.data, .{ .trans_b = !trans_b, .accumulate = true });
+                if (c.b.needs_grad) {
+                    if (trans_b) {
+                        try batchedInto(t.gpa, t.par, batch, Cm, Am, Bm, c.out.grad.data, c.a.value.data, c.b.grad.data, .{ .trans_a = true, .accumulate = true });
+                    } else {
+                        try batchedInto(t.gpa, t.par, batch, Am, Cm, Bm, c.a.value.data, c.out.grad.data, c.b.grad.data, .{ .trans_a = true, .accumulate = true });
                     }
                 }
             }

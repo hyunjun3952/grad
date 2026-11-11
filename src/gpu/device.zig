@@ -73,10 +73,16 @@ fn Gemm(comptime BM: usize, comptime BN: usize) type {
         var tile_a: [BK * BM_PAD]f32 addrspace(.shared) = undefined;
         var tile_b: [BK * BN_PAD]f32 addrspace(.shared) = undefined;
 
-        fn run(comptime ta: bool, comptime tb: bool, a: [*]const f32, b: [*]const f32, c: [*]f32, args: ga.GemmShape) void {
+        fn run(comptime ta: bool, comptime tb: bool, a_all: [*]const f32, b_all: [*]const f32, c_all: [*]f32, args: ga.GemmShape) void {
             const tid: usize = @workItemId(0);
             const tx = tid % 16;
             const ty = tid / 16;
+            // NOTE: a batched product never splits K, so work group z is free to pick the matrix.
+            const z: usize = @workGroupId(2);
+            const batched = args.batch != 0;
+            const a = if (batched) a_all + z * args.stride_a else a_all;
+            const b = if (batched) b_all + z * args.stride_b else b_all;
+            const c = if (batched) c_all + z * args.stride_c else c_all;
             const row0: usize = @as(usize, @workGroupId(1)) * BM;
             const col0: usize = @as(usize, @workGroupId(0)) * BN;
             const M: usize = args.m;
@@ -84,7 +90,7 @@ fn Gemm(comptime BM: usize, comptime BN: usize) type {
             const K: usize = args.k;
 
             var acc: [TM][TN]f32 = @splat(@splat(0));
-            const k_begin = @as(usize, @workGroupId(2)) * args.chunk;
+            const k_begin = if (batched) 0 else z * args.chunk;
             const k_end = @min(K, k_begin + args.chunk);
             var kk = k_begin;
             while (kk < k_end) : (kk += BK) {

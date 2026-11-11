@@ -1,9 +1,14 @@
+/// Arguments of the f32 GEMM kernels. When batch is non-zero, work group z picks the matrix and the strides (in elements) step between matrices; otherwise z splits K.
 pub const GemmShape = extern struct {
     m: u32,
     n: u32,
     k: u32,
     accumulate: u32,
     chunk: u32,
+    batch: u32,
+    stride_a: u32,
+    stride_b: u32,
+    stride_c: u32,
 };
 
 pub const max_tensors = 64;

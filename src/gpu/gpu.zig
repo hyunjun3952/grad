@@ -23,7 +23,8 @@ pub const ConvGeometry = ga.ConvGeometry;
 
 pub const cudnn = @import("cudnn.zig");
 
-pub const MatmulShape = struct { m: usize, n: usize, k: usize };
+/// The size of a product; batch above one means that many consecutive matrices of this size in each operand.
+pub const MatmulShape = struct { m: usize, n: usize, k: usize, batch: usize = 1 };
 
 pub const BroadcastPlan = struct { dims: [ga.max_rank]u32, a_strides: [ga.max_rank]u32, b_strides: [ga.max_rank]u32 };
 
@@ -486,18 +487,25 @@ pub const Gpu = struct {
     pub fn matmul(self: *Gpu, a: anytype, b: anytype, out: anytype, shape: MatmulShape, opts: MatmulOpts) Error!void {
         std.debug.assert(!(opts.trans_a and opts.trans_b));
         const wide = @typeInfo(@TypeOf(a)).pointer.child != u16 and @typeInfo(@TypeOf(b)).pointer.child != u16 and @typeInfo(@TypeOf(out)).pointer.child != u16;
-        if (!wide or self.tensorWorthwhile(shape.m, shape.n, shape.k)) return self.matmulTensor(a, b, out, shape, opts);
+        const batched = shape.batch > 1;
+        if (!wide or self.tensorWorthwhile(shape.m, shape.n, shape.k)) {
+            if (!batched) return self.matmulTensor(a, b, out, shape, opts);
+            // TODO: the tensor core path packs every matrix on its own, so a batch is still one product per matrix there.
+            const each: MatmulShape = .{ .m = shape.m, .n = shape.n, .k = shape.k };
+            for (0..shape.batch) |i| try self.matmulTensor(a[i * shape.m * shape.k ..][0 .. shape.m * shape.k], b[i * shape.k * shape.n ..][0 .. shape.k * shape.n], out[i * shape.m * shape.n ..][0 .. shape.m * shape.n], each, opts);
+            return;
+        }
         const tile: usize = if (shape.n <= 32 and shape.m <= 64) 2 else if (shape.n <= 32) 1 else 0;
         const transpose: usize = if (opts.trans_a) 2 else if (opts.trans_b) 1 else 0;
         const kernel: Kernel = @fromBackingInt(@backingInt(Kernel.sgemmNN) + @as(u5, @intCast(tile * 3 + transpose)));
         const tile_m: usize = if (tile == 2) 32 else 128;
         const tile_n: usize = if (tile == 0) 128 else 32;
         const blocks = @as(usize, ceilDiv(shape.n, tile_n)) * ceilDiv(shape.m, tile_m);
-        const splits = self.splitCount(@max(1, @min(shape.k / 256, (128 + blocks - 1) / blocks)));
+        const splits = if (batched) 1 else self.splitCount(@max(1, @min(shape.k / 256, (128 + blocks - 1) / blocks)));
         const chunk = std.mem.alignForward(usize, (shape.k + splits - 1) / splits, 8);
         if (splits > 1 and !opts.accumulate) try self.fill(out, 0);
-        const kernel_shape = pack(ga.GemmShape, .{ .m = shape.m, .n = shape.n, .k = shape.k, .accumulate = opts.accumulate, .chunk = chunk });
-        try self.launch(kernel, .{ ceilDiv(shape.n, tile_n), ceilDiv(shape.m, tile_m), ceilDiv(shape.k, chunk) }, .{ a, b, out, kernel_shape });
+        const kernel_shape = pack(ga.GemmShape, .{ .m = shape.m, .n = shape.n, .k = shape.k, .accumulate = opts.accumulate, .chunk = chunk, .batch = if (batched) shape.batch else 0, .stride_a = shape.m * shape.k, .stride_b = shape.k * shape.n, .stride_c = shape.m * shape.n });
+        try self.launch(kernel, .{ ceilDiv(shape.n, tile_n), ceilDiv(shape.m, tile_m), if (batched) toU32(shape.batch) else ceilDiv(shape.k, chunk) }, .{ a, b, out, kernel_shape });
     }
 
     /// A bf16 matrix padded to whole tiles, ready for the tensor core kernels.
