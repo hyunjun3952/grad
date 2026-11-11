@@ -490,6 +490,7 @@ fn TensorTile(comptime tile_rows: usize, comptime tile_cols: usize) type {
     return struct {
         const rows = tile_rows;
         const cols = tile_cols;
+        const warp_m = rows * cols / 256;
         const depth = 32;
         const stages = 3;
         const a_elems = rows * depth;
@@ -643,7 +644,7 @@ inline fn waitCopies() void {
     asm volatile ("cp.async.wait_group 1;" ::: .{ .memory = true });
 }
 
-const Acc = [2][4][4]f32;
+const Acc = [4][4][4]f32;
 const Warp = struct { lane: usize, row: usize, col: usize };
 const Block = struct { tid: usize, row0: usize, col0: usize, k_begin: usize };
 
@@ -801,11 +802,13 @@ inline fn pipeline(comptime kind: GemmKind, loader: anytype, block: Block, tiles
     }
 }
 
-inline fn storeTile(comptime half_output: bool, c: [*]f32, acc: *const Acc, shape: ga.TensorShape, block: Block, warp: Warp) void {
-    inline for (0..2) |mi| {
+inline fn storeTile(comptime kind: GemmKind, c: [*]f32, acc: *const Acc, shape: ga.TensorShape, block: Block, warp: Warp) void {
+    const tc = kind.Tile();
+    const half_output = !kind.tf32;
+    inline for (0..tc.warp_m / 16) |mi| {
         inline for (0..4) |ni| {
             inline for (0..4) |q| {
-                const r = block.row0 + warp.row * 32 + mi * 16 + warp.lane / 4 + (q / 2) * 8;
+                const r = block.row0 + warp.row * tc.warp_m + mi * 16 + warp.lane / 4 + (q / 2) * 8;
                 const col = block.col0 + warp.col * 32 + ni * 8 + (warp.lane % 4) * 2 + q % 2;
                 if (r < shape.m and col < shape.n) {
                     const at = if (shape.transpose_out != 0) col * shape.m + r else r * shape.n + col;
@@ -833,19 +836,19 @@ inline fn tileGemm(comptime kind: GemmKind, a: [*]const kind.Elem(), b: [*]const
     var loader = GemmLoader(kind).init(a, b, geo, shape, block);
     var acc: Acc = @splat(@splat(@splat(0)));
     pipeline(kind, &loader, block, tiles, warp, &acc);
-    storeTile(!kind.tf32, c, &acc, shape, block, warp);
+    storeTile(kind, c, &acc, shape, block, warp);
 }
 inline fn bf16Compute(comptime tc: type, warp: Warp, base: usize, acc: *Acc) void {
     inline for (0..tc.depth / 16) |step| {
-        var a_frag: [2][4]u32 = undefined;
-        inline for (0..2) |mi| {
-            const row = warp.row * 32 + mi * 16 + warp.lane % 8 + 8 * ((warp.lane / 8) % 2);
+        var a_frag: [4][4]u32 = undefined;
+        inline for (0..tc.warp_m / 16) |mi| {
+            const row = warp.row * tc.warp_m + mi * 16 + warp.lane % 8 + 8 * ((warp.lane / 8) % 2);
             a_frag[mi] = tc.ldmatrix(tc.sharedAddress(base + tc.aSlot(row, step * 2 + warp.lane / 16)));
         }
         inline for (0..2) |pair| {
             const k = step * 16 + warp.lane % 8 + 8 * ((warp.lane / 8) % 2);
             const frag = tc.ldmatrixTransposed(tc.sharedAddress(base + tc.a_elems + tc.bSlot(k, warp.col * 4 + pair * 2 + warp.lane / 16)));
-            inline for (0..2) |mi| {
+            inline for (0..tc.warp_m / 16) |mi| {
                 tc.mma(&acc[mi][pair * 2], a_frag[mi], .{ frag[0], frag[1] });
                 tc.mma(&acc[mi][pair * 2 + 1], a_frag[mi], .{ frag[2], frag[3] });
             }
@@ -856,9 +859,9 @@ inline fn bf16Compute(comptime tc: type, warp: Warp, base: usize, acc: *Acc) voi
 inline fn tf32Compute(comptime tc: type, warp: Warp, base: usize, acc: *Acc) void {
     inline for (0..tc.depth / 8) |step| {
         const k0 = step * 8 + warp.lane % 4;
-        var a_frag: [2][4]u32 = undefined;
-        inline for (0..2) |mi| {
-            const r = warp.row * 32 + mi * 16 + warp.lane / 4;
+        var a_frag: [4][4]u32 = undefined;
+        inline for (0..tc.warp_m / 16) |mi| {
+            const r = warp.row * tc.warp_m + mi * 16 + warp.lane / 4;
             a_frag[mi] = .{
                 tc.rounded(tc.smem[base + r * tc.a_pitch + k0]),
                 tc.rounded(tc.smem[base + (r + 8) * tc.a_pitch + k0]),
@@ -872,7 +875,7 @@ inline fn tf32Compute(comptime tc: type, warp: Warp, base: usize, acc: *Acc) voi
                 tc.rounded(tc.smem[base + tc.a_elems + k0 * tc.b_pitch + n]),
                 tc.rounded(tc.smem[base + tc.a_elems + (k0 + 4) * tc.b_pitch + n]),
             };
-            inline for (0..2) |mi| tc.mma(&acc[mi][ni], a_frag[mi], b_frag);
+            inline for (0..tc.warp_m / 16) |mi| tc.mma(&acc[mi][ni], a_frag[mi], b_frag);
         }
     }
 }
@@ -887,6 +890,14 @@ export fn convGemmForward(x: [*]const u16, w: [*]const u16, c: [*]f32, shape: ga
 
 export fn convGemmWeightGrad(dy_t: [*]const u16, x: [*]const u16, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
     tileGemm(.{ .mode = .gather_b }, dy_t, x, c, shape, geo);
+}
+
+export fn convGemmForwardWide(x: [*]const u16, w: [*]const u16, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
+    tileGemm(.{ .rows = 128, .cols = 128, .mode = .gather_a }, x, w, c, shape, geo);
+}
+
+export fn convGemmWeightGradWide(dy_t: [*]const u16, x: [*]const u16, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
+    tileGemm(.{ .rows = 128, .cols = 128, .mode = .gather_b }, dy_t, x, c, shape, geo);
 }
 
 export fn convGemmWeightGradShort(dy_t: [*]const u16, x: [*]const u16, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
@@ -930,6 +941,7 @@ fn Tf32Tile(comptime tile_rows: usize, comptime tile_cols: usize) type {
     return struct {
         const rows = tile_rows;
         const cols = tile_cols;
+        const warp_m = rows * cols / 256;
         const depth = 16;
         const stages = 3;
         const a_pitch = depth + 4;

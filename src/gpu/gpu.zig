@@ -53,6 +53,8 @@ const Kernel = enum {
     convGemmForward,
     convGemmWeightGrad,
     convGemmWeightGradShort,
+    convGemmForwardWide,
+    convGemmWeightGradWide,
     packWeightsRotated,
     elementwise,
     relu,
@@ -486,21 +488,23 @@ pub const Gpu = struct {
         const c_out: usize = geo.c_out;
         const m = @as(usize, geo.n) * geo.out_h * geo.out_w;
         const kernel_shape = pack(ga.TensorShape, .{ .m = m, .n = c_out, .k_padded = w.rows_padded, .n_padded = w.cols_padded, .accumulate = accumulate, .chunk = w.rows_padded, .transpose_out = false, .output_half = false });
-        try self.launch(.convGemmForward, .{ toU32(w.cols_padded / 64), ceilDiv(m, 128), 1 }, .{ x_half, w.data, out, kernel_shape, geo });
+        const wide = c_out % 128 == 0 and ceilDiv(m, 128) * (c_out / 128) >= 96;
+        try self.launch(if (wide) .convGemmForwardWide else .convGemmForward, .{ ceilDiv(c_out, if (wide) 128 else 64), ceilDiv(m, 128), 1 }, .{ x_half, w.data, out, kernel_shape, geo });
     }
 
     pub fn convImplicitWeightGrad(self: *Gpu, dy_t: Packed, x_half: []const u16, out: []f32, geo: ga.ConvGeometry) Error!void {
         const c_out: usize = geo.c_out;
         const taps = @as(usize, geo.k) * geo.k * geo.c;
         const short = c_out <= 64;
+        const wide = c_out % 128 == 0;
         const tile_rows: usize = if (short) 64 else 128;
-        const tile_cols: usize = if (short) 128 else 64;
+        const tile_cols: usize = if (short or wide) 128 else 64;
         const n_padded = std.mem.alignForward(usize, taps, tile_cols);
         const blocks = ceilDiv(c_out, tile_rows) * (n_padded / tile_cols);
         const splits = self.splitCount(@max(1, @min(dy_t.cols_padded / 256, (128 + blocks - 1) / blocks)));
         const chunk = std.mem.alignForward(usize, (dy_t.cols_padded + splits - 1) / splits, 32);
         const kernel_shape = pack(ga.TensorShape, .{ .m = c_out, .n = taps, .k_padded = dy_t.cols_padded, .n_padded = n_padded, .accumulate = true, .chunk = chunk, .transpose_out = true, .output_half = false });
-        const kernel: Kernel = if (short) .convGemmWeightGradShort else .convGemmWeightGrad;
+        const kernel: Kernel = if (short) .convGemmWeightGradShort else if (wide) .convGemmWeightGradWide else .convGemmWeightGrad;
         try self.launch(kernel, .{ toU32(n_padded / tile_cols), ceilDiv(c_out, tile_rows), ceilDiv(dy_t.cols_padded, chunk) }, .{ dy_t.data, x_half, out, kernel_shape, geo });
     }
 

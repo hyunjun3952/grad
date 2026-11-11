@@ -69,7 +69,7 @@ pub fn expectCudnnClose(comptime Case: type, seed: u64, tolerance: f32) !void {
 }
 
 fn compareWithGpu(comptime Case: type, seed: u64, tolerance: f32, backend: Backend) !void {
-    const gpu = try Gpu.forTest(64 << 20);
+    const gpu = try Gpu.forTest(256 << 20);
     defer gpu.deinit();
     gpu.tensor_cores = backend == .tensor_cores;
     gpu.tf32 = backend == .tf32;
