@@ -3,7 +3,7 @@ const std = @import("std");
 const cv = @import("../gpu/math/conv.zig");
 const kernels = @import("kernels.zig");
 
-const Job = struct { src: []const f32, dst: []f32, d: cv.Dims };
+const Job = struct { src: []const f32, dst: []f32, d: cv.Dims, first: usize = 0 };
 
 pub fn rowsOf(d: cv.Dims) usize {
     return @as(usize, d.n) * cv.outHeight(d) * cv.outWidth(d);
@@ -16,9 +16,9 @@ fn im2colRows(job: Job, lo: usize, hi: usize) void {
     const kc = k * k * c;
     const w: i64 = d.w;
     const pad: i64 = d.pad;
-    for (lo..hi) |row| {
-        const patch = cv.patchOf(@intCast(row), d);
-        const out = job.dst[row * kc ..][0..kc];
+    for (lo..hi) |index| {
+        const patch = cv.patchOf(@intCast(job.first + index), d);
+        const out = job.dst[index * kc ..][0..kc];
         const first: usize = @intCast(std.math.clamp(pad - @as(i64, patch.left), 0, @as(i64, @intCast(k))));
         const last: usize = @intCast(std.math.clamp(w + pad - @as(i64, patch.left), 0, @as(i64, @intCast(k))));
         for (0..k) |ky| {
@@ -37,7 +37,73 @@ fn im2colRows(job: Job, lo: usize, hi: usize) void {
 }
 
 pub fn im2col(par: kernels.Parallel, x: []const f32, col: []f32, d: cv.Dims) void {
-    kernels.parallelFor(par, rowsOf(d), 32, Job{ .src = x, .dst = col, .d = d }, im2colRows);
+    im2colRange(par, x, col, d, 0, rowsOf(d));
+}
+
+/// Writes rows first..first+count of the im2col matrix to the start of col.
+pub fn im2colRange(par: kernels.Parallel, x: []const f32, col: []f32, d: cv.Dims, first: usize, count: usize) void {
+    kernels.parallelFor(par, count, 32, Job{ .src = x, .dst = col, .d = d, .first = first }, im2colRows);
+}
+
+// Rows of the im2col matrix handled at once by the chunked convolution; the chunk buffer stays in cache.
+const chunk_bytes = 1 << 21;
+
+fn chunkRows(d: cv.Dims) usize {
+    const kc = @as(usize, d.k) * d.k * d.c;
+    return @min(rowsOf(d), @max(1024, chunk_bytes / (kc * @sizeOf(f32))));
+}
+
+// The matmul work buffer must fit both the full chunks and the shorter last one.
+fn chunkWorkLen(comptime cfg: kernels.TileConfig, par: kernels.Parallel, d: cv.Dims, chunk: usize) usize {
+    const kc = @as(usize, d.k) * d.k * d.c;
+    const tail = rowsOf(d) % chunk;
+    const full = if (cfg.trans_a)
+        kernels.matmulTiledWorkLen(f32, cfg, par, kc, chunk, d.c_out)
+    else
+        kernels.matmulTiledWorkLen(f32, cfg, par, chunk, kc, d.c_out);
+    if (tail == 0) return full;
+    const last = if (cfg.trans_a)
+        kernels.matmulTiledWorkLen(f32, cfg, par, kc, tail, d.c_out)
+    else
+        kernels.matmulTiledWorkLen(f32, cfg, par, tail, kc, d.c_out);
+    return @max(full, last);
+}
+
+/// Computes out = im2col(x) * w for a convolution without materializing the whole im2col matrix: it is built and multiplied
+/// in chunks of rows. w is (k*k*c) x c_out, out is positions x c_out.
+pub fn convForward(gpa: std.mem.Allocator, par: kernels.Parallel, x: []const f32, w: []const f32, out: []f32, d: cv.Dims) !void {
+    const kc = @as(usize, d.k) * d.k * d.c;
+    const rows = rowsOf(d);
+    const chunk = chunkRows(d);
+    const cfg: kernels.TileConfig = .{};
+    const col = try gpa.alloc(f32, chunk * kc);
+    defer gpa.free(col);
+    const work = try gpa.alloc(f32, chunkWorkLen(cfg, par, d, chunk));
+    defer gpa.free(work);
+    var first: usize = 0;
+    while (first < rows) : (first += chunk) {
+        const count = @min(chunk, rows - first);
+        im2colRange(par, x, col, d, first, count);
+        kernels.matmulTiled(f32, cfg, par, .{ .m = count, .k = kc, .n = d.c_out, .a = col[0 .. count * kc], .b = w, .out = out[first * d.c_out ..][0 .. count * d.c_out] }, work);
+    }
+}
+
+/// Adds the weight gradient im2col(x)^T * grad to dw, rebuilding the im2col matrix chunk by chunk. grad is positions x c_out.
+pub fn convWeightGrad(gpa: std.mem.Allocator, par: kernels.Parallel, x: []const f32, grad: []const f32, dw: []f32, d: cv.Dims) !void {
+    const kc = @as(usize, d.k) * d.k * d.c;
+    const rows = rowsOf(d);
+    const chunk = chunkRows(d);
+    const cfg: kernels.TileConfig = .{ .trans_a = true, .accumulate = true };
+    const col = try gpa.alloc(f32, chunk * kc);
+    defer gpa.free(col);
+    const work = try gpa.alloc(f32, chunkWorkLen(cfg, par, d, chunk));
+    defer gpa.free(work);
+    var first: usize = 0;
+    while (first < rows) : (first += chunk) {
+        const count = @min(chunk, rows - first);
+        im2colRange(par, x, col, d, first, count);
+        kernels.matmulTiled(f32, cfg, par, .{ .m = kc, .k = count, .n = d.c_out, .a = col[0 .. count * kc], .b = grad[first * d.c_out ..][0 .. count * d.c_out], .out = dw }, work);
+    }
 }
 
 fn col2imPixels(job: Job, lo: usize, hi: usize) void {

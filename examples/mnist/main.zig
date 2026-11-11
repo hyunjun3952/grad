@@ -36,8 +36,8 @@ const Mnist = struct {
         const c1, const n1, const c2, const n2, const fc = model;
         const n = @TypeOf(x.value).shape[0];
         const image = grad.autograd.reshape(x, &.{ n, 28, 28, 1 });
-        const a = try tape.maxPool(try tape.relu(try n1.forward(tape, try c1.forward(tape, image))), .{});
-        const b = try tape.maxPool(try tape.relu(try n2.forward(tape, try c2.forward(tape, a))), .{});
+        const a = try tape.maxPool(try n1.forwardRelu(tape, try c1.forward(tape, image)), .{});
+        const b = try tape.maxPool(try n2.forwardRelu(tape, try c2.forward(tape, a)), .{});
         return fc.forward(tape, try tape.dropout(grad.autograd.reshape(b, &.{ n, 512 }), 0.7));
     }
 };

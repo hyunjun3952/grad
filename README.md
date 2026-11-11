@@ -111,9 +111,9 @@ zig build bench -- cudnn        # cuDNN convolutions on the CIFAR shapes (needs 
 
 | Model | Backend | Epoch |
 | --- | --- | --- |
-| MNIST MLP 784-128-10, batch 64 | CPU, 6 threads | 0.32 s |
+| MNIST MLP 784-128-10, batch 64 | CPU, 6 threads | 0.29 s (0.32 s before the element-wise ops ran on the worker pool) |
 | | GPU | 0.21 s |
-| MNIST / Fashion-MNIST CNN | CPU, 6 threads | 13.2 s |
+| MNIST / Fashion-MNIST CNN | CPU, 6 threads | 10.9 s (11.8 s before the convolution built its im2col matrix in cache-sized chunks, 12.8 s before the element-wise ops ran on the worker pool and the example fused batch norm with ReLU; median of five alternating runs) |
 | | GPU | 0.87 s |
 | CIFAR-10 ResNet-14 64-128-256, batch 64 | GPU, bf16 tensor cores (`--tensor-cores`) | **17.2 s** |
 | | GPU, TF32 tensor cores (`--tf32`) | 25.0 s |
@@ -154,7 +154,7 @@ The bf16 tensor-core path has a relative RMS error of about 2e-3 against FP32. T
 | `@Vector` triple loop / naive triple loop | 17 to 20 / 1.3 to 2.2 GFLOPS |
 | MLP training step, batch 64, 1 thread / 6 threads | 378 us (2.6k steps/s) / 149 us (6.7k steps/s) |
 
-Per-op CPU time of the MNIST CNN at batch 64 (forward / backward, ms): conv 5x5 1->16 0.71 / 0.20, conv 5x5 16->32 0.52 / 2.45, max-pool 0.87 / 0.06, batch norm + ReLU 0.62 / 0.54. The first backward went from 0.39 to 0.20 ms when the tiled GEMM learned to split K across threads for products with few outputs and a long K (its weight gradient, 25 x 16 outputs over 36864 positions); the epoch did not change measurably (13.50 against 13.49 s), because the second convolution's backward dominates.
+Per-op CPU time of the MNIST CNN at batch 64 (forward / backward, ms): conv 5x5 1->16 0.71 / 0.20, conv 5x5 16->32 0.52 / 2.45, max-pool 0.87 / 0.06, batch norm + ReLU 0.62 / 0.54. The first backward went from 0.39 to 0.20 ms when the tiled GEMM learned to split K across threads for products with few outputs and a long K (its weight gradient, 25 x 16 outputs over 36864 positions); the epoch did not change measurably (13.50 against 13.49 s) because most of a step was not in the convolutions: timing the layers of the forward pass in a real run showed ReLU, bias add and gradient accumulation at 0.9 ms or more each on tensors of 2.4 MB, since those loops ran on one thread. They now run on the worker pool for equal shapes and for a vector added to every row, and the example uses the fused batch-norm ReLU. Thread scaling is still poor (24.3 s on one thread, 13.1 s on six): the direct convolution builds an im2col buffer of 15 MB for the first layer, and a path without it is the next step.
 
 ### Inference through ONNX (`zig build onnx`, CPU, 6 threads)
 

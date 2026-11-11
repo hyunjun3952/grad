@@ -1097,6 +1097,135 @@ test "linear has correct gradients for the input, the weights and the bias, on t
     try gradcheck.expectGpuMatchesCpu(LinearNet(4, 3, 5), 19, 1e-5);
     try gradcheck.expectGpuMatchesCpu(LinearNet(130, 70, 150), 20, 1e-4);
 }
+// Runs add (per-row vector), relu and mul (equal shapes) forward and backward on tensors big enough to be split across threads.
+fn elementwiseOnPool(par: lib.kernels.Parallel, out_x: []f32, out_b: []f32) !f32 {
+    const rows = 512;
+    const cols = 256;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var t: Tape = .{ .gpa = arena.allocator(), .par = par, .training = true };
+    var prng = std.Random.DefaultPrng.init(31);
+    const x = try t.leaf(try Tensor(f32, &.{ rows, cols }).empty(t.gpa));
+    const b = try t.leaf(try Tensor(f32, &.{cols}).empty(t.gpa));
+    const y = try t.constant(try Tensor(f32, &.{ rows, cols }).empty(t.gpa));
+    for (x.value.data) |*v| v.* = prng.random().floatNorm(f32);
+    for (b.value.data) |*v| v.* = prng.random().floatNorm(f32);
+    for (y.value.data) |*v| v.* = prng.random().floatNorm(f32);
+    @memset(x.grad.data, 0);
+    @memset(b.grad.data, 0);
+    const activated = try t.relu(try t.add(x, b));
+    const loss = try t.mse(try t.mul(activated, x), y);
+    try t.backward(loss);
+    @memcpy(out_x, x.grad.data);
+    @memcpy(out_b, b.grad.data);
+    return loss.value.data[0];
+}
+
+test "cpu element-wise ops give identical results on the worker pool and on one thread" {
+    const gpa = testing.allocator;
+    const one_x = try gpa.alloc(f32, 512 * 256);
+    defer gpa.free(one_x);
+    const many_x = try gpa.alloc(f32, 512 * 256);
+    defer gpa.free(many_x);
+    var one_b: [256]f32 = undefined;
+    var many_b: [256]f32 = undefined;
+    const one_loss = try elementwiseOnPool(.{}, one_x, &one_b);
+    const many_loss = try elementwiseOnPool(.{ .io = testing.io, .threads = 4 }, many_x, &many_b);
+    try testing.expect(one_loss > 0);
+    // The single-thread run takes the small-tensor path of the same kernels, so also check one element by hand:
+    // loss = mean((relu(x + b) * x - y)^2), so d loss / d x[i] = 2 * (relu(x + b) * x - y) / n * (relu(x + b) + x * (x + b > 0)).
+    var prng = std.Random.DefaultPrng.init(31);
+    const rng = prng.random();
+    const xs = try gpa.alloc(f32, 512 * 256);
+    defer gpa.free(xs);
+    var bs: [256]f32 = undefined;
+    const ys = try gpa.alloc(f32, 512 * 256);
+    defer gpa.free(ys);
+    for (xs) |*v| v.* = rng.floatNorm(f32);
+    for (&bs) |*v| v.* = rng.floatNorm(f32);
+    for (ys) |*v| v.* = rng.floatNorm(f32);
+    var want_loss: f64 = 0;
+    for (xs, ys, 0..) |x, y, i| {
+        const pre = x + bs[i % 256];
+        const r = @max(pre, 0);
+        want_loss += (r * x - y) * (r * x - y);
+    }
+    try testing.expectApproxEqAbs(@as(f32, @floatCast(want_loss / @as(f64, @floatFromInt(xs.len)))), one_loss, 1e-4);
+    for ([_]usize{ 0, 1, 255, 256, 70000, 131071 }) |i| {
+        const pre = xs[i] + bs[i % 256];
+        const r = @max(pre, 0);
+        const slope = r + xs[i] * (if (pre > 0) @as(f32, 1) else 0);
+        const want = 2 * (r * xs[i] - ys[i]) / @as(f32, @floatFromInt(xs.len)) * slope;
+        try testing.expectApproxEqAbs(want, one_x[i], 1e-6);
+    }
+    try testing.expectEqual(one_loss, many_loss);
+    try testing.expectEqualSlices(f32, one_x, many_x);
+    try testing.expectEqualSlices(f32, &one_b, &many_b);
+}
+fn chunkedConvolution(par: lib.kernels.Parallel, out_y: []f32, out_dw: []f32) !void {
+    const n = 30;
+    const size = 28;
+    const c_out = 4;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var t: Tape = .{ .gpa = arena.allocator(), .par = par, .training = true };
+    var prng = std.Random.DefaultPrng.init(37);
+    const rng = prng.random();
+    const x = try t.constant(try Tensor(f32, &.{ n, size, size, 1 }).empty(t.gpa));
+    const w = try t.leaf(try Tensor(f32, &.{ 25, c_out }).empty(t.gpa));
+    const target = try t.constant(try Tensor(f32, &.{ n, size * size * c_out }).empty(t.gpa));
+    for (x.value.data) |*v| v.* = rng.floatNorm(f32);
+    for (w.value.data) |*v| v.* = rng.floatNorm(f32);
+    for (target.value.data) |*v| v.* = rng.floatNorm(f32);
+    @memset(w.grad.data, 0);
+    const y = try t.conv2d(x, w, .{ .pad = 2 });
+    const loss = try t.mse(reshape(y, &.{ n, size * size * c_out }), target);
+    try t.backward(loss);
+    @memcpy(out_y, y.value.data);
+    @memcpy(out_dw, w.grad.data);
+
+    // Direct reference in double precision: y = sum x * w over the 5 x 5 window, dw = sum x * dy with dy = 2 (y - target) / count.
+    const count: f64 = @floatFromInt(y.value.data.len);
+    var want_dw: [25 * c_out]f64 = @splat(0);
+    for (0..n) |b| {
+        for (0..size) |oy| {
+            for (0..size) |ox| {
+                for (0..c_out) |oc| {
+                    var sum: f64 = 0;
+                    for (0..25) |j| {
+                        const py = oy + j / 5;
+                        const px = ox + j % 5;
+                        if (py < 2 or px < 2 or py - 2 >= size or px - 2 >= size) continue;
+                        sum += @as(f64, x.value.data[(b * size + py - 2) * size + px - 2]) * w.value.data[j * c_out + oc];
+                    }
+                    const at = ((b * size + oy) * size + ox) * c_out + oc;
+                    try testing.expectApproxEqAbs(@as(f32, @floatCast(sum)), y.value.data[at], 1e-5);
+                    const dy = 2 * (sum - target.value.data[at]) / count;
+                    for (0..25) |j| {
+                        const py = oy + j / 5;
+                        const px = ox + j % 5;
+                        if (py < 2 or px < 2 or py - 2 >= size or px - 2 >= size) continue;
+                        want_dw[j * c_out + oc] += @as(f64, x.value.data[(b * size + py - 2) * size + px - 2]) * dy;
+                    }
+                }
+            }
+        }
+    }
+    for (want_dw, w.grad.data) |want, got| try testing.expectApproxEqAbs(@as(f32, @floatCast(want)), got, 1e-5);
+}
+
+test "a cpu convolution built in chunks of rows matches a direct reference, outputs and weight gradient, on one thread and on the pool" {
+    // 30 x 28 x 28 = 23520 positions of a 5 x 5 window: more than one chunk of the im2col matrix, with a shorter last chunk.
+    var one_y: [30 * 28 * 28 * 4]f32 = undefined;
+    var many_y: [30 * 28 * 28 * 4]f32 = undefined;
+    var one_dw: [100]f32 = undefined;
+    var many_dw: [100]f32 = undefined;
+    try chunkedConvolution(.{}, &one_y, &one_dw);
+    try chunkedConvolution(.{ .io = testing.io, .threads = 4 }, &many_y, &many_dw);
+    try testing.expectEqualSlices(f32, &one_y, &many_y);
+    for (one_dw, many_dw) |a, b| try testing.expectApproxEqAbs(a, b, 1e-5);
+}
+
 test "the fused gru ops have correct gradients for every input, on the cpu and the gpu" {
     try gradcheck.expectFiniteDifferences(GruOpsNet, 11, 1e-2, 5e-3);
     try gradcheck.expectGpuMatchesCpu(GruOpsNet, 12, 1e-5);

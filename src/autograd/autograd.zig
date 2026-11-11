@@ -101,6 +101,40 @@ pub fn PoolOut(comptime In: type, comptime opts: PoolOpts) type {
     return Tensor(In.Elem, &.{ In.shape[0], (In.shape[1] + 2 * opts.pad - opts.kernel) / opts.stride + 1, (In.shape[2] + 2 * opts.pad - opts.kernel) / opts.stride + 1, In.shape[3] });
 }
 
+// ***** cpu element-wise kernels *****
+
+const PairJob = struct { dst: []f32, src: []const f32 };
+
+fn addRange(job: PairJob, lo: usize, hi: usize) void {
+    for (job.dst[lo..hi], job.src[lo..hi]) |*d, s| d.* += s;
+}
+
+fn reluRange(job: PairJob, lo: usize, hi: usize) void {
+    for (job.dst[lo..hi], job.src[lo..hi]) |*d, s| d.* = @max(s, 0);
+}
+
+const ReluGradJob = struct { dst: []f32, x: []const f32, g: []const f32 };
+
+fn reluGradRange(job: ReluGradJob, lo: usize, hi: usize) void {
+    for (job.dst[lo..hi], job.x[lo..hi], job.g[lo..hi]) |*d, v, g| d.* += if (v > 0) g else 0;
+}
+
+// out = a op b over rows of cols values; with repeat_b every row uses the same vector b instead of its own row of b.
+const RowJob = struct { a: [*]const f32, b: [*]const f32, out: [*]f32, cols: usize, repeat_b: bool, multiply: bool };
+
+fn rowElementwise(job: RowJob, lo: usize, hi: usize) void {
+    for (lo..hi) |row| {
+        const a = job.a[row * job.cols ..][0..job.cols];
+        const b = if (job.repeat_b) job.b[0..job.cols] else job.b[row * job.cols ..][0..job.cols];
+        const out = job.out[row * job.cols ..][0..job.cols];
+        if (job.multiply) {
+            for (out, a, b) |*o, x, y| o.* = x * y;
+        } else {
+            for (out, a, b) |*o, x, y| o.* = x + y;
+        }
+    }
+}
+
 // ***** tape *****
 
 const Node = struct {
@@ -172,6 +206,20 @@ pub const Tape = struct {
             return out;
         }
         if (comptime @TypeOf(a).Elem != f32) return error.NoDevice;
+        const A = @TypeOf(a);
+        const B = @TypeOf(b);
+        const R = ops.BroadcastResult(A, B);
+        // NOTE: the two shapes that dominate networks (equal shapes, and a vector added or multiplied to every row) run on
+        // the worker pool; anything else takes the general broadcasting loop of ops.
+        const equal = comptime std.mem.eql(usize, A.shape, B.shape);
+        const per_row = comptime A.rank >= 2 and B.rank == 1 and B.shape[0] == A.shape[A.rank - 1] and std.mem.eql(usize, R.shape, A.shape);
+        if (comptime equal or per_row) {
+            const out = try R.empty(self.gpa);
+            const cols = if (per_row) B.len else A.len;
+            const job: RowJob = .{ .a = a.data.ptr, .b = b.data.ptr, .out = out.data.ptr, .cols = cols, .repeat_b = per_row, .multiply = op == .mul };
+            kernels.parallelFor(self.par, A.len / cols, @max(1, (1 << 14) / cols), job, rowElementwise);
+            return out;
+        }
         return switch (op) {
             .add => ops.add(self.gpa, a, b),
             .mul => ops.mul(self.gpa, a, b),
@@ -216,7 +264,7 @@ pub const Tape = struct {
         }
         if (comptime D.Elem != f32) return error.NoDevice;
         if (comptime std.mem.eql(usize, D.shape, G.shape)) {
-            for (v.grad.data, g.data) |*d, x| d.* += x;
+            kernels.parallelFor(self.par, D.len, 1 << 15, PairJob{ .dst = v.grad.data, .src = g.data }, addRange);
         } else {
             const r = try ops.sumTo(self.gpa, g, D.shape);
             for (v.grad.data, r.data) |*d, x| d.* += x;
@@ -333,7 +381,8 @@ pub const Tape = struct {
             try dev.relu(x.value.data, value.data);
         } else {
             if (comptime @TypeOf(x.value).Elem != f32) return error.NoDevice;
-            value = try ops.relu(self.gpa, x.value);
+            value = try self.newTensor(@TypeOf(x.value));
+            kernels.parallelFor(self.par, value.data.len, 1 << 15, PairJob{ .dst = value.data, .src = x.value.data }, reluRange);
         }
         const out = try self.makeVar(value, x.needs_grad);
         try self.note(.relu, .{x}, out, .{});
@@ -341,9 +390,8 @@ pub const Tape = struct {
         if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
                 if (t.par.gpu) |dev| return dev.reluBackward(c.x.value.data, c.out.grad.data, c.x.grad.data);
-                for (c.x.grad.data, c.x.value.data, c.out.grad.data) |*gx, v, g| {
-                    gx.* += if (v > 0) g else 0;
-                }
+                if (comptime @TypeOf(c.x.value).Elem != f32) return error.NoDevice;
+                kernels.parallelFor(t.par, c.x.grad.data.len, 1 << 15, ReluGradJob{ .dst = c.x.grad.data, .x = c.x.value.data, .g = c.out.grad.data }, reluGradRange);
             }
         }.run);
         return out;
@@ -758,7 +806,11 @@ pub const Tape = struct {
         var x_half: []const u16 = &.{};
         switch (path) {
             .grouped => try self.convKernel(.groupedForward, .{ x.value.data, w.value.data, value.data }, d),
-            .direct => {
+            .direct => if (dev == null) {
+                // NOTE: the CPU builds the im2col matrix in cache-sized chunks instead of one buffer of positions x k*k*c;
+                // the weight gradient rebuilds it the same way.
+                try cpu.convForward(self.gpa, self.par, x.value.data, w.value.data, value.data, d);
+            } else {
                 col = try self.newTensor(Col);
                 try self.convKernel(.im2col, .{ x.value.data, col.data }, d);
                 try tensor.matmulInto(self.gpa, self.par, col, w.value, Flat{ .data = value.data }, .{});
@@ -806,7 +858,13 @@ pub const Tape = struct {
                             try tensor.matmulInto(t.gpa, t.par, grad, c.w.value, dcol, .{ .trans_b = true });
                             try t.convKernel(.col2im, .{ dcol.data, c.x.grad.data }, d);
                         }
-                        if (c.w.needs_grad) try tensor.matmulInto(t.gpa, t.par, c.col, grad, c.w.grad, .{ .trans_a = true, .accumulate = true });
+                        if (c.w.needs_grad) {
+                            if (device == null) {
+                                try cpu.convWeightGrad(t.gpa, t.par, c.x.value.data, grad.data, c.w.grad.data, d);
+                            } else {
+                                try tensor.matmulInto(t.gpa, t.par, c.col, grad, c.w.grad, .{ .trans_a = true, .accumulate = true });
+                            }
+                        }
                     },
                     .packed_im2col => {
                         const g = t.par.gpu.?;
