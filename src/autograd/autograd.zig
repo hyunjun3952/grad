@@ -8,6 +8,7 @@ const ga = @import("../gpu/args.zig");
 const conv = @import("../gpu/math/conv.zig");
 const cpu = @import("../cpu/ops.zig");
 const activation_math = @import("../gpu/math/activation.zig");
+const softmax_math = @import("../gpu/math/softmax.zig");
 const drop = @import("../gpu/math/dropout.zig");
 const norm = @import("../gpu/math/norm.zig");
 const bf16_math = @import("../gpu/math/bf16.zig");
@@ -278,6 +279,32 @@ pub const Tape = struct {
                 for (c.x.grad.data, c.x.value.data, c.out.grad.data) |*gx, v, g| {
                     gx.* += if (v > 0) g else 0;
                 }
+            }
+        }.run);
+        return out;
+    }
+
+    pub fn softmax(self: *Tape, x: anytype, comptime causal_period: usize) Error!Var(@TypeOf(x.value)) {
+        const X = @TypeOf(x.value);
+        comptime if (X.rank != 2 or X.Elem != f32) @compileError("softmax expects an f32 (rows, columns) tensor");
+        const cols = X.shape[1];
+        const value = try self.newTensor(X);
+        if (self.par.gpu) |dev| {
+            try dev.softmax(x.value.data, value.data, cols, causal_period);
+        } else {
+            const Job = struct { x: [*]const f32, y: [*]f32 };
+            kernels.parallelFor(self.par, X.shape[0], 16, Job{ .x = x.value.data.ptr, .y = value.data.ptr }, struct {
+                fn run(job: Job, lo: usize, hi: usize) void {
+                    for (lo..hi) |r| softmax_math.forwardRow(job.x + r * cols, job.y + r * cols, cols, softmax_math.limitOf(r, cols, causal_period));
+                }
+            }.run);
+        }
+        const out = try self.makeVar(value, x.needs_grad);
+        const Ctx = struct { x: @TypeOf(x), out: @TypeOf(out) };
+        if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .out = out }, struct {
+            fn run(t: *Tape, c: *const Ctx) Error!void {
+                if (t.par.gpu) |dev| return dev.softmaxBackward(c.out.value.data, c.out.grad.data, c.x.grad.data, cols);
+                for (0..X.shape[0]) |r| softmax_math.backwardRow(c.out.value.data.ptr + r * cols, c.out.grad.data.ptr + r * cols, c.x.grad.data.ptr + r * cols, cols);
             }
         }.run);
         return out;
@@ -988,6 +1015,26 @@ const WideConvNet = struct {
     }
 };
 
+fn SoftmaxNet(comptime period: usize) type {
+    return struct {
+        const X = Tensor(f32, &.{ 6, 3 });
+        pub const Inputs = struct { x: X, y: X };
+        pub const names = .{ "x", "y" };
+        pub const labels: [6]u8 = @splat(0);
+        const Result = struct { loss: Var(Tensor(f32, &.{})), x: Var(X), y: Var(X) };
+
+        pub fn build(t: *Tape, p: Inputs, _: []const u8) !Result {
+            const x = try t.leaf(p.x);
+            const y = try t.leaf(p.y);
+            return .{ .loss = try t.mse(try t.softmax(x, period), y), .x = x, .y = y };
+        }
+
+        pub fn acceptable(_: Allocator, _: Inputs) !bool {
+            return true;
+        }
+    };
+}
+
 const SmoothedNet = struct {
     pub const Inputs = SmallNet.Inputs;
     pub const names = SmallNet.names;
@@ -1581,6 +1628,19 @@ test "a convolution on bf16 activations agrees with the f32 convolution within b
     for (wide_y, half_y) |want, got| try testing.expectApproxEqAbs(want, got, 0.08 + 0.02 * @abs(want));
     for (wide_dx, half_dx) |want, got| try testing.expectApproxEqAbs(want, got, 0.25 + 0.03 * @abs(want));
     for (wide_dw, half_dw) |want, got| try testing.expectApproxEqAbs(want, got, 0.6 + 0.03 * @abs(want));
+}
+
+test "softmax rows, with and without a causal mask, have correct values and gradients on the cpu and the gpu" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var t: Tape = .{ .gpa = arena.allocator() };
+    const x = try t.leaf(try Tensor(f32, &.{ 3, 3 }).fromSlice(t.gpa, &.{ 0, 0, 0, 0, 0, 0, 1, 2, 3 }));
+    const p = try t.softmax(x, 3);
+    try testing.expectEqualSlices(f32, &.{ 1, 0, 0, 0.5, 0.5, 0, 0.09003057, 0.24472848, 0.66524094 }, p.value.data);
+    inline for (.{ 0, 3 }) |period| {
+        try gradcheck.expectFiniteDifferences(SoftmaxNet(period), 7, 1e-2, 3e-3);
+        try gradcheck.expectGpuMatchesCpu(SoftmaxNet(period), 8, 1e-5);
+    }
 }
 
 test "label smoothing blends the target and its gradient with the uniform distribution" {

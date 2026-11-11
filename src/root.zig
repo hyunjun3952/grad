@@ -25,6 +25,7 @@ test {
     _ = @import("gpu/math/conv.zig");
     _ = @import("gpu/math/dropout.zig");
     _ = @import("gpu/math/activation.zig");
+    _ = @import("gpu/math/softmax.zig");
     _ = @import("gpu/math/augment.zig");
     _ = @import("gpu/math/norm.zig");
     _ = @import("gpu/math/bf16.zig");

@@ -60,6 +60,8 @@ const Kernel = enum {
     relu,
     reluBackward,
     transposeHalf,
+    softmaxRows,
+    softmaxBackward,
     toHalf,
     fromHalf,
     addFromHalf,
@@ -588,6 +590,14 @@ pub const Gpu = struct {
 
     pub fn reluBackward(self: *Gpu, x: []const f32, g_out: []const f32, g_in: []f32) Error!void {
         try self.launchFlat(.reluBackward, x.len, .{ x, g_out, g_in, x.len });
+    }
+
+    pub fn softmax(self: *Gpu, x: []const f32, y: []f32, cols: usize, period: usize) Error!void {
+        try self.launchFlat(.softmaxRows, x.len / cols, .{ x, y, x.len / cols, cols, period });
+    }
+
+    pub fn softmaxBackward(self: *Gpu, y: []const f32, dy: []const f32, dx: []f32, cols: usize) Error!void {
+        try self.launchFlat(.softmaxBackward, y.len / cols, .{ y, dy, dx, y.len / cols, cols });
     }
 
     pub fn toHalf(self: *Gpu, x: []const f32, y: []u16) Error!void {

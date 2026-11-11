@@ -5,6 +5,7 @@ const ga = @import("args.zig");
 const cv = @import("math/conv.zig");
 const drop = @import("math/dropout.zig");
 const nm = @import("math/norm.zig");
+const soft = @import("math/softmax.zig");
 
 const BK = 8;
 const threads = 256;
@@ -189,6 +190,16 @@ export fn addFromHalf(x: [*]const u16, y: [*]f32, n: u32) callconv(.nvptx_kernel
 export fn addToHalf(x: [*]const f32, y: [*]u16, n: u32) callconv(.nvptx_kernel) void {
     const t = globalIndex();
     if (t < n) y[t] = bf16.encode(bf16.decode(y[t]) + x[t]);
+}
+
+export fn softmaxRows(x: [*]const f32, y: [*]f32, rows: u32, cols: u32, period: u32) callconv(.nvptx_kernel) void {
+    const r = globalIndex();
+    if (r < rows) soft.forwardRow(x + r * cols, y + r * cols, cols, soft.limitOf(r, cols, period));
+}
+
+export fn softmaxBackward(y: [*]const f32, dy: [*]const f32, dx: [*]f32, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
+    const r = globalIndex();
+    if (r < rows) soft.backwardRow(y + r * cols, dy + r * cols, dx + r * cols, cols);
 }
 
 export fn activation(x: [*]const f32, out: [*]f32, n: u32, kind: u32) callconv(.nvptx_kernel) void {

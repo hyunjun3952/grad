@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 
 pub const Kind = enum(u32) { sigmoid, tanh, gelu };
 
-inline fn exponential(x: f32) f32 {
+pub inline fn exponential(x: f32) f32 {
     if (builtin.cpu.arch.isNvptx()) return asm ("ex2.approx.f32 %[out], %[in];"
         : [out] "=f" (-> f32),
         : [in] "f" (x * 1.442695041),
