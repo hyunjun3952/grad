@@ -29,6 +29,8 @@ pub fn build(b: *std.Build) void {
     config.addOption(bool, "cnn", b.option(bool, "cnn", "mnist example: train the convolutional network instead of the MLP") orelse false);
     config.addOption(bool, "wide", b.option(bool, "wide", "cifar example: widths 64-192-384 instead of 64-128-256 (slower, more accurate)") orelse false);
 
+    config.addOption(bool, "cifar100", b.option(bool, "cifar100", "cifar example: train on CIFAR-100 (data/cifar100) instead of CIFAR-10") orelse false);
+
     inline for (.{ "mnist", "cifar" }) |name| {
         const exe = b.addExecutable(.{
             .name = name,

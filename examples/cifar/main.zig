@@ -7,7 +7,7 @@ const Tensor = grad.Tensor;
 const Tape = grad.autograd.Tape;
 const Var = grad.autograd.Var;
 
-const categories = 10;
+const categories = if (config.cifar100) 100 else 10;
 const w1 = 64;
 const w2 = if (config.wide) 192 else 128;
 const w3 = if (config.wide) 384 else 256;
@@ -37,10 +37,10 @@ fn residual(tape: *Tape, first: anytype, second: anytype, x: anytype) grad.autog
 }
 
 const Cifar = struct {
-    pub const name = std.fmt.comptimePrint("CIFAR-10 ResNet-14 {d}-{d}-{d}", .{ w1, w2, w3 });
+    pub const name = std.fmt.comptimePrint("CIFAR-{d} ResNet-14 {d}-{d}-{d}", .{ categories, w1, w2, w3 });
     pub const Layers = Network;
-    pub const Loader = grad.cifar;
-    pub const data_dir = "data/cifar";
+    pub const Loader = if (config.cifar100) grad.cifar100 else grad.cifar;
+    pub const data_dir = if (config.cifar100) "data/cifar100" else "data/cifar";
     pub const side = 32;
     pub const channels = 3;
     pub const classes = categories;

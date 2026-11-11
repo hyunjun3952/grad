@@ -2,6 +2,7 @@ pub const augment = @import("gpu/math/augment.zig");
 pub const autograd = @import("autograd/autograd.zig");
 pub const checkpoint = @import("nn/checkpoint.zig");
 pub const cifar = @import("data/cifar.zig");
+pub const cifar100 = @import("data/cifar100.zig");
 pub const Dataset = @import("data/dataset.zig").Dataset;
 pub const gpu = @import("gpu/gpu.zig");
 pub const kernels = @import("cpu/kernels.zig");
