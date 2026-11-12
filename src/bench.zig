@@ -518,6 +518,37 @@ fn measureGpu(io: Io, dev: *grad.gpu.Gpu, comptime operation: anytype, args: any
     return nanoseconds(io, started);
 }
 
+// Times the im2col matrix build and the GEMM of one convolution forward separately. NOTE: the library builds the matrix in
+// cache-sized chunks, so building it whole here overstates im2col a little (the chunk stays in cache there).
+fn convSplit(io: Io, gpa: std.mem.Allocator, par: kernels.Parallel, out: *Io.Writer, name: []const u8, d: grad.math.conv.Dims) !void {
+    const rows = grad.cpu_ops.rowsOf(d);
+    const kc = @as(usize, d.k) * d.k * d.c;
+    const x = try gpa.alloc(f32, @as(usize, d.n) * d.h * d.w * d.c);
+    defer gpa.free(x);
+    const w = try gpa.alloc(f32, kc * d.c_out);
+    defer gpa.free(w);
+    const col = try gpa.alloc(f32, rows * kc);
+    defer gpa.free(col);
+    const result = try gpa.alloc(f32, rows * d.c_out);
+    defer gpa.free(result);
+    const work = try gpa.alloc(f32, kernels.matmulTiledWorkLen(f32, .{}, par, rows, kc, d.c_out));
+    defer gpa.free(work);
+    @memset(x, 0.5);
+    @memset(w, 0.25);
+
+    var best_col: f64 = 1e9;
+    var best_gemm: f64 = 1e9;
+    for (0..20) |_| {
+        var started = Io.Clock.awake.now(io);
+        grad.cpu_ops.im2col(par, x, col, d);
+        best_col = @min(best_col, milliseconds(io, started));
+        started = Io.Clock.awake.now(io);
+        kernels.matmulTiled(f32, .{}, par, .{ .m = rows, .k = kc, .n = d.c_out, .a = col, .b = w, .out = result }, work);
+        best_gemm = @min(best_gemm, milliseconds(io, started));
+    }
+    try out.print("{s:<18} {d:>9.3} {d:>9.3}\n", .{ name, best_col, best_gemm });
+}
+
 fn cpuOps(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
     const par: kernels.Parallel = .{ .io = io, .threads = std.Thread.getCpuCount() catch 1 };
     const Tape = grad.autograd.Tape;
@@ -550,6 +581,14 @@ fn cpuOps(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
             best_backward = @min(best_backward, milliseconds(io, back));
         }
         try out.print("{s:<18} {d:>9.3} {d:>9.3}\n", .{ case[0], best_forward, best_backward });
+    }
+
+    try out.print("\n{s:<18} {s:>9} {s:>9}\n", .{ "forward split", "im2col", "gemm" });
+    inline for (.{
+        .{ "conv 5x5 1->16", grad.math.conv.Dims{ .n = 64, .h = 28, .w = 28, .c = 1, .k = 5, .c_out = 16 } },
+        .{ "conv 5x5 16->32", grad.math.conv.Dims{ .n = 64, .h = 12, .w = 12, .c = 16, .k = 5, .c_out = 32 } },
+    }) |case| {
+        try convSplit(io, gpa, par, out, case[0], case[1]);
     }
 
     var best: [3][2]f64 = @splat(@splat(1e9));
