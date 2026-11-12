@@ -92,6 +92,25 @@ test "convForward equals the per-element im2col product on the direct single-cha
         @memset(got, 99);
         try lib.cpu_ops.convForward(gpa, par, x, w, got, d);
         for (want, got) |a, b| try testing.expectApproxEqAbs(a, b, 1e-4);
+
+        // The weight gradient adds im2col(x)^T * grad to what dw already holds.
+        const upstream = try gpa.alloc(f32, rows * d.c_out);
+        defer gpa.free(upstream);
+        for (upstream) |*v| v.* = rng.floatNorm(f32);
+        const want_dw = try gpa.alloc(f32, w.len);
+        defer gpa.free(want_dw);
+        const got_dw = try gpa.alloc(f32, w.len);
+        defer gpa.free(got_dw);
+        for (want_dw, got_dw, 0..) |*a, *b, q| {
+            const start = rng.floatNorm(f32);
+            a.* = start;
+            b.* = start;
+            var sum: f64 = start;
+            for (0..rows) |r| sum += @as(f64, columns[r * kc + q / d.c_out]) * upstream[r * d.c_out + q % d.c_out];
+            a.* = @floatCast(sum);
+        }
+        try lib.cpu_ops.convWeightGrad(gpa, par, x, upstream, got_dw, d);
+        for (want_dw, got_dw) |a, b| try testing.expectApproxEqAbs(a, b, 1e-3);
     }
 }
 

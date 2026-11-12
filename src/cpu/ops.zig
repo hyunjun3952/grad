@@ -85,6 +85,13 @@ fn convIsDirect(d: cv.Dims) bool {
     return d.c == 1 and d.groups == 1 and d.pad == 0 and d.dilation == 1 and d.c_out % direct_lanes == 0;
 }
 
+// Index in x of the top-left tap of output position row (positions are numbered image, then output row, then output column).
+fn directOrigin(d: cv.Dims, row: usize) usize {
+    const out_w: usize = cv.outWidth(d);
+    const out_h: usize = cv.outHeight(d);
+    return ((row / (out_h * out_w)) * d.h + row / out_w % out_h * d.stride) * d.w + row % out_w * d.stride;
+}
+
 // Output positions accumulated together: one position is a chain of k*k dependent multiply-adds, so a single chain waits on
 // the FMA latency; independent positions fill the pipeline.
 const direct_block = 8;
@@ -94,13 +101,8 @@ fn convDirectBlock(comptime block: usize, job: DirectJob, first: usize) void {
     const d = job.d;
     const k: usize = d.k;
     const c_out: usize = d.c_out;
-    const out_w: usize = cv.outWidth(d);
-    const out_h: usize = cv.outHeight(d);
     var origin: [block]usize = undefined;
-    inline for (0..block) |b| {
-        const row = first + b;
-        origin[b] = ((row / (out_h * out_w)) * d.h + row / out_w % out_h * d.stride) * d.w + row % out_w * d.stride;
-    }
+    inline for (0..block) |b| origin[b] = directOrigin(d, first + b);
     var v: usize = 0;
     while (v < c_out) : (v += direct_lanes) {
         var acc: [block]Vec = @splat(@splat(0));
@@ -167,8 +169,71 @@ pub fn convInputGrad(gpa: std.mem.Allocator, par: kernels.Parallel, grad: []cons
     }
 }
 
+const DirectGradJob = struct { x: []const f32, grad: []const f32, partial: []f32, d: cv.Dims, shares: usize };
+
+// Positions whose output gradients stay in L1 while every tap group sweeps over them, and taps accumulated together (each
+// is an independent chain, which hides the FMA latency).
+const grad_block = 64;
+const grad_taps = 8;
+
+fn gradTapGroup(comptime group: usize, job: DirectGradJob, mine: []f32, origins: []const usize, first: usize, tap: usize, v: usize) void {
+    const Vec = @Vector(direct_lanes, f32);
+    const d = job.d;
+    const k: usize = d.k;
+    const c_out: usize = d.c_out;
+    var offsets: [group]usize = undefined;
+    inline for (0..group) |g| offsets[g] = (tap + g) / k * d.w + (tap + g) % k;
+    var acc: [group]Vec = @splat(@splat(0));
+    for (origins, 0..) |origin, i| {
+        const g_row: Vec = job.grad[(first + i) * c_out + v ..][0..direct_lanes].*;
+        inline for (0..group) |g| acc[g] = @mulAdd(Vec, @splat(job.x[origin + offsets[g]]), g_row, acc[g]);
+    }
+    inline for (0..group) |g| {
+        const slot = mine[(tap + g) * c_out + v ..][0..direct_lanes];
+        slot.* = @as(Vec, slot.*) + acc[g];
+    }
+}
+
+fn convDirectGradParts(job: DirectGradJob, lo: usize, hi: usize) void {
+    const d = job.d;
+    const kc: usize = @as(usize, d.k) * d.k;
+    const rows = rowsOf(d);
+    const per_share = (rows + job.shares - 1) / job.shares;
+    for (lo..hi) |share| {
+        const mine = job.partial[share * kc * d.c_out ..][0 .. kc * d.c_out];
+        var first = share * per_share;
+        const last = @min(first + per_share, rows);
+        while (first < last) : (first += grad_block) {
+            const count = @min(grad_block, last - first);
+            var origins: [grad_block]usize = undefined;
+            for (0..count) |i| origins[i] = directOrigin(d, first + i);
+            var v: usize = 0;
+            while (v < d.c_out) : (v += direct_lanes) {
+                var tap: usize = 0;
+                while (tap + grad_taps <= kc) : (tap += grad_taps) gradTapGroup(grad_taps, job, mine, origins[0..count], first, tap, v);
+                while (tap < kc) : (tap += 1) gradTapGroup(1, job, mine, origins[0..count], first, tap, v);
+            }
+        }
+    }
+}
+
+// Weight gradient of a single-channel convolution: each thread sums its share of the positions into a private copy of dw,
+// and the copies are added in order, so the result does not depend on scheduling.
+fn convDirectWeightGrad(gpa: std.mem.Allocator, par: kernels.Parallel, x: []const f32, grad: []const f32, dw: []f32, d: cv.Dims) !void {
+    const shares = if (par.io == null) 1 else @max(1, @min(par.threads, rowsOf(d) / 256));
+    const partial = try gpa.alloc(f32, shares * dw.len);
+    defer gpa.free(partial);
+    @memset(partial, 0);
+    kernels.parallelFor(par, shares, 1, DirectGradJob{ .x = x, .grad = grad, .partial = partial, .d = d, .shares = shares }, convDirectGradParts);
+    for (0..shares) |share| {
+        for (dw, partial[share * dw.len ..][0..dw.len]) |*total, value| total.* += value;
+    }
+}
+
 /// Adds the weight gradient im2col(x)^T * grad to dw, rebuilding the im2col matrix chunk by chunk. grad is positions x c_out.
+/// A single-channel convolution without padding sums the taps directly instead.
 pub fn convWeightGrad(gpa: std.mem.Allocator, par: kernels.Parallel, x: []const f32, grad: []const f32, dw: []f32, d: cv.Dims) !void {
+    if (convIsDirect(d)) return convDirectWeightGrad(gpa, par, x, grad, dw, d);
     const kc = @as(usize, d.k) * d.k * d.c;
     const rows = rowsOf(d);
     const chunk = chunkRows(d);
