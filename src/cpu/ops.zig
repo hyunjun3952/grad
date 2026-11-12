@@ -19,6 +19,11 @@ fn im2colRows(job: Job, lo: usize, hi: usize) void {
     for (lo..hi) |index| {
         const patch = cv.patchOf(@intCast(job.first + index), d);
         const out = job.dst[index * kc ..][0..kc];
+        if (d.dilation != 1) {
+            // NOTE: the memcpy fast path copies whole tap rows, which only holds for contiguous (dilated) taps.
+            for (0..kc) |cc| out[cc] = cv.im2colValue(job.src.ptr, @intCast(job.first + index), @intCast(cc), d);
+            continue;
+        }
         const first: usize = @intCast(std.math.clamp(pad - @as(i64, patch.left), 0, @as(i64, @intCast(k))));
         const last: usize = @intCast(std.math.clamp(w + pad - @as(i64, patch.left), 0, @as(i64, @intCast(k))));
         for (0..k) |ky| {
@@ -142,13 +147,15 @@ fn col2imPixels(job: Job, lo: usize, hi: usize) void {
         const out = job.dst[pixel * c ..][0..c];
         var ky: u32 = 0;
         while (ky < d.k) : (ky += 1) {
-            if (y < ky or (y - ky) % d.stride != 0) continue;
-            const oy = (y - ky) / d.stride;
+            const shift_y = ky * d.dilation;
+            if (y < shift_y or (y - shift_y) % d.stride != 0) continue;
+            const oy = (y - shift_y) / d.stride;
             if (oy >= oh) continue;
             var kx: u32 = 0;
             while (kx < d.k) : (kx += 1) {
-                if (x < kx or (x - kx) % d.stride != 0) continue;
-                const ox = (x - kx) / d.stride;
+                const shift_x = kx * d.dilation;
+                if (x < shift_x or (x - shift_x) % d.stride != 0) continue;
+                const ox = (x - shift_x) / d.stride;
                 if (ox >= ow) continue;
                 const source = job.src[((@as(usize, n) * oh + oy) * ow + ox) * kc + (@as(usize, ky) * d.k + kx) * c ..][0..c];
                 for (out, source) |*o, s| o.* += s;

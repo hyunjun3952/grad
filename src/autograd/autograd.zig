@@ -820,15 +820,21 @@ pub const Tape = struct {
         const kc = k * k * c_in;
         const Col = Tensor(f32, &.{ rows, kc });
         const Flat = Tensor(f32, &.{ rows, c_out });
-        const geometry: ga.ConvGeometry = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = c_in, .k = k, .stride = opts.stride, .pad = opts.pad, .out_h = Out.shape[1], .out_w = Out.shape[2], .positions = rows, .c_out = c_out };
-        const reverse: ga.ConvGeometry = .{ .n = In.shape[0], .h = Out.shape[1], .w = Out.shape[2], .c = c_out, .k = k, .stride = 1, .pad = k - 1 - opts.pad, .out_h = In.shape[1], .out_w = In.shape[2], .positions = In.len / c_in, .c_out = c_in };
+        const geometry: ga.ConvGeometry = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = c_in, .k = k, .stride = opts.stride, .pad = opts.pad, .out_h = Out.shape[1], .out_w = Out.shape[2], .positions = rows, .c_out = c_out, .dilation = opts.dilation };
+        // NOTE: the input gradient is a convolution with rotated weights, a kernel that spans dilation * (k - 1) + 1 and
+        // padding dilation * (k - 1) - pad; when that pad is negative the gather cannot crop, and the conv stays grouped.
+        const reverse: ga.ConvGeometry = .{ .n = In.shape[0], .h = Out.shape[1], .w = Out.shape[2], .c = c_out, .k = k, .stride = 1, .pad = opts.dilation * (k - 1) - opts.pad, .out_h = In.shape[1], .out_w = In.shape[2], .positions = In.len / c_in, .c_out = c_in, .dilation = opts.dilation };
         const cudnn_geometry: gpu_mod.cudnn.Geometry = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = c_in, .k = c_out, .r = k, .pad = opts.pad, .stride = opts.stride };
         const aligned_out = std.mem.alignForward(usize, c_out, 64);
 
         const dev = self.par.gpu;
         const unit_stride_blocks = opts.stride == 1 and c_in % 64 == 0;
-        const general = opts.groups > 1 or opts.dilation > 1;
-        const path: ConvPath = if (general) .grouped else if (dev == null) .direct else if (dev.?.cudnn_lib != null) .cudnn else if (dev.?.tensorWorthwhile(rows, c_out, kc)) (if (unit_stride_blocks and c_out % 32 == 0) .implicit else .packed_im2col) else if (unit_stride_blocks and c_out % 16 == 0 and dev.?.f32ImplicitWorthwhile(rows, c_out, kc)) .f32_implicit else .direct;
+        // NOTE: the gathers space the taps by dilation and the reverse geometry pads by dilation * (k - 1) - pad, so a
+        // dilated convolution can take the implicit GEMM; it cannot take cuDNN (no dilation in its descriptor) or any
+        // path when the reverse pad would be negative.
+        const general = opts.groups > 1 or opts.dilation * (k - 1) < opts.pad;
+        const dilated = opts.dilation > 1;
+        const path: ConvPath = if (general) .grouped else if (dev == null) .direct else if (dev.?.cudnn_lib != null and !dilated) .cudnn else if (dev.?.tensorWorthwhile(rows, c_out, kc)) (if (unit_stride_blocks and c_out % 32 == 0) .implicit else .packed_im2col) else if (unit_stride_blocks and c_out % 16 == 0 and dev.?.f32ImplicitWorthwhile(rows, c_out, kc)) .f32_implicit else .direct;
 
         const value = try self.newTensor(Out);
         // NOTE: the column matrix is k*k times the input. It is kept for the weight gradient unless recompute_columns is set;

@@ -1205,12 +1205,16 @@ fn GemmLoader(comptime kind: GemmKind) type {
         inline fn issue(self: *@This(), stage: usize, kk: usize) void {
             const base = stage * tc.stage_elems;
             const geometry = self.geo;
+            // NOTE: the taps of a dilated convolution sit dilation apart, and a grouped launch reads its channels out of a
+            // tensor whose rows hold all the groups, so the memory stride differs from the logical channel count.
+            const dil: i32 = @intCast(geometry.dilation);
+            const channel_step = if (geometry.c_step != 0) geometry.c_step else geometry.c;
             if (mode == .gather_a) {
                 inline for (0..a_per) |i| {
-                    const y = self.origin_y[i] + self.cursor_ky;
-                    const x = self.origin_x[i] + self.cursor_kx;
+                    const y = self.origin_y[i] + self.cursor_ky * dil;
+                    const x = self.origin_x[i] + self.cursor_kx * dil;
                     const valid = self.origin_valid[i] and y >= 0 and y < @as(i32, @intCast(geometry.h)) and x >= 0 and x < @as(i32, @intCast(geometry.w));
-                    const at = if (valid) ((@as(usize, self.origin_n[i]) * geometry.h + @as(usize, @intCast(y))) * geometry.w + @as(usize, @intCast(x))) * geometry.c + self.cursor_channel + self.chunk_a * lane_elems else 0;
+                    const at = if (valid) ((@as(usize, self.origin_n[i]) * geometry.h + @as(usize, @intCast(y))) * geometry.w + @as(usize, @intCast(x))) * channel_step + self.cursor_channel + self.chunk_a * lane_elems else 0;
                     copyAsyncZfill(tc.sharedAddress(base + self.dst_a[i]), self.a + at, valid);
                 }
                 self.cursor_channel += tc.depth;
@@ -1239,10 +1243,10 @@ fn GemmLoader(comptime kind: GemmKind) type {
             inline for (0..b_per) |j| {
                 const col = self.first_col + self.chunk_b[j] * lane_elems;
                 if (mode == .gather_b) {
-                    const y = @as(i32, @intCast(self.p_y[j] * geometry.stride)) + self.tap_ky[j] - @as(i32, @intCast(geometry.pad));
-                    const x = @as(i32, @intCast(self.p_x[j] * geometry.stride)) + self.tap_kx[j] - @as(i32, @intCast(geometry.pad));
+                    const y = @as(i32, @intCast(self.p_y[j] * geometry.stride)) + self.tap_ky[j] * dil - @as(i32, @intCast(geometry.pad));
+                    const x = @as(i32, @intCast(self.p_x[j] * geometry.stride)) + self.tap_kx[j] * dil - @as(i32, @intCast(geometry.pad));
                     const valid = self.p[j] < geometry.positions and y >= 0 and y < @as(i32, @intCast(geometry.h)) and x >= 0 and x < @as(i32, @intCast(geometry.w));
-                    const at = if (valid) ((@as(usize, self.p_n[j]) * geometry.h + @as(usize, @intCast(y))) * geometry.w + @as(usize, @intCast(x))) * geometry.c + self.tap_channel[j] else 0;
+                    const at = if (valid) ((@as(usize, self.p_n[j]) * geometry.h + @as(usize, @intCast(y))) * geometry.w + @as(usize, @intCast(x))) * channel_step + self.tap_channel[j] else 0;
                     copyAsyncZfill(tc.sharedAddress(base + self.dst_b[j]), self.b + at, valid);
                     // NOTE: issue is called for consecutive tiles of K, so the position moves by exactly depth each time.
                     self.p[j] += tc.depth;

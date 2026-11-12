@@ -336,6 +336,28 @@ const WideConvNet = struct {
     }
 };
 
+const DilatedConvNet = struct {
+    const X = Tensor(f32, &.{ 4, 16, 16, 64 });
+    const W = Tensor(f32, &.{ 576, 32 });
+    const Y = Tensor(f32, &.{ 4, 16 * 16 * 32 });
+
+    pub const Inputs = struct { x: X, w: W, y: Y };
+    pub const names = .{ "x", "w", "y" };
+    pub const labels: [4]u8 = @splat(0);
+    const Result = struct { loss: Var(Tensor(f32, &.{})), x: Var(X), w: Var(W), y: Var(Y) };
+
+    pub fn build(t: *Tape, p: Inputs, _: []const u8) !Result {
+        const x = try t.leaf(p.x);
+        const w = try t.leaf(p.w);
+        const y = try t.leaf(p.y);
+        return .{ .loss = try t.mse(reshape(try t.conv2d(x, w, .{ .pad = 2, .dilation = 2 }), &.{ 4, 16 * 16 * 32 }), y), .x = x, .w = w, .y = y };
+    }
+
+    pub fn acceptable(_: Allocator, _: Inputs) !bool {
+        return true;
+    }
+};
+
 fn LayerNormNet(comptime rows: usize, comptime cols: usize) type {
     return struct {
         const X = Tensor(f32, &.{ rows, cols });
@@ -1486,6 +1508,11 @@ test "grouped, depthwise and dilated convolutions match a direct convolution, fi
 
 test "the wide 128x128 tensor-core kernels agree with the cpu on a grid large enough to select them" {
     try gradcheck.expectTensorCoresClose(WideConvNet, 12, 0.2);
+}
+
+test "dilated convolutions on the implicit GEMM match the cpu" {
+    try gradcheck.expectGpuMatchesCpu(DilatedConvNet, 41, 1e-4);
+    try gradcheck.expectTensorCoresClose(DilatedConvNet, 42, 0.2);
 }
 
 test "implicit-GEMM convolutions on tensor cores match a direct convolution and the cpu" {
