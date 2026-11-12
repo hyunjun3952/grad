@@ -74,9 +74,60 @@ fn chunkWorkLen(comptime cfg: kernels.TileConfig, par: kernels.Parallel, d: cv.D
     return @max(full, last);
 }
 
+const DirectJob = struct { x: []const f32, w: []const f32, out: []f32, d: cv.Dims };
+
+const direct_lanes = std.simd.suggestVectorLength(f32) orelse 1;
+
+// NOTE: with a single input channel the im2col matrix is k*k times the input, and building it costs more than the product
+// (0.26 ms against 0.08 ms for the MNIST 1->16 layer). Padding and dilation would need bounds checks per tap, so they stay on
+// the GEMM path.
+fn convIsDirect(d: cv.Dims) bool {
+    return d.c == 1 and d.groups == 1 and d.pad == 0 and d.dilation == 1 and d.c_out % direct_lanes == 0;
+}
+
+// Output positions accumulated together: one position is a chain of k*k dependent multiply-adds, so a single chain waits on
+// the FMA latency; independent positions fill the pipeline.
+const direct_block = 8;
+
+fn convDirectBlock(comptime block: usize, job: DirectJob, first: usize) void {
+    const Vec = @Vector(direct_lanes, f32);
+    const d = job.d;
+    const k: usize = d.k;
+    const c_out: usize = d.c_out;
+    const out_w: usize = cv.outWidth(d);
+    const out_h: usize = cv.outHeight(d);
+    var origin: [block]usize = undefined;
+    inline for (0..block) |b| {
+        const row = first + b;
+        origin[b] = ((row / (out_h * out_w)) * d.h + row / out_w % out_h * d.stride) * d.w + row % out_w * d.stride;
+    }
+    var v: usize = 0;
+    while (v < c_out) : (v += direct_lanes) {
+        var acc: [block]Vec = @splat(@splat(0));
+        for (0..k) |ky| {
+            for (0..k) |kx| {
+                const weights: Vec = job.w[(ky * k + kx) * c_out + v ..][0..direct_lanes].*;
+                inline for (0..block) |b| {
+                    const tap: Vec = @splat(job.x[origin[b] + ky * d.w + kx]);
+                    acc[b] = @mulAdd(Vec, tap, weights, acc[b]);
+                }
+            }
+        }
+        inline for (0..block) |b| job.out[(first + b) * c_out + v ..][0..direct_lanes].* = acc[b];
+    }
+}
+
+fn convDirectRows(job: DirectJob, lo: usize, hi: usize) void {
+    var row = lo;
+    while (row + direct_block <= hi) : (row += direct_block) convDirectBlock(direct_block, job, row);
+    while (row < hi) : (row += 1) convDirectBlock(1, job, row);
+}
+
 /// Computes out = im2col(x) * w for a convolution without materializing the whole im2col matrix: it is built and multiplied
-/// in chunks of rows. w is (k*k*c) x c_out, out is positions x c_out.
+/// in chunks of rows. w is (k*k*c) x c_out, out is positions x c_out. A single-channel convolution without padding skips the
+/// matrix and accumulates the taps directly.
 pub fn convForward(gpa: std.mem.Allocator, par: kernels.Parallel, x: []const f32, w: []const f32, out: []f32, d: cv.Dims) !void {
+    if (convIsDirect(d)) return kernels.parallelFor(par, rowsOf(d), 64, DirectJob{ .x = x, .w = w, .out = out, .d = d }, convDirectRows);
     const kc = @as(usize, d.k) * d.k * d.c;
     const rows = rowsOf(d);
     const chunk = chunkRows(d);

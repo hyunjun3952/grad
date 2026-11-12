@@ -51,6 +51,50 @@ test "row-wise im2col and col2im equal the per-element reference for strides, pa
     }
 }
 
+test "convForward equals the per-element im2col product on the direct single-channel path and on the GEMM path" {
+    var prng = std.Random.DefaultPrng.init(21);
+    const rng = prng.random();
+    const gpa = testing.allocator;
+    const par: kernels.Parallel = .{ .io = testing.io, .threads = 3 };
+    for ([_]cv.Dims{
+        // Single channel, no padding: the direct path for c_out = 16.
+        .{ .n = 3, .h = 12, .w = 11, .c = 1, .k = 5, .c_out = 16 },
+        .{ .n = 2, .h = 13, .w = 12, .c = 1, .k = 3, .stride = 2, .c_out = 32 },
+        .{ .n = 1, .h = 6, .w = 6, .c = 1, .k = 1, .c_out = 16 },
+        // Padding, several channels and a c_out that is no multiple of any vector width stay on the GEMM path.
+        .{ .n = 2, .h = 8, .w = 8, .c = 1, .k = 3, .pad = 1, .c_out = 16 },
+        .{ .n = 2, .h = 8, .w = 8, .c = 3, .k = 3, .c_out = 16 },
+        .{ .n = 2, .h = 9, .w = 9, .c = 1, .k = 3, .c_out = 6 },
+    }) |d| {
+        const kc = @as(usize, d.k) * d.k * d.c;
+        const rows = rowsOf(d);
+        const x = try gpa.alloc(f32, @as(usize, d.n) * d.h * d.w * d.c);
+        defer gpa.free(x);
+        const w = try gpa.alloc(f32, kc * d.c_out);
+        defer gpa.free(w);
+        const columns = try gpa.alloc(f32, rows * kc);
+        defer gpa.free(columns);
+        const want = try gpa.alloc(f32, rows * d.c_out);
+        defer gpa.free(want);
+        const got = try gpa.alloc(f32, rows * d.c_out);
+        defer gpa.free(got);
+        for (x) |*v| v.* = rng.floatNorm(f32);
+        for (w) |*v| v.* = rng.floatNorm(f32);
+
+        for (0..columns.len) |t| cv.im2col(@intCast(t), x.ptr, columns.ptr, d);
+        for (0..rows) |r| {
+            for (0..d.c_out) |o| {
+                var sum: f64 = 0;
+                for (0..kc) |q| sum += @as(f64, columns[r * kc + q]) * w[q * d.c_out + o];
+                want[r * d.c_out + o] = @floatCast(sum);
+            }
+        }
+        @memset(got, 99);
+        try lib.cpu_ops.convForward(gpa, par, x, w, got, d);
+        for (want, got) |a, b| try testing.expectApproxEqAbs(a, b, 1e-4);
+    }
+}
+
 test "row-wise max pooling gives the same values and winner indices as the per-element reference" {
     var prng = std.Random.DefaultPrng.init(9);
     const rng = prng.random();
