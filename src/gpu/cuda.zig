@@ -16,6 +16,7 @@ const Api = struct {
     cuCtxSynchronize: *const fn () callconv(.c) Status,
     cuMemAlloc_v2: *const fn (ptr: *DevicePtr, bytes: usize) callconv(.c) Status,
     cuMemFree_v2: *const fn (ptr: DevicePtr) callconv(.c) Status,
+    cuMemGetInfo_v2: *const fn (free: *usize, total: *usize) callconv(.c) Status,
     cuMemsetD32_v2: *const fn (dst: DevicePtr, value: c_uint, count: usize) callconv(.c) Status,
     cuMemcpyHtoD_v2: *const fn (dst: DevicePtr, src: *const anyopaque, bytes: usize) callconv(.c) Status,
     cuMemcpyDtoH_v2: *const fn (dst: *anyopaque, src: DevicePtr, bytes: usize) callconv(.c) Status,
@@ -130,6 +131,14 @@ pub const Cuda = struct {
 
     pub fn free(self: *const Cuda, ptr: DevicePtr) void {
         _ = self.api.cuMemFree_v2(ptr);
+    }
+
+    /// Returns how many bytes of device memory are free right now, for every process on the device.
+    pub fn freeBytes(self: *const Cuda) !usize {
+        var free_bytes: usize = 0;
+        var total_bytes: usize = 0;
+        try self.check(self.api.cuMemGetInfo_v2(&free_bytes, &total_bytes));
+        return free_bytes;
     }
 
     pub fn memsetD32(self: *const Cuda, dst: DevicePtr, value: u32, count: usize) !void {

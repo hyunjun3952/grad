@@ -349,6 +349,11 @@ pub const Gpu = struct {
         return cuda.Cuda.deviceCount();
     }
 
+    /// Returns how many bytes of device memory are free right now, counting every process on the device.
+    pub fn freeDeviceBytes(self: *Gpu) Error!usize {
+        return self.cu.freeBytes();
+    }
+
     /// Makes this device current on the calling thread, which a thread must do once before it uses a Gpu created elsewhere.
     pub fn makeCurrent(self: *Gpu) Error!void {
         try self.cu.makeCurrent();
