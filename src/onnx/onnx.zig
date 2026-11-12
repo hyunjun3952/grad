@@ -94,6 +94,9 @@ const Builder = struct {
     constants: []const trace_mod.Constant,
     values: std.AutoHashMap(usize, Known),
     emitted: std.AutoHashMap(usize, []const u8),
+    outputs: []const View,
+    // The output id of a batch norm whose scale and shift went into the convolution before it (zero for none).
+    folded_norm: usize = 0,
     counter: usize = 0,
 
     fn fresh(self: *Builder, prefix: []const u8) ![]const u8 {
@@ -227,7 +230,45 @@ const Builder = struct {
         try self.node("Transpose", &.{source}, output, &.{.{ .ints = .{ "perm", &.{ 0, 2, 3, 1 } } }});
     }
 
-    fn convert(self: *Builder, e: Entry) Error!void {
+    const Affine = struct { scale: []const f32, shift: []const f32 };
+
+    // The per-channel scale and shift that a batch norm entry applies with its running statistics.
+    fn normAffine(self: *Builder, e: Entry) Error!Affine {
+        const c = e.inputs[1].dims[0];
+        const gamma = self.weightOf(e.inputs[1].id) orelse return error.UnknownTensor;
+        const beta = self.weightOf(e.inputs[2].id) orelse return error.UnknownTensor;
+        const mean = self.weightOf(e.inputs[3].id) orelse return error.UnknownTensor;
+        const variance = self.weightOf(e.inputs[4].id) orelse return error.UnknownTensor;
+        const scale = try self.names.allocator().alloc(f32, c);
+        const shift = try self.names.allocator().alloc(f32, c);
+        for (0..c) |i| {
+            scale[i] = gamma[i] / @sqrt(variance[i] + norm.eps);
+            shift[i] = beta[i] - mean[i] * scale[i];
+        }
+        return .{ .scale = scale, .shift = shift };
+    }
+
+    // Returns the batch norm that directly follows a convolution when it is the only user of the convolution's output;
+    // its scale then goes into the filters and its shift becomes the convolution bias, so no Mul and Add are written.
+    fn foldableNorm(self: *const Builder, conv: Entry, rest: []const Entry) ?Entry {
+        if (rest.len == 0) return null;
+        const next = rest[0];
+        if (next.op != .batch_norm and next.op != .batch_norm_relu and next.op != .batch_norm_add_relu) return null;
+        if (next.inputs[0].id != conv.output.id) return null;
+        if (next.op == .batch_norm_add_relu and next.inputs[5].id == conv.output.id) return null;
+        for (rest[1..]) |later| {
+            for (later.inputs[0..later.count]) |input| {
+                if (input.id == conv.output.id) return null;
+            }
+        }
+        for (self.outputs) |output| {
+            if (output.id == conv.output.id) return null;
+        }
+        return next;
+    }
+
+    // Writes the nodes of one traced op; rest holds the entries after it, which a convolution looks at to fold a batch norm.
+    fn convert(self: *Builder, e: Entry, rest: []const Entry) Error!void {
         // NOTE: a cast only changes how an activation is stored, so the exported graph stays in f32 and the output aliases the input.
         if (e.op == .cast) return self.produce(e.output, try self.use(e.inputs[0]));
         const out = try self.fresh("value");
@@ -283,7 +324,12 @@ const Builder = struct {
                 .{ .float = .{ "epsilon", layernorm.eps } },
             }),
             .softmax => {
-                const x = try self.use(e.inputs[0]);
+                var x = try self.use(e.inputs[0]);
+                if (e.scale != 1) {
+                    const scaled = try self.fresh("scaled");
+                    try self.node("Mul", &.{ x, try self.floats("scale", &.{1}, &.{e.scale}) }, scaled, &.{});
+                    x = scaled;
+                }
                 if (e.period == 0) {
                     try self.node("Softmax", &.{x}, out, &.{.{ .int = .{ "axis", -1 } }});
                 } else {
@@ -327,15 +373,26 @@ const Builder = struct {
                         }
                     }
                 }
-                const filters = try self.floats("filters", &.{ c_out, c_in, k, k }, oihw);
-                const planar = try self.channelsFirst(try self.use(e.inputs[0]));
+                var operands: [3][]const u8 = .{ try self.channelsFirst(try self.use(e.inputs[0])), "", "" };
+                var count: usize = 2;
+                if (self.foldableNorm(e, rest)) |next| {
+                    const affine = try self.normAffine(next);
+                    const per_filter = oihw.len / c_out;
+                    for (0..c_out) |co| {
+                        for (oihw[co * per_filter ..][0..per_filter]) |*v| v.* *= affine.scale[co];
+                    }
+                    operands[2] = try self.floats("bias", &.{c_out}, affine.shift);
+                    count = 3;
+                    self.folded_norm = next.output.id;
+                }
+                operands[1] = try self.floats("filters", &.{ c_out, c_in, k, k }, oihw);
                 const convolved = try self.fresh("convolved");
                 const kernel: i64 = @intCast(k);
                 const stride: i64 = @intCast(e.stride);
                 const pad: i64 = @intCast(e.pad);
                 const dilation: i64 = @intCast(e.dilation);
                 const groups: i64 = @intCast(e.groups);
-                try self.node("Conv", &.{ planar, filters }, convolved, &.{
+                try self.node("Conv", operands[0..count], convolved, &.{
                     .{ .ints = .{ "kernel_shape", &.{ kernel, kernel } } },
                     .{ .ints = .{ "strides", &.{ stride, stride } } },
                     .{ .ints = .{ "pads", &.{ pad, pad, pad, pad } } },
@@ -357,25 +414,24 @@ const Builder = struct {
                 });
                 try self.channelsLast(pooled, out);
             },
-            .batch_norm, .batch_norm_relu => {
-                const c = e.inputs[1].dims[0];
-                const gamma = self.weightOf(e.inputs[1].id) orelse return error.UnknownTensor;
-                const beta = self.weightOf(e.inputs[2].id) orelse return error.UnknownTensor;
-                const mean = self.weightOf(e.inputs[3].id) orelse return error.UnknownTensor;
-                const variance = self.weightOf(e.inputs[4].id) orelse return error.UnknownTensor;
-                const scale = try self.gpa.alloc(f32, c);
-                defer self.gpa.free(scale);
-                const shift = try self.gpa.alloc(f32, c);
-                defer self.gpa.free(shift);
-                for (0..c) |i| {
-                    scale[i] = gamma[i] / @sqrt(variance[i] + norm.eps);
-                    shift[i] = beta[i] - mean[i] * scale[i];
+            .batch_norm, .batch_norm_relu, .batch_norm_add_relu => {
+                var shifted = try self.use(e.inputs[0]);
+                // NOTE: a folded batch norm is already in the filters and the bias of the convolution before it.
+                if (self.folded_norm != e.output.id) {
+                    const c = e.inputs[1].dims[0];
+                    const affine = try self.normAffine(e);
+                    const scaled = try self.fresh("scaled");
+                    try self.node("Mul", &.{ shifted, try self.floats("scale", &.{c}, affine.scale) }, scaled, &.{});
+                    shifted = if (e.op == .batch_norm) out else try self.fresh("shifted");
+                    try self.node("Add", &.{ scaled, try self.floats("shift", &.{c}, affine.shift) }, shifted, &.{});
                 }
-                const scaled = try self.fresh("scaled");
-                try self.node("Mul", &.{ try self.use(e.inputs[0]), try self.floats("scale", &.{c}, scale) }, scaled, &.{});
-                const shifted = if (e.op == .batch_norm_relu) try self.fresh("shifted") else out;
-                try self.node("Add", &.{ scaled, try self.floats("shift", &.{c}, shift) }, shifted, &.{});
-                if (e.op == .batch_norm_relu) try self.node("Relu", &.{shifted}, out, &.{});
+                if (e.op == .batch_norm) return self.produce(e.output, shifted);
+                var activated = shifted;
+                if (e.op == .batch_norm_add_relu) {
+                    activated = try self.fresh("summed");
+                    try self.node("Add", &.{ shifted, try self.use(e.inputs[5]) }, activated, &.{});
+                }
+                try self.node("Relu", &.{activated}, out, &.{});
             },
         }
         try self.produce(e.output, out);
@@ -416,6 +472,7 @@ pub fn build(gpa: Allocator, graph: Graph) Error![]u8 {
         .constants = trace.constants.items,
         .values = .init(gpa),
         .emitted = .init(gpa),
+        .outputs = outputs,
     };
     defer {
         b.names.deinit();
@@ -424,7 +481,7 @@ pub fn build(gpa: Allocator, graph: Graph) Error![]u8 {
         b.graph.bytes.deinit(gpa);
     }
     for (inputs, 0..) |input, i| try b.produce(input, try b.boundary("input", i, inputs.len));
-    for (trace.entries.items) |e| try b.convert(e);
+    for (trace.entries.items, 0..) |e, i| try b.convert(e, trace.entries.items[i + 1 ..]);
     for (outputs, 0..) |output, i| try b.node("Identity", &.{try b.use(output)}, try b.boundary("output", i, outputs.len), &.{});
     try b.graph.bytesField(gpa, 2, "grad");
     for (inputs, 0..) |input, i| try b.valueInfo(11, try b.boundary("input", i, inputs.len), input);

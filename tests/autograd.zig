@@ -117,9 +117,11 @@ test "dropout is the identity at eval, and backward reuses the forward mask" {
     try testing.expect(kept > 700 and kept < 900);
 }
 
-test "gpu dropout draws the same mask as the cpu" {
+test "gpu dropout draws the same mask as the cpu, with the seed split between the tape and the device step seed" {
     const gpu = try gpu_mod.Gpu.forTest(1 << 20);
     defer gpu.deinit();
+    // NOTE: a recorded training step keeps part of the seed on the device; tape seed 1 plus step seed 2 must equal seed 3.
+    try gpu.setStepSeed(2);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const Row = Tensor(f32, &.{ 1, 1000 });
@@ -132,7 +134,7 @@ test "gpu dropout draws the same mask as the cpu" {
 
     const ones = try gpu.alloc(f32, Row.len);
     try gpu.fill(ones, 1);
-    var gpu_tape: Tape = .{ .gpa = arena.allocator(), .par = .{ .gpu = gpu }, .training = true, .seed = 3 };
+    var gpu_tape: Tape = .{ .gpa = arena.allocator(), .par = .{ .gpu = gpu }, .training = true, .seed = 1 };
     const grad = try gpu.alloc(f32, Row.len);
     try gpu.fill(grad, 0);
     const gpu_x: Var(Row) = .{ .value = .{ .data = ones }, .grad = .{ .data = grad }, .needs_grad = true };
@@ -437,7 +439,7 @@ fn BatchedNet(comptime trans_b: bool) type {
     };
 }
 
-fn SoftmaxNet(comptime period: usize, comptime rows: usize, comptime cols: usize) type {
+fn SoftmaxNet(comptime period: usize, comptime rows: usize, comptime cols: usize, comptime scale: f32) type {
     return struct {
         const X = Tensor(f32, &.{ rows, cols });
         pub const Inputs = struct { x: X, y: X };
@@ -448,7 +450,7 @@ fn SoftmaxNet(comptime period: usize, comptime rows: usize, comptime cols: usize
         pub fn build(t: *Tape, p: Inputs, _: []const u8) !Result {
             const x = try t.leaf(p.x);
             const y = try t.leaf(p.y);
-            return .{ .loss = try t.mse(try t.softmax(x, period), y), .x = x, .y = y };
+            return .{ .loss = try t.mse(try t.softmax(x, .{ .causal_period = period, .scale = scale }), y), .x = x, .y = y };
         }
 
         pub fn acceptable(_: Allocator, _: Inputs) !bool {
@@ -682,6 +684,65 @@ test "batch norm with a fused relu matches finite differences, the gpu and the t
     try gradcheck.expectTensorCoresClose(BnReluCase, 46, 3e-2);
 }
 
+const BnAddReluCase = struct {
+    pub const Inputs = struct { x: BnCase.X, r: BnCase.X, gamma: BnCase.Channels, beta: BnCase.Channels, v: BnCase.V };
+    pub const names = .{ "x", "r", "gamma", "beta", "v" };
+    pub const value_names = BnCase.value_names;
+    pub const labels = BnCase.labels;
+    const Result = struct { loss: Var(Tensor(f32, &.{})), x: Var(BnCase.X), r: Var(BnCase.X), gamma: Var(BnCase.Channels), beta: Var(BnCase.Channels), v: Var(BnCase.V), running_mean: BnCase.Channels, running_var: BnCase.Channels };
+
+    fn network(t: *Tape, p: Inputs, label_slice: []const u8, comptime fused: bool) !Result {
+        const x = try t.leaf(p.x);
+        const r = try t.leaf(p.r);
+        const gamma = try t.leaf(p.gamma);
+        const beta = try t.leaf(p.beta);
+        const v = try t.leaf(p.v);
+        const running_mean = try t.zeroedTensor(BnCase.Channels);
+        const running_var = try t.filledTensor(BnCase.Channels, 1);
+        const stats = .{ .mean = running_mean, .variance = running_var };
+        const activated = if (fused) try t.batchNormAddRelu(x, r, gamma, beta, stats) else try t.addRelu(try t.batchNorm(x, gamma, beta, stats), r);
+        const loss = try t.crossEntropy(try t.matmul(activated, v), label_slice);
+        return .{ .loss = loss, .x = x, .r = r, .gamma = gamma, .beta = beta, .v = v, .running_mean = running_mean, .running_var = running_var };
+    }
+
+    pub fn build(t: *Tape, p: Inputs, label_slice: []const u8) !Result {
+        return network(t, p, label_slice, true);
+    }
+
+    pub fn acceptable(gpa: Allocator, p: Inputs) !bool {
+        var t: Tape = .{ .gpa = gpa, .training = true };
+        const running_mean = try t.zeroedTensor(BnCase.Channels);
+        const running_var = try t.filledTensor(BnCase.Channels, 1);
+        const y = try t.add(try t.batchNorm(try t.constant(p.x), try t.constant(p.gamma), try t.constant(p.beta), .{ .mean = running_mean, .variance = running_var }), try t.constant(p.r));
+        var smallest: f32 = std.math.floatMax(f32);
+        for (y.value.data) |v| smallest = @min(smallest, @abs(v));
+        return smallest > 0.05;
+    }
+};
+
+test "batch norm with a fused residual and relu equals the separate ops and matches finite differences and the gpu" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const p = try gradcheck.randomInputs(BnAddReluCase, gpa, 50);
+
+    var separate_tape: Tape = .{ .gpa = gpa, .training = true };
+    const separate = try BnAddReluCase.network(&separate_tape, p, &BnAddReluCase.labels, false);
+    try separate_tape.backward(separate.loss);
+    var fused_tape: Tape = .{ .gpa = gpa, .training = true };
+    const fused = try BnAddReluCase.network(&fused_tape, p, &BnAddReluCase.labels, true);
+    try fused_tape.backward(fused.loss);
+
+    try testing.expectEqual(separate.loss.value.data[0], fused.loss.value.data[0]);
+    inline for (BnAddReluCase.names) |name| {
+        try testing.expectEqualSlices(f32, @field(separate, name).grad.data, @field(fused, name).grad.data);
+    }
+    try testing.expect(fused_tape.nodes.items.len < separate_tape.nodes.items.len);
+
+    try gradcheck.expectFiniteDifferences(BnAddReluCase, 51, 1e-3, 3e-3);
+    try gradcheck.expectGpuMatchesCpu(BnAddReluCase, 52, 1e-5);
+}
+
 const AddReluNet = struct {
     const X = Tensor(f32, &.{ 4, 3 });
     const W = Tensor(f32, &.{ 3, 5 });
@@ -905,7 +966,9 @@ test "casting to bf16 and back rounds the values and passes the gradient through
     for (host) |g| try testing.expectEqual(@as(f32, 2), g);
 }
 
-fn runBatchNorm(comptime half: bool, gpu: *gpu_mod.Gpu, x_values: []const f32, dy_values: []const f32, out_values: []f32, dx_values: []f32, running: []f32) !void {
+// Runs batchNormRelu (or batchNormAddRelu with residual r when r_values is not empty) on the device in f32 or bf16 and downloads
+// the output, the input gradient, the residual gradient into dr_values and the running statistics.
+fn runBatchNorm(comptime half: bool, gpu: *gpu_mod.Gpu, x_values: []const f32, r_values: []const f32, dy_values: []const f32, out_values: []f32, dx_values: []f32, dr_values: []f32, running: []f32) !void {
     const X = Tensor(f32, &.{ 600, 16 });
     const Channels = Tensor(f32, &.{16});
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -915,6 +978,10 @@ fn runBatchNorm(comptime half: bool, gpu: *gpu_mod.Gpu, x_values: []const f32, d
     const x = try t.leaf(X{ .data = try gpu.alloc(f32, X.len) });
     try gpu.upload(x.value.data, x_values);
     try gpu.fill(x.grad.data, 0);
+    const r = try t.leaf(X{ .data = try gpu.alloc(f32, X.len) });
+    try gpu.fill(r.value.data, 0);
+    if (r_values.len != 0) try gpu.upload(r.value.data, r_values);
+    try gpu.fill(r.grad.data, 0);
     const gamma = try t.leaf(Channels{ .data = try gpu.alloc(f32, 16) });
     const beta = try t.leaf(Channels{ .data = try gpu.alloc(f32, 16) });
     try gpu.fill(gamma.value.data, 1.5);
@@ -927,7 +994,11 @@ fn runBatchNorm(comptime half: bool, gpu: *gpu_mod.Gpu, x_values: []const f32, d
     try gpu.fill(variance.data, 1);
 
     const input = if (half) try t.cast(x, u16) else x;
-    const out = try t.batchNormRelu(input, gamma, beta, .{ .mean = mean, .variance = variance });
+    const running_stats = .{ .mean = mean, .variance = variance };
+    const out = if (r_values.len == 0)
+        try t.batchNormRelu(input, gamma, beta, running_stats)
+    else
+        try t.batchNormAddRelu(input, if (half) try t.cast(r, u16) else r, gamma, beta, running_stats);
     const back = try t.cast(out, f32);
     try gpu.download(out_values, back.value.data);
     try gpu.upload(back.grad.data, dy_values);
@@ -937,6 +1008,7 @@ fn runBatchNorm(comptime half: bool, gpu: *gpu_mod.Gpu, x_values: []const f32, d
         try t.nodes.items[at].run(&t, t.nodes.items[at].ctx);
     }
     try gpu.download(dx_values, x.grad.data);
+    try gpu.download(dr_values, r.grad.data);
     try gpu.download(running[0..16], mean.data);
     try gpu.download(running[16..], variance.data);
 }
@@ -956,8 +1028,9 @@ test "batch norm on bf16 activations matches the f32 path within bf16 rounding, 
     var half_dx: [600 * 16]f32 = undefined;
     var wide_running: [32]f32 = undefined;
     var half_running: [32]f32 = undefined;
-    try runBatchNorm(false, gpu, &x, &dy, &wide_out, &wide_dx, &wide_running);
-    try runBatchNorm(true, gpu, &x, &dy, &half_out, &half_dx, &half_running);
+    var unused: [600 * 16]f32 = undefined;
+    try runBatchNorm(false, gpu, &x, &.{}, &dy, &wide_out, &wide_dx, &unused, &wide_running);
+    try runBatchNorm(true, gpu, &x, &.{}, &dy, &half_out, &half_dx, &unused, &half_running);
     for (wide_out, half_out) |want, got| try testing.expectApproxEqAbs(want, got, 0.04 + 0.01 * @abs(want));
     var flipped: usize = 0;
     for (wide_dx, half_dx) |want, got| {
@@ -965,6 +1038,43 @@ test "batch norm on bf16 activations matches the f32 path within bf16 rounding, 
     }
     try testing.expect(flipped <= 3);
     for (wide_running, half_running) |want, got| try testing.expectApproxEqAbs(want, got, 0.02 + 0.01 * @abs(want));
+}
+
+test "batch norm with a fused residual and relu on bf16 activations matches the f32 path within bf16 rounding" {
+    const gpu = try gpu_mod.Gpu.forTest(8 << 20);
+    defer gpu.deinit();
+    var prng = std.Random.DefaultPrng.init(32);
+    const rng = prng.random();
+    var x: [600 * 16]f32 = undefined;
+    var r: [600 * 16]f32 = undefined;
+    var dy: [600 * 16]f32 = undefined;
+    for (&x, &r, &dy) |*a, *b, *c| {
+        a.* = rng.floatNorm(f32) * 2 + 0.5;
+        b.* = rng.floatNorm(f32);
+        c.* = rng.floatNorm(f32);
+    }
+    var wide_out: [x.len]f32 = undefined;
+    var half_out: [x.len]f32 = undefined;
+    var wide_dx: [x.len]f32 = undefined;
+    var half_dx: [x.len]f32 = undefined;
+    var wide_dr: [x.len]f32 = undefined;
+    var half_dr: [x.len]f32 = undefined;
+    var wide_running: [32]f32 = undefined;
+    var half_running: [32]f32 = undefined;
+    try runBatchNorm(false, gpu, &x, &r, &dy, &wide_out, &wide_dx, &wide_dr, &wide_running);
+    try runBatchNorm(true, gpu, &x, &r, &dy, &half_out, &half_dx, &half_dr, &half_running);
+    for (wide_out, half_out) |want, got| try testing.expectApproxEqAbs(want, got, 0.04 + 0.01 * @abs(want));
+    var flipped: usize = 0;
+    var active: usize = 0;
+    for (wide_dx, half_dx, wide_dr, half_dr, wide_out) |want, got, want_r, got_r, o| {
+        if (@abs(want - got) > 0.03 + 0.02 * @abs(want)) flipped += 1;
+        if (@abs(want_r - got_r) > 0.01 + 0.01 * @abs(want_r)) flipped += 1;
+        if (o > 0) active += 1;
+    }
+    try testing.expect(flipped <= 6);
+    // NOTE: the residual gradient is the masked output gradient, so it must be zero exactly where the output is.
+    for (wide_dr, wide_out, dy) |g, o, d| try testing.expectEqual(if (o > 0) d else 0, g);
+    try testing.expect(active > x.len / 4 and active < x.len * 3 / 4);
 }
 
 fn runHalfChain(comptime half: bool, gpu: *gpu_mod.Gpu, a_values: []const f32, b_values: []const f32, g_values: []const f32, out: []f32, grad_a: []f32, grad_b: []f32) !void {
@@ -1075,20 +1185,45 @@ test "a convolution on bf16 activations agrees with the f32 convolution within b
     for (wide_dw, half_dw) |want, got| try testing.expectApproxEqAbs(want, got, 0.6 + 0.03 * @abs(want));
 }
 
+test "a gpu im2col convolution that rebuilds its column matrix in the backward pass gives the same outputs and gradients" {
+    const gpu = try gpu_mod.Gpu.forTest(32 << 20);
+    defer gpu.deinit();
+    var prng = std.Random.DefaultPrng.init(38);
+    const rng = prng.random();
+    var values: [2 * 8 * 8 * 64 + 576 * 32 + 2 * 8 * 8 * 32]f32 = undefined;
+    for (&values) |*v| v.* = rng.floatNorm(f32) * 0.3;
+    const x = values[0 .. 2 * 8 * 8 * 64];
+    const w = values[x.len..][0 .. 576 * 32];
+    const g = values[x.len + w.len ..];
+    var results: [2][2 * 8 * 8 * 32 + 2 * 8 * 8 * 64 + 576 * 32]f32 = undefined;
+    for (&results, [_]bool{ false, true }) |*r, recompute| {
+        gpu.recompute_columns = recompute;
+        try runConvChain(false, gpu, x, w, g, r[0..g.len], r[g.len..][0..x.len], r[g.len + x.len ..]);
+    }
+    try testing.expectEqualSlices(f32, &results[0], &results[1]);
+}
+
 test "softmax rows, with and without a causal mask, have correct values and gradients on the cpu and the gpu" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var t: Tape = .{ .gpa = arena.allocator() };
     const x = try t.leaf(try Tensor(f32, &.{ 3, 3 }).fromSlice(t.gpa, &.{ 0, 0, 0, 0, 0, 0, 1, 2, 3 }));
-    const p = try t.softmax(x, 3);
+    const p = try t.softmax(x, .{ .causal_period = 3 });
     try testing.expectEqualSlices(f32, &.{ 1, 0, 0, 0.5, 0.5, 0, 0.09003057, 0.24472848, 0.66524094 }, p.value.data);
+    // A scale of 0.5 on the last row (1, 2, 3) is a softmax of (0.5, 1, 1.5), computed here with the standard exp.
+    const halved = try t.softmax(x, .{ .scale = 0.5 });
+    const total = @exp(@as(f64, 0.5)) + @exp(@as(f64, 1)) + @exp(@as(f64, 1.5));
+    for (halved.value.data[6..], [_]f64{ 0.5, 1, 1.5 }) |got, v| try testing.expectApproxEqAbs(@as(f32, @floatCast(@exp(v) / total)), got, 1e-6);
     inline for (.{ 0, 3 }) |period| {
-        try gradcheck.expectFiniteDifferences(SoftmaxNet(period, 6, 3), 7, 1e-2, 3e-3);
-        try gradcheck.expectGpuMatchesCpu(SoftmaxNet(period, 6, 3), 8, 1e-5);
+        try gradcheck.expectFiniteDifferences(SoftmaxNet(period, 6, 3, 1), 7, 1e-2, 3e-3);
+        try gradcheck.expectGpuMatchesCpu(SoftmaxNet(period, 6, 3, 1), 8, 1e-5);
     }
     // Rows wider than a warp, one of them causal with a period shorter than the row (the rest of the row is masked).
-    try gradcheck.expectGpuMatchesCpu(SoftmaxNet(0, 37, 200), 15, 1e-5);
-    try gradcheck.expectGpuMatchesCpu(SoftmaxNet(40, 40, 200), 16, 1e-5);
+    try gradcheck.expectGpuMatchesCpu(SoftmaxNet(0, 37, 200, 1), 15, 1e-5);
+    try gradcheck.expectGpuMatchesCpu(SoftmaxNet(40, 40, 200, 1), 16, 1e-5);
+    // A scaled softmax, as attention uses it: the scale must reach both the values and the input gradient.
+    try gradcheck.expectFiniteDifferences(SoftmaxNet(3, 6, 3, 0.35), 9, 1e-2, 3e-3);
+    try gradcheck.expectGpuMatchesCpu(SoftmaxNet(40, 40, 200, 0.35), 10, 1e-5);
     try gradcheck.expectGpuMatchesCpu(WideCrossEntropyNet, 17, 1e-4);
 }
 
@@ -1429,7 +1564,7 @@ fn runElementwiseChain(comptime half: bool, gpu: *gpu_mod.Gpu, x_values: []const
     // NOTE: the gain makes the softmax inputs large enough that its output depends on every op before it; near zero it is almost uniform.
     const gain = try t.constant(try t.filledTensor(Tensor(f32, &.{}), 6));
     const sharpened = try t.mul(thinned, if (half) try t.cast(gain, u16) else gain);
-    const probabilities = try t.cast(try t.softmax(sharpened, 4), f32);
+    const probabilities = try t.cast(try t.softmax(sharpened, .{ .causal_period = 4 }), f32);
     try gpu.download(&result.out, probabilities.value.data);
     try gpu.upload(probabilities.grad.data, g_values);
     var at = t.nodes.items.len;

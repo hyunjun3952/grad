@@ -6,6 +6,7 @@ const input = lib.onnx_runtime.input;
 const broadcast = lib.onnx_runtime.broadcast;
 const pool = lib.onnx_runtime.pool;
 const convolve = lib.onnx_runtime.convolve;
+const transpose = lib.onnx_runtime.transpose;
 const Model = lib.onnx_runtime.Model;
 const Array = lib.onnx_runtime.Array;
 
@@ -38,8 +39,8 @@ test "an exported network, read back with runtime shapes, gives the same outputs
     for (image.value.data) |*v| v.* = rng.floatNorm(f32);
     const first, const second, const fc = layers;
     const a = try tape.maxPool(try first.forwardRelu(&tape, autograd.reshape(image, &.{ 1, 8, 8, 1 })), .{});
-    const b = try second.forward(&tape, a);
-    const logits = try fc.forward(&tape, autograd.reshape(try tape.avgPool(try tape.avgPool(try tape.relu(b), .{}), .{}), &.{ 1, 4 }));
+    const b = try second.forwardAddRelu(&tape, a, a);
+    const logits = try fc.forward(&tape, autograd.reshape(try tape.avgPool(try tape.avgPool(b, .{}), .{}), &.{ 1, 4 }));
 
     const state = nn.state(layers);
     var weights: [state.len]onnx.Weight = undefined;
@@ -71,15 +72,55 @@ test "grouped and dilated convolutions, pooling, softmax and broadcasting follow
     try testing.expectEqualSlices(usize, &.{ 1, 1, 3, 3 }, dilated.dims);
     try testing.expectEqualSlices(f32, &.{ 5, 10, 5, 10, 20, 10, 5, 10, 5 }, dilated.data[0..9]);
 
-    const maxed = try pool(a, .{ .attributes = &.{ .{ .name = "kernel_shape", .ints = &.{ 2, 2 } }, .{ .name = "strides", .ints = &.{ 1, 1 } } } }, .{ .dims = &.{ 1, 1, 3, 3 }, .data = x.data[0..9] }, true);
+    const maxed = try pool(a, .{}, .{ .attributes = &.{ .{ .name = "kernel_shape", .ints = &.{ 2, 2 } }, .{ .name = "strides", .ints = &.{ 1, 1 } } } }, .{ .dims = &.{ 1, 1, 3, 3 }, .data = x.data[0..9] }, true);
     try testing.expectEqualSlices(f32, &.{ 5, 6, 8, 9 }, maxed.data);
 
     const probabilities = try softmax(a, .{}, .{ .dims = &.{ 1, 2 }, .data = @constCast(&[_]f32{ 0, 0 }) });
     try testing.expectEqualSlices(f32, &.{ 0.5, 0.5 }, probabilities.data);
 
-    const summed = try broadcast(a, .{ .dims = &.{ 2, 1 }, .data = @constCast(&[_]f32{ 10, 20 }) }, .{ .dims = &.{3}, .data = @constCast(&[_]f32{ 1, 2, 3 }) }, plus);
+    const summed = try broadcast(a, .{}, .{ .dims = &.{ 2, 1 }, .data = @constCast(&[_]f32{ 10, 20 }) }, .{ .dims = &.{3}, .data = @constCast(&[_]f32{ 1, 2, 3 }) }, plus);
     try testing.expectEqualSlices(usize, &.{ 2, 3 }, summed.dims);
     try testing.expectEqualSlices(f32, &.{ 11, 12, 13, 21, 22, 23 }, summed.data);
+}
+
+test "transposes and broadcasts on their fast paths give the same values as an index-by-index reference" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const par: lib.kernels.Parallel = .{ .io = testing.io, .threads = 3 };
+    const dims = [_]usize{ 2, 33, 5, 7 };
+    const x: Array = .{ .dims = &dims, .data = try a.alloc(f32, 2 * 33 * 5 * 7) };
+    for (x.data, 0..) |*v, i| v.* = @floatFromInt(i);
+    const perms = [_][]const i64{ &.{ 0, 3, 1, 2 }, &.{ 0, 2, 3, 1 }, &.{ 1, 2, 3, 0 }, &.{ 3, 2, 1, 0 }, &.{ 0, 2, 1, 3 } };
+    for (perms) |perm| {
+        const got = try transpose(a, par, .{ .attributes = &.{.{ .name = "perm", .ints = perm }} }, x);
+        var index: [4]usize = @splat(0);
+        for (got.data) |v| {
+            var source: [4]usize = undefined;
+            for (perm, 0..) |p, d| source[@intCast(p)] = index[d];
+            try testing.expectEqual(@as(f32, @floatFromInt(((source[0] * 33 + source[1]) * 5 + source[2]) * 7 + source[3])), v);
+            var d: usize = 4;
+            while (d > 0) {
+                d -= 1;
+                index[d] += 1;
+                if (index[d] < got.dims[d]) break;
+                index[d] = 0;
+            }
+        }
+    }
+
+    const channel: Array = .{ .dims = &.{ 1, 7 }, .data = try a.alloc(f32, 7) };
+    for (channel.data, 0..) |*v, i| v.* = @floatFromInt(1000 * i);
+    const right = try broadcast(a, par, x, channel, lib.onnx_runtime.minus);
+    const left = try broadcast(a, par, channel, x, lib.onnx_runtime.minus);
+    const same = try broadcast(a, par, x, x, plus);
+    try testing.expectEqualSlices(usize, &dims, right.dims);
+    try testing.expectEqualSlices(usize, &dims, left.dims);
+    for (x.data, right.data, left.data, same.data, 0..) |v, r, l, s, i| {
+        try testing.expectEqual(v - channel.data[i % 7], r);
+        try testing.expectEqual(channel.data[i % 7] - v, l);
+        try testing.expectEqual(2 * v, s);
+    }
 }
 
 test "a gru step with two inputs and two outputs survives export and import" {

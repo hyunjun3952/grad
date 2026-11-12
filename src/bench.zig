@@ -395,15 +395,15 @@ fn implicitGemm(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
         const geo: grad.gpu.ConvGeometry = .{ .n = case.n, .h = case.side, .w = case.side, .c = case.c_in, .k = 3, .stride = 1, .pad = 1, .out_h = case.side, .out_w = case.side, .positions = @intCast(rows), .c_out = case.c_out };
         const x_half = (try dev.packMatrix(x, rows, case.c_in, rows, case.c_in, false)).data;
         const w_half = try dev.packMatrix(w, kc, case.c_out, kc, case.c_out, false);
-        const dy_t = try dev.packMatrix(y, case.c_out, rows, std.mem.alignForward(usize, case.c_out, 128), std.mem.alignForward(usize, rows, 32), true);
+        const dy_half = (try dev.packMatrix(y, rows, case.c_out, rows, case.c_out, false)).data;
         const flops = 2.0 * @as(f64, @floatFromInt(rows)) * @as(f64, @floatFromInt(kc)) * @as(f64, @floatFromInt(case.c_out));
         var tflops: [2]f64 = undefined;
         for (0..2) |variant| {
-            if (variant == 0) try dev.convImplicitForward(x_half, w_half, y, geo, false) else try dev.convImplicitWeightGrad(dy_t, x_half, dw, geo);
+            if (variant == 0) try dev.convImplicitForward(x_half, w_half, y, geo, false) else try dev.convImplicitWeightGrad(dy_half, x_half, dw, geo);
             try dev.cu.sync();
             const t0 = Io.Clock.awake.now(io);
             for (0..20) |_| {
-                if (variant == 0) try dev.convImplicitForward(x_half, w_half, y, geo, false) else try dev.convImplicitWeightGrad(dy_t, x_half, dw, geo);
+                if (variant == 0) try dev.convImplicitForward(x_half, w_half, y, geo, false) else try dev.convImplicitWeightGrad(dy_half, x_half, dw, geo);
             }
             try dev.cu.sync();
             const ns = nanoseconds(io, t0);

@@ -51,6 +51,32 @@ test "row-wise im2col and col2im equal the per-element reference for strides, pa
     }
 }
 
+test "row-wise max pooling gives the same values and winner indices as the per-element reference" {
+    var prng = std.Random.DefaultPrng.init(9);
+    const rng = prng.random();
+    const gpa = testing.allocator;
+    const par: kernels.Parallel = .{ .io = testing.io, .threads = 3 };
+    for ([_]cv.Dims{
+        .{ .n = 2, .h = 8, .w = 8, .c = 5, .k = 2, .stride = 2 },
+        .{ .n = 3, .h = 7, .w = 9, .c = 16, .k = 3, .stride = 2, .pad = 1 },
+        .{ .n = 1, .h = 5, .w = 6, .c = 3, .k = 3, .stride = 1, .pad = 1 },
+    }) |d| {
+        const x = try gpa.alloc(f32, @as(usize, d.n) * d.h * d.w * d.c);
+        defer gpa.free(x);
+        // NOTE: values from a small set, so that windows hold ties and the first-maximum rule is exercised.
+        for (x) |*v| v.* = @floatFromInt(rng.uintLessThan(u32, 6));
+        const len = cv.workItems(.maxPool, d);
+        const buffers = try gpa.alloc(f32, 2 * len);
+        defer gpa.free(buffers);
+        const indices = try gpa.alloc(u32, 2 * len);
+        defer gpa.free(indices);
+        for (0..len) |t| cv.maxPool(@intCast(t), x.ptr, buffers.ptr, indices.ptr, d);
+        lib.cpu_ops.maxPool(par, x, buffers[len..], indices[len..], d);
+        try testing.expectEqualSlices(f32, buffers[0..len], buffers[len..]);
+        try testing.expectEqualSlices(u32, indices[0..len], indices[len..]);
+    }
+}
+
 test "row-wise batch-norm apply and input gradient equal the per-element reference" {
     var prng = std.Random.DefaultPrng.init(8);
     const rng = prng.random();
@@ -78,20 +104,27 @@ test "row-wise batch-norm apply and input gradient equal the per-element referen
     for (&sums) |*v| v.* = rng.floatNorm(f32);
     const p: norm.Affine = .{ .mean = &channel[0], .inv_std = &channel[1], .gamma = &channel[2], .beta = &channel[3] };
 
-    for ([_]u32{ 0, 1 }) |flag| {
+    for ([_]u32{ 0, 1, 3 }) |flag| {
         const l: norm.Layout = .{ .len = len, .channels = c, .flag = flag };
         const want = try gpa.alloc(f32, len);
         defer gpa.free(want);
         const got = try gpa.alloc(f32, len);
         defer gpa.free(got);
-        for (0..len) |t| norm.apply(f32, t, x.ptr, want.ptr, p, l);
-        normApply(par, x, got, p, l);
+        for (0..len) |t| norm.apply(f32, t, x.ptr, mask.ptr, want.ptr, p, l);
+        normApply(par, x, mask, got, p, l);
         try testing.expectEqualSlices(f32, want, got);
 
+        const want_dr = try gpa.alloc(f32, len);
+        defer gpa.free(want_dr);
+        const got_dr = try gpa.alloc(f32, len);
+        defer gpa.free(got_dr);
         @memset(want, 0.25);
         @memset(got, 0.25);
-        for (0..len) |t| norm.gradInput(f32, t, .{ .x = x.ptr, .dy = dy.ptr, .dx = want.ptr, .sums = &sums, .mask = mask.ptr }, p, l);
-        normGradInput(par, .{ .x = x.ptr, .dy = dy.ptr, .dx = got.ptr, .sums = &sums, .mask = mask.ptr }, p, l);
+        @memset(want_dr, -0.5);
+        @memset(got_dr, -0.5);
+        for (0..len) |t| norm.gradInput(f32, t, .{ .x = x.ptr, .dy = dy.ptr, .dx = want.ptr, .sums = &sums, .mask = mask.ptr, .dr = want_dr.ptr }, p, l);
+        normGradInput(par, .{ .x = x.ptr, .dy = dy.ptr, .dx = got.ptr, .sums = &sums, .mask = mask.ptr, .dr = got_dr.ptr }, p, l);
         for (want, got) |a, b| try testing.expectApproxEqAbs(a, b, 1e-6);
+        try testing.expectEqualSlices(f32, want_dr, got_dr);
     }
 }

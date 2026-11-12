@@ -218,6 +218,8 @@ pub const Gpu = struct {
     tf32: bool = false,
     tensor_core_min_work: usize = 1 << 22,
     deterministic: bool = false,
+    // Trades time for memory: im2col convolutions rebuild their column matrix in the backward pass instead of keeping it.
+    recompute_columns: bool = false,
     gpa: Allocator,
     cu: cuda.Cuda,
     fns: [kernel_count]cuda.Handle,
@@ -228,6 +230,8 @@ pub const Gpu = struct {
     zero_base: usize,
     zero_size: usize,
     zero_used: usize,
+    step_peak: usize,
+    zero_peak: usize,
     cudnn_lib: ?cudnn.Cudnn,
     cudnn_plans: std.ArrayList(PlanEntry),
     cudnn_workspace: usize,
@@ -235,13 +239,16 @@ pub const Gpu = struct {
     graphs: std.ArrayList(cuda.Handle),
     capturing: bool,
     multiprocessors: usize,
+    // NOTE: added to every dropout seed on the device, so that a recorded step draws new masks when setStepSeed changes it.
+    step_seed: []u64,
 
     const PlanEntry = struct { geometry: cudnn.Geometry, plan: cudnn.Plan };
 
-    /// Where and how big a Gpu is: the CUDA device ordinal and the scratch bytes per step.
-    pub const Config = struct { step_bytes: usize, device: usize = 0 };
+    /// Where and how big a Gpu is: the CUDA device ordinal, the scratch bytes per step and the bytes of the zero arena
+    /// (gradient buffers), a quarter of step_bytes when not given. peakUsage tells how much of both a program needs.
+    pub const Config = struct { step_bytes: usize, zero_bytes: ?usize = null, device: usize = 0 };
 
-    /// Opens the driver, loads the kernels and reserves step_bytes for scratch plus a quarter of that for the zero arena.
+    /// Opens the driver, loads the kernels and reserves the scratch and zero arenas of config.
     /// The device context becomes current on the calling thread; use makeCurrent when another thread takes over.
     pub fn init(gpa: Allocator, config: Config) Error!*Gpu {
         const step_bytes = config.step_bytes;
@@ -253,6 +260,7 @@ pub const Gpu = struct {
         self.tf32 = false;
         self.tensor_core_min_work = 1 << 22;
         self.deterministic = false;
+        self.recompute_columns = false;
         self.owned = .empty;
         self.cudnn_lib = null;
         self.cudnn_plans = .empty;
@@ -271,11 +279,21 @@ pub const Gpu = struct {
         self.step_base = try self.cu.alloc(step_bytes);
         self.step_size = step_bytes;
         self.step_used = 0;
-        self.zero_size = step_bytes / 4;
+        self.zero_size = std.mem.alignForward(usize, config.zero_bytes orelse step_bytes / 4, 256);
         self.zero_base = try self.cu.alloc(self.zero_size);
         self.zero_used = 0;
+        self.step_peak = 0;
+        self.zero_peak = 0;
         try self.cu.memsetD32(self.zero_base, 0, self.zero_size / 4);
+        self.step_seed = try self.alloc(u64, 1);
+        try self.cu.memsetD32(@intFromPtr(self.step_seed.ptr), 0, 2);
         return self;
+    }
+
+    /// Sets the offset that the device adds to every dropout seed; a recorded step reads it at replay time.
+    pub fn setStepSeed(self: *Gpu, value: u64) Error!void {
+        const one = [1]u64{value};
+        try self.upload(self.step_seed, &one);
     }
 
     /// Same as init, but skips the calling test when no driver is installed.
@@ -327,7 +345,13 @@ pub const Gpu = struct {
         const bytes = @sizeOf(T) * n;
         if (at + bytes > self.step_size) return error.OutOfMemory;
         self.step_used = at + bytes;
+        self.step_peak = @max(self.step_peak, self.step_used);
         return @as([*]T, @ptrFromInt(self.step_base + at))[0..n];
+    }
+
+    /// The most scratch and zero-arena bytes in use at any point so far, to size Config for a program.
+    pub fn peakUsage(self: *const Gpu) struct { step: usize, zero: usize } {
+        return .{ .step = self.step_peak, .zero = self.zero_peak };
     }
 
     /// Takes n zeroed elements from the zero arena; resetStep clears what was used so the next step sees zeros again.
@@ -336,6 +360,7 @@ pub const Gpu = struct {
         const bytes = @sizeOf(T) * n;
         if (at + bytes > self.zero_size) return error.OutOfMemory;
         self.zero_used = at + bytes;
+        self.zero_peak = @max(self.zero_peak, self.zero_used);
         return @as([*]T, @ptrFromInt(self.zero_base + at))[0..n];
     }
 
@@ -656,24 +681,28 @@ pub const Gpu = struct {
         try self.launch(if (wide) .convGemmForwardWide else .convGemmForward, .{ ceilDiv(c_out, if (wide) 128 else 64), ceilDiv(m, 128), 1 }, .{ x_half, w.data, out, kernel_shape, geo });
     }
 
-    pub fn convImplicitWeightGrad(self: *Gpu, dy_t: Packed, x_half: []const u16, out: []f32, geo: ga.ConvGeometry) Error!void {
+    /// Adds the weight gradient of an implicit-GEMM convolution to out (taps x c_out, f32). dy is the bf16 output gradient
+    /// as stored, positions x c_out; the kernel reads it transposed itself, so no packed copy is made.
+    pub fn convImplicitWeightGrad(self: *Gpu, dy: []const u16, x_half: []const u16, out: []f32, geo: ga.ConvGeometry) Error!void {
         const c_out: usize = geo.c_out;
+        std.debug.assert(c_out % 8 == 0 and dy.len == @as(usize, geo.positions) * c_out);
         const taps = @as(usize, geo.k) * geo.k * geo.c;
+        const k_padded = std.mem.alignForward(usize, geo.positions, 32);
         const short = c_out <= 64;
         const wide = c_out % 128 == 0;
         const tile_rows: usize = if (short) 64 else 128;
         const tile_cols: usize = if (short or wide) 128 else 64;
         const n_padded = std.mem.alignForward(usize, taps, tile_cols);
         const blocks = ceilDiv(c_out, tile_rows) * (n_padded / tile_cols);
-        const splits = @max(1, @min(dy_t.cols_padded / 256, (128 + blocks - 1) / blocks));
-        const chunk = std.mem.alignForward(usize, (dy_t.cols_padded + splits - 1) / splits, 32);
-        const kernel_shape = pack(ga.TensorShape, .{ .m = c_out, .n = taps, .k_padded = dy_t.cols_padded, .n_padded = n_padded, .accumulate = true, .chunk = chunk, .transpose_out = true, .output_half = false, .split_stride = 0 });
+        const splits = @max(1, @min(k_padded / 256, (128 + blocks - 1) / blocks));
+        const chunk = std.mem.alignForward(usize, (k_padded + splits - 1) / splits, 32);
+        const kernel_shape = pack(ga.TensorShape, .{ .m = c_out, .n = taps, .k_padded = k_padded, .n_padded = n_padded, .accumulate = true, .chunk = chunk, .transpose_out = true, .output_half = false, .split_stride = 0 });
         const kernel: Kernel = if (short) .convGemmWeightGradShort else if (wide) .convGemmWeightGradWide else .convGemmWeightGrad;
         const mark = self.step_used;
         defer self.step_used = mark;
-        const parts = ceilDiv(dy_t.cols_padded, chunk);
+        const parts = ceilDiv(k_padded, chunk);
         const target, const shape = try self.orderedTarget(out, kernel_shape, parts);
-        try self.launch(kernel, .{ toU32(n_padded / tile_cols), ceilDiv(c_out, tile_rows), parts }, .{ dy_t.data, x_half, target, shape, geo });
+        try self.launch(kernel, .{ toU32(n_padded / tile_cols), ceilDiv(c_out, tile_rows), parts }, .{ dy, x_half, target, shape, geo });
         try self.combineSplits(target, out, shape, parts, true);
     }
 
@@ -780,12 +809,12 @@ pub const Gpu = struct {
         try self.launchFlat(.gruNextBackward, h.len, .{ gx, gc, update, h, d_next, grad, flags, h.len, hidden });
     }
 
-    pub fn softmax(self: *Gpu, x: anytype, y: anytype, cols: usize, period: usize) Error!void {
-        try self.launchFlat(variant(.softmaxRows, y), 32 * (x.len / cols), .{ x, y, x.len / cols, cols, period });
+    pub fn softmax(self: *Gpu, x: anytype, y: anytype, cols: usize, period: usize, scale: f32) Error!void {
+        try self.launchFlat(variant(.softmaxRows, y), 32 * (x.len / cols), .{ x, y, x.len / cols, cols, period, scale });
     }
 
-    pub fn softmaxBackward(self: *Gpu, y: anytype, dy: anytype, dx: anytype, cols: usize) Error!void {
-        try self.launchFlat(variant(.softmaxBackward, dx), 32 * (y.len / cols), .{ y, dy, dx, y.len / cols, cols });
+    pub fn softmaxBackward(self: *Gpu, y: anytype, dy: anytype, dx: anytype, cols: usize, scale: f32) Error!void {
+        try self.launchFlat(variant(.softmaxBackward, dx), 32 * (y.len / cols), .{ y, dy, dx, y.len / cols, cols, scale });
     }
 
     pub fn toHalf(self: *Gpu, x: []const f32, y: []u16) Error!void {
@@ -891,10 +920,11 @@ pub const Gpu = struct {
         try self.launchFlat(if (E == u16) .batchNormFinishHalf else .batchNormFinish, c, .{ sums, x[0..c], st, norm.Layout{ .len = @intCast(x.len), .channels = @intCast(c), .flag = @intFromBool(training) } });
     }
 
-    pub fn batchNormApply(self: *Gpu, x: anytype, y: anytype, p: norm.Affine, l: norm.Layout) Error!void {
+    /// Applies the batch-norm affine map to x into y; residual is added before the ReLU when l.flag has residual_flag (pass x otherwise).
+    pub fn batchNormApply(self: *Gpu, x: anytype, residual: @TypeOf(x), y: anytype, p: norm.Affine, l: norm.Layout) Error!void {
         const E = @typeInfo(@TypeOf(x)).pointer.child;
-        if (E == u16 and l.channels % 4 == 0 and x.len % 4 == 0) return self.launchFlat(.batchNormApplyQuad, x.len / 4, .{ x, y, p, l });
-        try self.launchFlat(if (E == u16) .batchNormApplyHalf else .batchNormApply, x.len, .{ x, y, p, l });
+        if (E == u16 and l.channels % 4 == 0 and x.len % 4 == 0) return self.launchFlat(.batchNormApplyQuad, x.len / 4, .{ x, residual, y, p, l });
+        try self.launchFlat(if (E == u16) .batchNormApplyHalf else .batchNormApply, x.len, .{ x, residual, y, p, l });
     }
 
     pub fn batchNormGradSums(self: *Gpu, x: anytype, dy: anytype, p: norm.Affine, mask: anytype, out: norm.GradOut) Error!void {
@@ -914,7 +944,7 @@ pub const Gpu = struct {
         try self.launchFlat(if (E == u16) .batchNormGradInputHalf else .batchNormGradInput, l.len, .{ io, p, l });
     }
     pub fn dropout(self: *Gpu, src: anytype, dst: anytype, seed: u64, keep: f32, accumulate: bool) Error!void {
-        try self.launchFlat(variant(.dropout, dst), src.len, .{ src, dst, src.len, seed, keep, accumulate });
+        try self.launchFlat(variant(.dropout, dst), src.len, .{ src, dst, src.len, seed, self.step_seed, keep, accumulate });
     }
 
     fn launchTable(self: *Gpu, kernel: Kernel, table: ga.TensorTable, args: anytype) Error!void {

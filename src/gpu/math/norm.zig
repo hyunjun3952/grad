@@ -7,34 +7,42 @@ pub const max_channels = 256;
 
 pub const Affine = extern struct { mean: [*]const f32, inv_std: [*]const f32, gamma: [*]const f32, beta: [*]const f32 };
 pub const Stats = extern struct { mean: [*]f32, inv_std: [*]f32, running_mean: [*]f32, running_var: [*]f32 };
+/// Layout.flag of apply and gradInput: the bits below. batchNormFinish uses the same field as its training switch.
 pub const Layout = extern struct { len: u32, channels: u32, flag: u32 };
+/// Bit of Layout.flag: ReLU after the affine map (backward: the output is the mask).
+pub const relu_flag: u32 = 1;
+/// Bit of Layout.flag: a residual tensor is added before the ReLU (backward: its gradient is accumulated into dr).
+pub const residual_flag: u32 = 2;
 pub fn GradIo(comptime E: type) type {
-    return extern struct { x: [*]const E, dy: [*]const E, dx: [*]E, sums: [*]const f32, mask: [*]const E };
+    return extern struct { x: [*]const E, dy: [*]const E, dx: [*]E, sums: [*]const f32, mask: [*]const E, dr: [*]E };
 }
 pub const GradOut = struct { sums: []f32, gamma: []f32, beta: []f32 };
 
-pub inline fn apply(comptime E: type, t: usize, x: [*]const E, y: [*]E, p: Affine, l: Layout) void {
+pub inline fn apply(comptime E: type, t: usize, x: [*]const E, residual: [*]const E, y: [*]E, p: Affine, l: Layout) void {
     const ch = t % l.channels;
-    const v = p.gamma[ch] * (bf16.load(E, x, t) - p.mean[ch]) * p.inv_std[ch] + p.beta[ch];
-    bf16.store(E, y, t, if (l.flag != 0) @max(v, 0) else v);
+    var v = p.gamma[ch] * (bf16.load(E, x, t) - p.mean[ch]) * p.inv_std[ch] + p.beta[ch];
+    if (l.flag & residual_flag != 0) v += bf16.load(E, residual, t);
+    bf16.store(E, y, t, if (l.flag & relu_flag != 0) @max(v, 0) else v);
 }
 
 pub inline fn gradInput(comptime E: type, t: usize, io: GradIo(E), p: Affine, l: Layout) void {
     const ch = t % l.channels;
     const n: f32 = @floatFromInt(l.len / l.channels);
     const x_hat = (bf16.load(E, io.x, t) - p.mean[ch]) * p.inv_std[ch];
-    const g = if (l.flag != 0 and bf16.load(E, io.mask, t) <= 0) 0 else bf16.load(E, io.dy, t);
+    const g = if (l.flag & relu_flag != 0 and bf16.load(E, io.mask, t) <= 0) 0 else bf16.load(E, io.dy, t);
+    if (l.flag & residual_flag != 0) bf16.store(E, io.dr, t, bf16.load(E, io.dr, t) + g);
     bf16.store(E, io.dx, t, bf16.load(E, io.dx, t) + p.gamma[ch] * p.inv_std[ch] / n * (n * g - io.sums[ch] - x_hat * io.sums[l.channels + ch]));
 }
 
-pub inline fn applyQuad(comptime E: type, t: usize, x: [*]const E, y: [*]E, p: Affine, l: Layout) void {
+pub inline fn applyQuad(comptime E: type, t: usize, x: [*]const E, residual: [*]const E, y: [*]E, p: Affine, l: Layout) void {
     const ch = t % l.channels;
     const gamma: bf16.Quad = p.gamma[ch..][0..4].*;
     const mean: bf16.Quad = p.mean[ch..][0..4].*;
     const inv_std: bf16.Quad = p.inv_std[ch..][0..4].*;
     const beta: bf16.Quad = p.beta[ch..][0..4].*;
-    const v = gamma * (bf16.loadQuad(E, x, t) - mean) * inv_std + beta;
-    bf16.storeQuad(E, y, t, if (l.flag != 0) @max(v, @as(bf16.Quad, @splat(0))) else v);
+    var v = gamma * (bf16.loadQuad(E, x, t) - mean) * inv_std + beta;
+    if (l.flag & residual_flag != 0) v += bf16.loadQuad(E, residual, t);
+    bf16.storeQuad(E, y, t, if (l.flag & relu_flag != 0) @max(v, @as(bf16.Quad, @splat(0))) else v);
 }
 
 pub inline fn gradInputQuad(comptime E: type, t: usize, io: GradIo(E), p: Affine, l: Layout) void {
@@ -47,7 +55,8 @@ pub inline fn gradInputQuad(comptime E: type, t: usize, io: GradIo(E), p: Affine
     const sum_dyx: bf16.Quad = io.sums[l.channels + ch ..][0..4].*;
     const x_hat = (bf16.loadQuad(E, io.x, t) - mean) * inv_std;
     const dy = bf16.loadQuad(E, io.dy, t);
-    const g = if (l.flag != 0) @select(f32, bf16.loadQuad(E, io.mask, t) > @as(bf16.Quad, @splat(0)), dy, @as(bf16.Quad, @splat(0))) else dy;
+    const g = if (l.flag & relu_flag != 0) @select(f32, bf16.loadQuad(E, io.mask, t) > @as(bf16.Quad, @splat(0)), dy, @as(bf16.Quad, @splat(0))) else dy;
+    if (l.flag & residual_flag != 0) bf16.storeQuad(E, io.dr, t, bf16.loadQuad(E, io.dr, t) + g);
     bf16.storeQuad(E, io.dx, t, bf16.loadQuad(E, io.dx, t) + gamma * inv_std / n * (n * g - sum_dy - x_hat * sum_dyx));
 }
 

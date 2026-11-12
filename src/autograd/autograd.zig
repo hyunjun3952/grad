@@ -59,13 +59,18 @@ pub fn reshape(x: anytype, comptime shape: []const usize) Var(Tensor(@TypeOf(x.v
     return .{ .value = .{ .data = x.value.data }, .grad = .{ .data = x.grad.data }, .needs_grad = x.needs_grad };
 }
 
-fn batchNormGradIo(comptime E: type, k: anytype, sums: []const f32, comptime fuse_relu: bool) norm.GradIo(E) {
-    return .{ .x = k.x.value.data.ptr, .dy = k.out.grad.data.ptr, .dx = k.x.grad.data.ptr, .sums = sums.ptr, .mask = if (fuse_relu) k.out.value.data.ptr else k.out.grad.data.ptr };
+// What batch norm fuses after its affine map: nothing, a ReLU, or a residual addition followed by a ReLU.
+const NormFuse = enum { none, relu, add_relu };
+
+fn batchNormGradIo(comptime E: type, k: anytype, sums: []const f32, comptime fuse: NormFuse) norm.GradIo(E) {
+    const dr = if (fuse == .add_relu) k.residual.grad.data.ptr else k.x.grad.data.ptr;
+    return .{ .x = k.x.value.data.ptr, .dy = k.out.grad.data.ptr, .dx = k.x.grad.data.ptr, .sums = sums.ptr, .mask = if (fuse != .none) k.out.value.data.ptr else k.out.grad.data.ptr, .dr = dr };
 }
 
 pub const Activation = activation_math.Kind;
 pub const ConvOpts = struct { stride: usize = 1, pad: usize = 0, dilation: usize = 1, groups: usize = 1 };
 pub const PoolOpts = struct { kernel: usize = 2, stride: usize = 2, pad: usize = 0 };
+pub const SoftmaxOpts = struct { causal_period: usize = 0, scale: f32 = 1 };
 const ConvPath = enum { direct, packed_im2col, implicit, tf32, cudnn, grouped };
 const Packed = gpu_mod.Gpu.Packed;
 
@@ -494,31 +499,34 @@ pub const Tape = struct {
         return out;
     }
 
-    /// Applies softmax over the last axis. With causal_period above zero, row i only sees columns up to i % causal_period.
-    pub fn softmax(self: *Tape, x: anytype, comptime causal_period: usize) Error!Var(@TypeOf(x.value)) {
+    /// Applies softmax over the last axis to scale * x (attention folds its 1 / sqrt(depth) in here instead of a separate
+    /// multiply). With causal_period above zero, row i only sees columns up to i % causal_period.
+    pub fn softmax(self: *Tape, x: anytype, comptime opts: SoftmaxOpts) Error!Var(@TypeOf(x.value)) {
         const X = @TypeOf(x.value);
         comptime if (X.rank != 2) @compileError("softmax expects a (rows, columns) tensor");
+        comptime if (!(opts.scale > 0)) @compileError("softmax needs a scale above zero");
         const cols = X.shape[1];
+        const period = opts.causal_period;
         const value = try self.newTensor(X);
         if (self.par.gpu) |dev| {
-            try dev.softmax(x.value.data, value.data, cols, causal_period);
+            try dev.softmax(x.value.data, value.data, cols, period, opts.scale);
         } else {
             if (comptime X.Elem != f32) return error.NoDevice;
             const Job = struct { x: [*]const f32, y: [*]f32 };
             kernels.parallelFor(self.par, X.shape[0], 16, Job{ .x = x.value.data.ptr, .y = value.data.ptr }, struct {
                 fn run(job: Job, lo: usize, hi: usize) void {
-                    for (lo..hi) |r| softmax_math.forwardRow(f32, job.x + r * cols, job.y + r * cols, cols, softmax_math.limitOf(r, cols, causal_period));
+                    for (lo..hi) |r| softmax_math.forwardRow(f32, job.x + r * cols, job.y + r * cols, cols, softmax_math.limitOf(r, cols, period), opts.scale);
                 }
             }.run);
         }
         const out = try self.makeVar(value, x.needs_grad);
-        try self.note(.softmax, .{x}, out, .{ .period = causal_period });
+        try self.note(.softmax, .{x}, out, .{ .period = period, .scale = opts.scale });
         const Ctx = struct { x: @TypeOf(x), out: @TypeOf(out) };
         if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
-                if (t.par.gpu) |dev| return dev.softmaxBackward(c.out.value.data, c.out.grad.data, c.x.grad.data, cols);
+                if (t.par.gpu) |dev| return dev.softmaxBackward(c.out.value.data, c.out.grad.data, c.x.grad.data, cols, opts.scale);
                 if (comptime X.Elem != f32) return error.NoDevice;
-                for (0..X.shape[0]) |r| softmax_math.backwardRow(f32, c.out.value.data.ptr + r * cols, c.out.grad.data.ptr + r * cols, c.x.grad.data.ptr + r * cols, cols);
+                for (0..X.shape[0]) |r| softmax_math.backwardRow(f32, c.out.value.data.ptr + r * cols, c.out.grad.data.ptr + r * cols, c.x.grad.data.ptr + r * cols, cols, opts.scale);
             }
         }.run);
         return out;
@@ -659,15 +667,22 @@ pub const Tape = struct {
 
     /// Normalizes over every axis except the last using batch statistics while training and running ones otherwise.
     pub fn batchNorm(self: *Tape, x: anytype, gamma: anytype, beta: anytype, running: anytype) Error!Var(@TypeOf(x.value)) {
-        return self.batchNormImpl(false, x, gamma, beta, running);
+        return self.batchNormImpl(.none, x, {}, gamma, beta, running);
     }
 
     /// Batch norm followed by ReLU, fused into one kernel.
     pub fn batchNormRelu(self: *Tape, x: anytype, gamma: anytype, beta: anytype, running: anytype) Error!Var(@TypeOf(x.value)) {
-        return self.batchNormImpl(true, x, gamma, beta, running);
+        return self.batchNormImpl(.relu, x, {}, gamma, beta, running);
     }
 
-    fn batchNormImpl(self: *Tape, comptime fuse_relu: bool, x: anytype, gamma: anytype, beta: anytype, running: anytype) Error!Var(@TypeOf(x.value)) {
+    /// Computes max(batchNorm(x) + residual, 0), the end of a residual block, in one pass over the activations.
+    /// residual must have the shape and element type of x.
+    pub fn batchNormAddRelu(self: *Tape, x: anytype, residual: anytype, gamma: anytype, beta: anytype, running: anytype) Error!Var(@TypeOf(x.value)) {
+        comptime if (@TypeOf(x.value) != @TypeOf(residual.value)) @compileError("batchNormAddRelu expects a residual of the same shape as x");
+        return self.batchNormImpl(.add_relu, x, residual, gamma, beta, running);
+    }
+
+    fn batchNormImpl(self: *Tape, comptime fuse: NormFuse, x: anytype, residual: anytype, gamma: anytype, beta: anytype, running: anytype) Error!Var(@TypeOf(x.value)) {
         const In = @TypeOf(x.value);
         const c = In.shape[In.rank - 1];
         const Channels = Tensor(f32, &.{c});
@@ -676,30 +691,51 @@ pub const Tape = struct {
         const value = try self.newTensor(In);
         const st: norm.Stats = .{ .mean = mean.data.ptr, .inv_std = inv_std.data.ptr, .running_mean = running.mean.data.ptr, .running_var = running.variance.data.ptr };
         const affine: norm.Affine = .{ .mean = st.mean, .inv_std = st.inv_std, .gamma = gamma.value.data.ptr, .beta = beta.value.data.ptr };
-        const layout: norm.Layout = .{ .len = In.len, .channels = c, .flag = @intFromBool(fuse_relu) };
+        const flag: u32 = switch (fuse) {
+            .none => 0,
+            .relu => norm.relu_flag,
+            .add_relu => norm.relu_flag | norm.residual_flag,
+        };
+        const layout: norm.Layout = .{ .len = In.len, .channels = c, .flag = flag };
+        const added = if (fuse == .add_relu) residual.value.data else x.value.data;
         if (self.par.gpu) |dev| {
             try dev.batchNormStats(x.value.data, st, c, self.training);
-            try dev.batchNormApply(x.value.data, value.data, affine, layout);
+            try dev.batchNormApply(x.value.data, added, value.data, affine, layout);
         } else if (In.Elem == f32) {
             cpu.normStats(self.par, x.value.data, st, c, self.training);
-            cpu.normApply(self.par, x.value.data, value.data, affine, layout);
+            cpu.normApply(self.par, x.value.data, added, value.data, affine, layout);
         } else return error.NoDevice;
-        const out = try self.makeVar(value, x.needs_grad or gamma.needs_grad or beta.needs_grad);
-        try self.note(if (fuse_relu) .batch_norm_relu else .batch_norm, .{ x, gamma, beta, running.mean, running.variance }, out, .{});
+        const residual_grad = fuse == .add_relu and residual.needs_grad;
+        const out = try self.makeVar(value, x.needs_grad or gamma.needs_grad or beta.needs_grad or residual_grad);
+        const norm_inputs = .{ x, gamma, beta, running.mean, running.variance };
+        switch (fuse) {
+            .none => try self.note(.batch_norm, norm_inputs, out, .{}),
+            .relu => try self.note(.batch_norm_relu, norm_inputs, out, .{}),
+            .add_relu => try self.note(.batch_norm_add_relu, norm_inputs ++ .{residual}, out, .{}),
+        }
 
-        const Ctx = struct { x: @TypeOf(x), gamma: @TypeOf(gamma), beta: @TypeOf(beta), affine: norm.Affine, out: @TypeOf(out) };
-        if (out.needs_grad and self.training) try self.recordBackward(Ctx{ .x = x, .gamma = gamma, .beta = beta, .affine = affine, .out = out }, struct {
+        const Ctx = struct { x: @TypeOf(x), residual: @TypeOf(residual), gamma: @TypeOf(gamma), beta: @TypeOf(beta), affine: norm.Affine, out: @TypeOf(out) };
+        if (out.needs_grad and self.training) try self.recordBackward(Ctx{ .x = x, .residual = residual, .gamma = gamma, .beta = beta, .affine = affine, .out = out }, struct {
             fn run(t: *Tape, k: *const Ctx) Error!void {
                 const sums = try t.zeroedTensor(Tensor(f32, &.{2 * c}));
-                const mask: []const In.Elem = if (fuse_relu) k.out.value.data else &.{};
+                const mask: []const In.Elem = if (fuse != .none) k.out.value.data else &.{};
                 const grads: norm.GradOut = .{ .sums = sums.data, .gamma = k.gamma.grad.data, .beta = k.beta.grad.data };
+                const to_residual = fuse == .add_relu and k.residual.needs_grad;
+                var grad_layout = layout;
+                if (!to_residual) grad_layout.flag &= ~norm.residual_flag;
+                const io = batchNormGradIo(In.Elem, k, sums.data, fuse);
                 if (t.par.gpu) |dev| {
                     try dev.batchNormGradSums(k.x.value.data, k.out.grad.data, k.affine, mask, grads);
-                    if (k.x.needs_grad) try dev.batchNormGradInput(batchNormGradIo(In.Elem, k, sums.data, fuse_relu), k.affine, layout);
-                } else if (In.Elem == f32) {
-                    cpu.normGradSums(t.par, k.x.value.data, k.out.grad.data, k.affine, mask, grads);
-                    if (k.x.needs_grad) cpu.normGradInput(t.par, batchNormGradIo(In.Elem, k, sums.data, fuse_relu), k.affine, layout);
+                    if (k.x.needs_grad) return dev.batchNormGradInput(io, k.affine, grad_layout);
+                    // NOTE: without an input gradient the residual still needs the masked output gradient.
+                    if (to_residual) try dev.addReluBackward(k.out.value.data, k.out.grad.data, k.residual.grad.data, k.residual.grad.data, true, false);
+                    return;
                 }
+                if (comptime In.Elem != f32) return error.NoDevice;
+                cpu.normGradSums(t.par, k.x.value.data, k.out.grad.data, k.affine, mask, grads);
+                if (k.x.needs_grad) return cpu.normGradInput(t.par, io, k.affine, grad_layout);
+                if (!to_residual) return;
+                for (k.out.value.data, k.out.grad.data, k.residual.grad.data) |o, g, *d| d.* += if (o > 0) g else 0;
             }
         }.run);
         return out;
@@ -727,6 +763,7 @@ pub const Tape = struct {
         switch (op) {
             .im2col => return cpu.im2col(self.par, slices[0], slices[1], d),
             .col2im => return cpu.col2im(self.par, slices[0], slices[1], d),
+            .maxPool => return cpu.maxPool(self.par, slices[0], slices[1], slices[2], d),
             else => {},
         }
         kernels.parallelEach(self.par, conv.workItems(op, d), @field(conv, @tagName(op)), slices ++ .{d});
@@ -763,10 +800,7 @@ pub const Tape = struct {
                     const rotated = try g.packRotatedWeights(c.w.value.data, k, c_in, c_out);
                     try g.convImplicitForward(c.out.grad.data, rotated, c.x.grad.data, reverse, true);
                 }
-                if (c.w.needs_grad) {
-                    const grad_t = try g.packMatrix(c.out.grad.data, c_out, rows, std.mem.alignForward(usize, c_out, 128), std.mem.alignForward(usize, rows, 32), true);
-                    try g.convImplicitWeightGrad(grad_t, c.x.value.data, c.w.grad.data, geometry);
-                }
+                if (c.w.needs_grad) try g.convImplicitWeightGrad(c.out.grad.data, c.x.value.data, c.w.grad.data, geometry);
             }
         }.run);
         return out;
@@ -797,7 +831,10 @@ pub const Tape = struct {
         const path: ConvPath = if (general) .grouped else if (dev == null) .direct else if (dev.?.cudnn_lib != null) .cudnn else if (dev.?.tensorWorthwhile(rows, c_out, kc)) (if (unit_stride_blocks and c_out % 32 == 0) .implicit else .packed_im2col) else if (unit_stride_blocks and c_out % 16 == 0 and dev.?.tf32Worthwhile(rows, c_out, kc)) .tf32 else .direct;
 
         const value = try self.newTensor(Out);
-        var col: Col = undefined;
+        // NOTE: the column matrix is k*k times the input. It is kept for the weight gradient unless recompute_columns is set;
+        // then it goes back to the arena right after the product and the backward pass rebuilds it. Keeping one per layer
+        // took 2.8 GiB at batch 128 in the strict f32 CIFAR network, and rebuilding made that epoch about 13% slower.
+        var col: []f32 = &.{};
         var col_half: Packed = .{ .data = &.{}, .rows_padded = 0, .cols_padded = 0 };
         var x_half: []const u16 = &.{};
         switch (path) {
@@ -807,15 +844,20 @@ pub const Tape = struct {
                 // the weight gradient rebuilds it the same way.
                 try cpu.convForward(self.gpa, self.par, x.value.data, w.value.data, value.data, d);
             } else {
-                col = try self.newTensor(Col);
-                try self.convKernel(.im2col, .{ x.value.data, col.data }, d);
-                try tensor.matmulInto(self.gpa, self.par, col, w.value, Flat{ .data = value.data }, .{});
+                const g = dev.?;
+                const mark = g.step_used;
+                const columns: Col = .{ .data = try g.scratch(f32, Col.len) };
+                try self.convKernel(.im2col, .{ x.value.data, columns.data }, d);
+                try tensor.matmulInto(self.gpa, self.par, columns, w.value, Flat{ .data = value.data }, .{});
+                if (g.recompute_columns) g.step_used = mark else col = columns.data;
             },
             .packed_im2col => {
                 const g = dev.?;
-                col_half = try g.im2colPacked(x.value.data, d);
-                const w_half = try g.packMatrix(w.value.data, kc, c_out, col_half.cols_padded, aligned_out, false);
-                try g.matmulPacked(col_half, w_half, value.data, .{ .m = rows, .n = c_out, .k = kc }, false, false);
+                const mark = g.step_used;
+                const columns = try g.im2colPacked(x.value.data, d);
+                const w_half = try g.packMatrix(w.value.data, kc, c_out, columns.cols_padded, aligned_out, false);
+                try g.matmulPacked(columns, w_half, value.data, .{ .m = rows, .n = c_out, .k = kc }, false, false);
+                if (g.recompute_columns) g.step_used = mark else col_half = columns;
             },
             .implicit => {
                 const g = dev.?;
@@ -834,7 +876,7 @@ pub const Tape = struct {
         const out = try self.makeVar(value, x.needs_grad or w.needs_grad);
         try self.note(.conv, .{ x, w }, out, .{ .kernel = k, .stride = opts.stride, .pad = opts.pad, .dilation = opts.dilation, .groups = opts.groups });
 
-        const Ctx = struct { x: @TypeOf(x), w: @TypeOf(w), path: ConvPath, col: Col, col_half: Packed, x_half: []const u16, out: @TypeOf(out) };
+        const Ctx = struct { x: @TypeOf(x), w: @TypeOf(w), path: ConvPath, col: []f32, col_half: Packed, x_half: []const u16, out: @TypeOf(out) };
         if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .w = w, .path = path, .col = col, .col_half = col_half, .x_half = x_half, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
                 const grad: Flat = .{ .data = c.out.grad.data };
@@ -862,7 +904,12 @@ pub const Tape = struct {
                             if (device == null) {
                                 try cpu.convWeightGrad(t.gpa, t.par, c.x.value.data, grad.data, c.w.grad.data, d);
                             } else {
-                                try tensor.matmulInto(t.gpa, t.par, c.col, grad, c.w.grad, .{ .trans_a = true, .accumulate = true });
+                                var columns: Col = .{ .data = c.col };
+                                if (c.col.len == 0) {
+                                    columns.data = try device.?.scratch(f32, Col.len);
+                                    try t.convKernel(.im2col, .{ c.x.value.data, columns.data }, d);
+                                }
+                                try tensor.matmulInto(t.gpa, t.par, columns, grad, c.w.grad, .{ .trans_a = true, .accumulate = true });
                             }
                         }
                     },
@@ -876,21 +923,20 @@ pub const Tape = struct {
                             try t.convKernel(.col2imHalf, .{ dcol_half, c.x.grad.data }, d);
                         }
                         if (c.w.needs_grad) {
-                            const grad_t = try g.packMatrix(grad.data, c_out, rows, std.mem.alignForward(usize, c_out, 128), c.col_half.rows_padded, true);
-                            try g.matmulPacked(grad_t, c.col_half, c.w.grad.data, .{ .m = c_out, .n = kc, .k = rows }, true, true);
+                            const columns = if (c.col_half.data.len != 0) c.col_half else try g.im2colPacked(c.x.value.data, d);
+                            const grad_t = try g.packMatrix(grad.data, c_out, rows, std.mem.alignForward(usize, c_out, 128), columns.rows_padded, true);
+                            try g.matmulPacked(grad_t, columns, c.w.grad.data, .{ .m = c_out, .n = kc, .k = rows }, true, true);
                         }
                     },
                     .implicit => {
                         const g = t.par.gpu.?;
+                        // NOTE: one bf16 copy of the output gradient serves both products.
+                        const grad_half = try g.packMatrix(grad.data, rows, c_out, rows, c_out, false);
                         if (c.x.needs_grad) {
-                            const grad_half = try g.packMatrix(grad.data, rows, c_out, rows, c_out, false);
                             const rotated = try g.packRotatedWeights(c.w.value.data, k, c_in, c_out);
                             try g.convImplicitForward(grad_half.data, rotated, c.x.grad.data, reverse, true);
                         }
-                        if (c.w.needs_grad) {
-                            const grad_t = try g.packMatrix(grad.data, c_out, rows, std.mem.alignForward(usize, c_out, 128), std.mem.alignForward(usize, rows, 32), true);
-                            try g.convImplicitWeightGrad(grad_t, c.x_half, c.w.grad.data, geometry);
-                        }
+                        if (c.w.needs_grad) try g.convImplicitWeightGrad(grad_half.data, c.x_half, c.w.grad.data, geometry);
                     },
                     .tf32 => {
                         const g = t.par.gpu.?;

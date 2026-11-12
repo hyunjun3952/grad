@@ -309,7 +309,42 @@ fn stridesFor(dims: []const usize, rank: usize, out: *[max_rank]usize) void {
     }
 }
 
-pub fn broadcast(a: Allocator, x: Array, y: Array, comptime f: fn (f32, f32) f32) Error!Array {
+// Returns true when small, without its leading ones, equals the trailing axes of big: small then repeats along the leading
+// axes of big (a per-channel scale, a bias, a scalar or a tensor of the same shape) and the result has the shape of big.
+fn repeatsAlong(small: []const usize, big: []const usize) bool {
+    var rest = small;
+    while (rest.len > 0 and rest[0] == 1) rest = rest[1..];
+    if (small.len > big.len) return false;
+    return std.mem.eql(usize, rest, big[big.len - rest.len ..]);
+}
+
+fn Repeated(comptime f: fn (f32, f32) f32) type {
+    return struct {
+        const Job = struct { big: []const f32, small: []const f32, out: []f32, swapped: bool };
+
+        fn run(job: Job, lo: usize, hi: usize) void {
+            var j = lo % job.small.len;
+            for (job.out[lo..hi], job.big[lo..hi]) |*o, v| {
+                o.* = if (job.swapped) f(job.small[j], v) else f(v, job.small[j]);
+                j += 1;
+                if (j == job.small.len) j = 0;
+            }
+        }
+    };
+}
+
+/// Combines x and y element by element with ONNX (numpy) broadcasting. The common cases, equal shapes or one operand
+/// repeating along the leading axes of the other, run as a flat loop on the worker pool; other shapes take an index walk.
+pub fn broadcast(a: Allocator, par: kernels.Parallel, x: Array, y: Array, comptime f: fn (f32, f32) f32) Error!Array {
+    const x_big = repeatsAlong(y.dims, x.dims);
+    if (x_big or repeatsAlong(x.dims, y.dims)) {
+        const big = if (x_big) x else y;
+        const out = try make(a, big.dims);
+        if (out.data.len == 0) return out;
+        const job: Repeated(f).Job = .{ .big = big.data, .small = if (x_big) y.data else x.data, .out = out.data, .swapped = !x_big };
+        kernels.parallelFor(par, out.data.len, 1 << 14, job, Repeated(f).run);
+        return out;
+    }
     const rank = @max(x.dims.len, y.dims.len);
     var dims: [max_rank]usize = undefined;
     for (0..rank) |i| {
@@ -346,7 +381,7 @@ pub fn broadcast(a: Allocator, x: Array, y: Array, comptime f: fn (f32, f32) f32
 pub fn plus(x: f32, y: f32) f32 {
     return x + y;
 }
-fn minus(x: f32, y: f32) f32 {
+pub fn minus(x: f32, y: f32) f32 {
     return x - y;
 }
 fn times(x: f32, y: f32) f32 {
@@ -356,9 +391,14 @@ fn over(x: f32, y: f32) f32 {
     return x / y;
 }
 
-fn map(a: Allocator, x: Array, comptime f: fn (f32) f32) Error!Array {
+fn map(a: Allocator, par: kernels.Parallel, x: Array, comptime f: fn (f32) f32) Error!Array {
     const out = try make(a, x.dims);
-    for (out.data, x.data) |*o, v| o.* = f(v);
+    const Job = struct { x: []const f32, out: []f32 };
+    kernels.parallelFor(par, out.data.len, 1 << 14, Job{ .x = x.data, .out = out.data }, struct {
+        fn run(job: Job, lo: usize, hi: usize) void {
+            for (job.out[lo..hi], job.x[lo..hi]) |*o, v| o.* = f(v);
+        }
+    }.run);
     return out;
 }
 
@@ -387,20 +427,20 @@ fn execute(a: Allocator, par: kernels.Parallel, node: Node, values: *std.StringH
     const kind = std.meta.stringToEnum(Kind, node.op) orelse return error.UnsupportedOp;
     const out = try a.alloc(Array, 1);
     out[0] = switch (kind) {
-        .Add => try broadcast(a, try input(values, node, 0), try input(values, node, 1), plus),
-        .Sub => try broadcast(a, try input(values, node, 0), try input(values, node, 1), minus),
-        .Mul => try broadcast(a, try input(values, node, 0), try input(values, node, 1), times),
-        .Div => try broadcast(a, try input(values, node, 0), try input(values, node, 1), over),
-        .Relu => try map(a, try input(values, node, 0), relu),
-        .Sigmoid => try map(a, try input(values, node, 0), sigmoid),
-        .Tanh => try map(a, try input(values, node, 0), tanhf),
-        .Gelu => try map(a, try input(values, node, 0), geluTanh),
-        .Sqrt => try map(a, try input(values, node, 0), sqrtf),
+        .Add => try broadcast(a, par, try input(values, node, 0), try input(values, node, 1), plus),
+        .Sub => try broadcast(a, par, try input(values, node, 0), try input(values, node, 1), minus),
+        .Mul => try broadcast(a, par, try input(values, node, 0), try input(values, node, 1), times),
+        .Div => try broadcast(a, par, try input(values, node, 0), try input(values, node, 1), over),
+        .Relu => try map(a, par, try input(values, node, 0), relu),
+        .Sigmoid => try map(a, par, try input(values, node, 0), sigmoid),
+        .Tanh => try map(a, par, try input(values, node, 0), tanhf),
+        .Gelu => try map(a, par, try input(values, node, 0), geluTanh),
+        .Sqrt => try map(a, par, try input(values, node, 0), sqrtf),
         .Identity, .Dropout => try input(values, node, 0),
         .MatMul => try matmul(a, try input(values, node, 0), try input(values, node, 1)),
-        .Gemm => try gemm(a, node, try input(values, node, 0), try input(values, node, 1), maybeInput(values, node, 2)),
+        .Gemm => try gemm(a, par, node, try input(values, node, 0), try input(values, node, 1), maybeInput(values, node, 2)),
         .Conv => try convolve(a, par, node, try input(values, node, 0), try input(values, node, 1), maybeInput(values, node, 2)),
-        .MaxPool, .AveragePool => try pool(a, node, try input(values, node, 0), kind == .MaxPool),
+        .MaxPool, .AveragePool => try pool(a, par, node, try input(values, node, 0), kind == .MaxPool),
         .GlobalAveragePool => try globalAverage(a, try input(values, node, 0)),
         .BatchNormalization => try batchNorm(a, node, try input(values, node, 0), try input(values, node, 1), try input(values, node, 2), try input(values, node, 3), try input(values, node, 4)),
         .Flatten => blk: {
@@ -409,7 +449,7 @@ fn execute(a: Allocator, par: kernels.Parallel, node: Node, values: *std.StringH
             break :blk .{ .dims = try a.dupe(usize, &.{ product(x.dims[0..axis]), product(x.dims[axis..]) }), .data = x.data };
         },
         .Reshape => try reshape(a, try input(values, node, 0), try input(values, node, 1)),
-        .Transpose => try transpose(a, node, try input(values, node, 0)),
+        .Transpose => try transpose(a, par, node, try input(values, node, 0)),
         .Concat => try concat(a, node, values),
         .Softmax => try softmax(a, node, try input(values, node, 0)),
         .Gather => try gather(a, node, try input(values, node, 0), try input(values, node, 1)),
@@ -439,7 +479,7 @@ fn matmul(a: Allocator, x: Array, y: Array) Error!Array {
     return out;
 }
 
-fn gemm(a: Allocator, node: Node, x: Array, y: Array, c: ?Array) Error!Array {
+fn gemm(a: Allocator, par: kernels.Parallel, node: Node, x: Array, y: Array, c: ?Array) Error!Array {
     const trans_a = node.int("transA", 0) != 0;
     const trans_b = node.int("transB", 0) != 0;
     const alpha = node.float("alpha", 1);
@@ -454,7 +494,7 @@ fn gemm(a: Allocator, node: Node, x: Array, y: Array, c: ?Array) Error!Array {
     if (c) |bias| {
         const scaled = try make(a, bias.dims);
         for (scaled.data, bias.data) |*o, v| o.* = v * beta;
-        return broadcast(a, out, scaled, plus);
+        return broadcast(a, par, out, scaled, plus);
     }
     return out;
 }
@@ -473,9 +513,13 @@ fn pair(list: []const i64, index: usize, default: usize) usize {
 
 const Window = struct { c: usize, h: usize, w: usize, kh: usize, kw: usize, sy: usize, sx: usize, py: usize, px: usize, dy: usize, dx: usize, oh: usize, ow: usize };
 
-fn planarColumns(x: []const f32, col: []f32, v: Window) void {
+const ColumnJob = struct { x: []const f32, col: []f32, v: Window };
+
+// Builds the rows of the column matrix that belong to input channels lo to hi.
+fn planarColumns(job: ColumnJob, lo: usize, hi: usize) void {
+    const x, const col, const v = .{ job.x, job.col, job.v };
     const positions = v.oh * v.ow;
-    for (0..v.c) |ic| {
+    for (lo..hi) |ic| {
         for (0..v.kh) |ky| {
             for (0..v.kw) |kx| {
                 const row = col[((ic * v.kh + ky) * v.kw + kx) * positions ..][0..positions];
@@ -527,15 +571,19 @@ pub fn convolve(a: Allocator, par: kernels.Parallel, node: Node, x: Array, w: Ar
         const col = try a.alloc(f32, taps * positions);
         const work = try a.alloc(f32, kernels.matmulTiledWorkLen(f32, .{}, par, m, taps, positions));
         const view: Window = .{ .c = c, .h = h, .w = width, .kh = kh, .kw = kw, .sy = sy, .sx = sx, .py = py, .px = px, .dy = dy, .dx = dx, .oh = oh, .ow = ow };
+        const BiasJob = struct { image: []f32, bias: []const f32, positions: usize };
         for (0..n) |b| {
-            planarColumns(x.data[b * c * h * width ..], col, view);
+            kernels.parallelFor(par, c, @max(1, 4096 / (kh * kw * positions)), ColumnJob{ .x = x.data[b * c * h * width ..], .col = col, .v = view }, planarColumns);
             const image = out.data[b * m * positions ..][0 .. m * positions];
             kernels.matmulTiled(f32, .{}, par, .{ .m = m, .k = taps, .n = positions, .a = w.data, .b = col, .out = image }, work);
-            if (bias) |extra| {
-                for (0..m) |oc| {
-                    for (image[oc * positions ..][0..positions]) |*v| v.* += extra.data[oc];
+            const extra = bias orelse continue;
+            kernels.parallelFor(par, m, @max(1, 8192 / positions), BiasJob{ .image = image, .bias = extra.data, .positions = positions }, struct {
+                fn run(job: BiasJob, lo: usize, hi: usize) void {
+                    for (lo..hi) |oc| {
+                        for (job.image[oc * job.positions ..][0..job.positions]) |*v| v.* += job.bias[oc];
+                    }
                 }
-            }
+            }.run);
         }
         return out;
     }
@@ -581,7 +629,37 @@ pub fn convolve(a: Allocator, par: kernels.Parallel, node: Node, x: Array, w: Ar
     return out;
 }
 
-pub fn pool(a: Allocator, node: Node, x: Array, is_max: bool) Error!Array {
+const PoolJob = struct { x: []const f32, out: []f32, v: Window, is_max: bool };
+
+// Pools the planes (image and channel pairs) lo to hi.
+fn poolPlanes(job: PoolJob, lo: usize, hi: usize) void {
+    const v = job.v;
+    for (lo..hi) |plane| {
+        for (0..v.oh) |oy| {
+            for (0..v.ow) |ox| {
+                var best: f32 = -std.math.inf(f32);
+                var total: f32 = 0;
+                var count: usize = 0;
+                for (0..v.kh) |i| {
+                    const iy = oy * v.sy + i;
+                    if (iy < v.py or iy - v.py >= v.h) continue;
+                    for (0..v.kw) |j| {
+                        const ix = ox * v.sx + j;
+                        if (ix < v.px or ix - v.px >= v.w) continue;
+                        const value = job.x[(plane * v.h + iy - v.py) * v.w + ix - v.px];
+                        best = @max(best, value);
+                        total += value;
+                        count += 1;
+                    }
+                }
+                job.out[(plane * v.oh + oy) * v.ow + ox] = if (job.is_max) best else total / @as(f32, @floatFromInt(@max(count, 1)));
+            }
+        }
+    }
+}
+
+/// Max or average pooling of an NCHW tensor (count_include_pad off), one plane per work item on the worker pool.
+pub fn pool(a: Allocator, par: kernels.Parallel, node: Node, x: Array, is_max: bool) Error!Array {
     if (x.dims.len != 4) return error.UnsupportedOp;
     const kernel = node.ints("kernel_shape");
     const strides = node.ints("strides");
@@ -599,28 +677,8 @@ pub fn pool(a: Allocator, node: Node, x: Array, is_max: bool) Error!Array {
     const oh = (h + 2 * py - ky) / sy + 1;
     const ow = (w + 2 * px - kx) / sx + 1;
     const out = try make(a, &.{ n, c, oh, ow });
-    for (0..n * c) |plane| {
-        for (0..oh) |oy| {
-            for (0..ow) |ox| {
-                var best: f32 = -std.math.inf(f32);
-                var total: f32 = 0;
-                var count: usize = 0;
-                for (0..ky) |i| {
-                    const iy = oy * sy + i;
-                    if (iy < py or iy - py >= h) continue;
-                    for (0..kx) |j| {
-                        const ix = ox * sx + j;
-                        if (ix < px or ix - px >= w) continue;
-                        const v = x.data[(plane * h + iy - py) * w + ix - px];
-                        best = @max(best, v);
-                        total += v;
-                        count += 1;
-                    }
-                }
-                out.data[(plane * oh + oy) * ow + ox] = if (is_max) best else total / @as(f32, @floatFromInt(@max(count, 1)));
-            }
-        }
-    }
+    const view: Window = .{ .c = c, .h = h, .w = w, .kh = ky, .kw = kx, .sy = sy, .sx = sx, .py = py, .px = px, .dy = 1, .dx = 1, .oh = oh, .ow = ow };
+    kernels.parallelFor(par, n * c, @max(1, 8192 / @max(1, oh * ow * ky * kx)), PoolJob{ .x = x.data, .out = out.data, .v = view, .is_max = is_max }, poolPlanes);
     return out;
 }
 
@@ -671,7 +729,45 @@ fn reshape(a: Allocator, x: Array, shape: Array) Error!Array {
     return .{ .dims = dims, .data = x.data };
 }
 
-fn transpose(a: Allocator, node: Node, x: Array) Error!Array {
+const Groups = struct { lead: usize, middle: usize };
+
+// Recognizes a permutation that keeps axes 0 to lead - 1 and swaps two contiguous groups of the remaining axes, lead to
+// middle - 1 and middle to the end: per leading index, that is the transpose of a (rows, cols) matrix.
+fn swappedGroups(perm: []const usize) ?Groups {
+    var lead: usize = 0;
+    while (lead < perm.len and perm[lead] == lead) lead += 1;
+    if (lead == perm.len) return null;
+    const middle = perm[lead];
+    for (perm[lead..], 0..) |p, i| {
+        const want = if (i < perm.len - middle) middle + i else lead + i - (perm.len - middle);
+        if (p != want) return null;
+    }
+    return .{ .lead = lead, .middle = middle };
+}
+
+const TransposeJob = struct { x: []const f32, out: []f32, rows: usize, cols: usize };
+
+// Transposes bands of 32 rows, matrix by matrix; work item i is band i % bands of matrix i / bands.
+fn transposeBlocks(job: TransposeJob, lo: usize, hi: usize) void {
+    const bands = (job.rows + 31) / 32;
+    const size = job.rows * job.cols;
+    for (lo..hi) |item| {
+        const src = job.x[item / bands * size ..][0..size];
+        const dst = job.out[item / bands * size ..][0..size];
+        const r0 = item % bands * 32;
+        const r1 = @min(r0 + 32, job.rows);
+        var c0: usize = 0;
+        while (c0 < job.cols) : (c0 += 32) {
+            const c1 = @min(c0 + 32, job.cols);
+            for (r0..r1) |r| {
+                for (c0..c1) |col| dst[col * job.rows + r] = src[r * job.cols + col];
+            }
+        }
+    }
+}
+
+/// Permutes the axes of x by the perm attribute (reversed when absent); two swapped groups of axes take a blocked matrix transpose.
+pub fn transpose(a: Allocator, par: kernels.Parallel, node: Node, x: Array) Error!Array {
     const rank = x.dims.len;
     var perm: [max_rank]usize = undefined;
     const given = node.ints("perm");
@@ -687,6 +783,13 @@ fn transpose(a: Allocator, node: Node, x: Array) Error!Array {
     }
     for (0..rank) |d| dims[d] = x.dims[perm[d]];
     const out = try make(a, dims[0..rank]);
+    if (swappedGroups(perm[0..rank])) |split| {
+        // NOTE: the exporter wraps every convolution and pooling in NHWC to NCHW transposes and back; both are this case.
+        const job: TransposeJob = .{ .x = x.data, .out = out.data, .rows = product(x.dims[split.lead..split.middle]), .cols = product(x.dims[split.middle..]) };
+        const blocks = product(x.dims[0..split.lead]) * ((job.rows + 31) / 32);
+        kernels.parallelFor(par, blocks, @max(1, 8192 / (32 * @max(1, job.cols))), job, transposeBlocks);
+        return out;
+    }
     var index: [max_rank]usize = @splat(0);
     for (out.data) |*v| {
         var offset: usize = 0;

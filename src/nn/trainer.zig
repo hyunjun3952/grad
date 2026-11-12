@@ -60,6 +60,7 @@ const Options = struct {
     tensor_cores: bool = false,
     tf32: bool = false,
     deterministic: bool = false,
+    recompute: bool = false,
     progress: bool = false,
     mirrored: bool = false,
     cudnn_dir: ?[:0]const u8 = null,
@@ -75,6 +76,7 @@ const Options = struct {
     warmup_epochs: usize = 0,
     predict: usize = 0,
     batch: ?usize = null,
+    scratch_mib: ?usize = null,
     replicas: usize = 1,
     learning_rate: ?f32 = null,
     onnx_path: ?[]const u8 = null,
@@ -91,6 +93,8 @@ const Options = struct {
                 o.progress = true;
             } else if (std.mem.eql(u8, arg, "--deterministic")) {
                 o.deterministic = true;
+            } else if (std.mem.eql(u8, arg, "--recompute")) {
+                o.recompute = true;
             } else if (std.mem.eql(u8, arg, "--tf32")) {
                 o.tf32 = true;
             } else if (std.mem.eql(u8, arg, "--tensor-cores")) {
@@ -123,6 +127,8 @@ const Options = struct {
                 o.until = try std.fmt.parseInt(usize, v, 10);
             } else if (valueOf(arg, "--batch")) |v| {
                 o.batch = try std.fmt.parseInt(usize, v, 10);
+            } else if (valueOf(arg, "--scratch")) |v| {
+                o.scratch_mib = try std.fmt.parseInt(usize, v, 10);
             } else if (valueOf(arg, "--replicas")) |v| {
                 o.replicas = try std.fmt.parseInt(usize, v, 10);
             } else if (valueOf(arg, "--lr")) |v| {
@@ -315,12 +321,17 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
             }
         };
 
-        fn mixedLoss(tape: *Tape, logits: anytype, labels: []const u8, other_labels: []const u8, kept: f32) autograd.Error!autograd.Var(Tensor(f32, &.{})) {
-            if (kept == 1) return tape.crossEntropy(logits, labels);
+        // The CutMix loss: kept times the loss on the labels plus 1 - kept times the loss on the pasted images' labels.
+        // weights, when given, is a device buffer holding kept and 1 - kept that is refilled every step; a recorded step
+        // uses it so that the graph does not bake the share in, and then always has the mixed form.
+        fn mixedLoss(tape: *Tape, logits: anytype, labels: []const u8, other_labels: []const u8, kept: f32, weights: ?[]f32) autograd.Error!autograd.Var(Tensor(f32, &.{})) {
+            if (kept == 1 and weights == null) return tape.crossEntropy(logits, labels);
             const Scalar = Tensor(f32, &.{});
+            const kept_weight: Scalar = if (weights) |w| .{ .data = w[0..1] } else try tape.filledTensor(Scalar, kept);
+            const other_weight: Scalar = if (weights) |w| .{ .data = w[1..2] } else try tape.filledTensor(Scalar, 1 - kept);
             return tape.add(
-                try tape.mul(try tape.crossEntropy(logits, labels), try tape.constant(try tape.filledTensor(Scalar, kept))),
-                try tape.mul(try tape.crossEntropy(logits, other_labels), try tape.constant(try tape.filledTensor(Scalar, 1 - kept))),
+                try tape.mul(try tape.crossEntropy(logits, labels), try tape.constant(kept_weight)),
+                try tape.mul(try tape.crossEntropy(logits, other_labels), try tape.constant(other_weight)),
             );
         }
 
@@ -354,13 +365,18 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
             const test_set = shared.test_set;
             const replicas = opts.replicas;
 
-            const gpu: ?*Gpu = if (opts.gpu) try Gpu.init(gpa, .{ .step_bytes = Spec.scratch_bytes, .device = index % @max(1, Gpu.deviceCount()) }) else null;
+            // NOTE: --scratch=N reserves N MiB for each arena instead of Spec.scratch_bytes and a quarter of it; the zero arena
+            // holds the gradients, which need about as much as the activations in bf16, hence the same size for both.
+            const scratch_bytes: usize = if (opts.scratch_mib) |mib| mib << 20 else Spec.scratch_bytes;
+            const zero_bytes: ?usize = if (opts.scratch_mib) |mib| mib << 20 else null;
+            const gpu: ?*Gpu = if (opts.gpu) try Gpu.init(gpa, .{ .step_bytes = scratch_bytes, .zero_bytes = zero_bytes, .device = index % @max(1, Gpu.deviceCount()) }) else null;
             defer if (gpu) |dev| dev.deinit();
             if (gpu) |dev| {
                 if (opts.profile and index == 0) dev.startProfile(io);
                 dev.tensor_cores = opts.tensor_cores;
                 dev.tf32 = opts.tf32;
                 dev.deterministic = opts.deterministic;
+                dev.recompute_columns = opts.recompute;
                 if (opts.cudnn_dir) |dir| dev.enableCudnn(dir) catch |err| if (index == 0) try out.print("cuDNN unavailable ({s}), using the built-in kernels\n", .{@errorName(err)});
             }
             // NOTE: replica threads must not share the CPU worker pool, which is a single global one.
@@ -409,6 +425,15 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
             const live = index == 0 and (opts.progress or try Io.File.stdout().isTty(io));
             if (live) Io.File.stdout().enableAnsiEscapeCodes(io) catch {};
             const progress_every = @max(1, steps / 100);
+            // NOTE: a training step is the same sequence of launches every time, so on the GPU the forward and backward pass is
+            // recorded once and replayed. What changes per step stays outside or in device buffers: the batch is gathered in
+            // place, the dropout seed offset and the CutMix weights are uploaded before each replay, and Adam, EMA and the
+            // loss sum run after it. Profiling cannot record, replicas exchange gradients through the host and cuDNN plans
+            // are not captured, so those runs launch every step normally.
+            const use_graph = gpu != null and !opts.profile and replicas == 1 and opts.cudnn_dir == null;
+            var graph: ?Gpu.Graph = null;
+            var graph_loss: autograd.Var(Tensor(f32, &.{})) = undefined;
+            const mix_weights: ?[]f32 = if (use_graph and opts.cutmix > 0) try gpu.?.alloc(f32, 2) else null;
             for (start_epoch..@max(start_epoch, stop_epoch)) |epoch| {
                 const started = Io.Clock.awake.now(io);
                 try feed.shuffle(epoch);
@@ -424,14 +449,30 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
                     // with the whole batch would. CutMix pairs rows inside a slice only.
                     try feed.fill(step * replicas + index, augment);
 
-                    _ = arena.reset(.retain_capacity);
-                    if (gpu) |dev| try dev.resetStep();
                     adam.lr = optim.cosineLr(learning_rate, global_step, epochs * steps, opts.warmup_epochs * steps);
-                    var tape: Tape = .{ .gpa = arena.allocator(), .par = par, .training = true, .smoothing = opts.smoothing, .seed = (global_step * replicas + index) * 8 };
-                    try optim.zeroGrad(par, params);
-                    const logits = try Spec.forward(model, &tape, try tape.constant(feed.batch));
-                    const loss = try mixedLoss(&tape, logits, feed.labels, feed.other_labels, mix.kept);
-                    try tape.backward(loss);
+                    // NOTE: dropout seeds are (global_step * replicas + index) * 8 plus the op number; a recorded step keeps
+                    // index * 8 on the tape and takes the step part from the device, which gives the same masks.
+                    const step_seed = global_step * replicas * 8;
+                    if (use_graph) {
+                        const dev = gpu.?;
+                        try dev.setStepSeed(step_seed);
+                        if (mix_weights) |w| try dev.upload(w, &[2]f32{ mix.kept, 1 - mix.kept });
+                    }
+                    if (!use_graph or graph == null) {
+                        _ = arena.reset(.retain_capacity);
+                        if (gpu) |dev| {
+                            try dev.resetStep();
+                            if (use_graph) try dev.beginCapture();
+                        }
+                        var tape: Tape = .{ .gpa = arena.allocator(), .par = par, .training = true, .smoothing = opts.smoothing, .seed = index * 8 + if (use_graph) 0 else step_seed };
+                        try optim.zeroGrad(par, params);
+                        const logits = try Spec.forward(model, &tape, try tape.constant(feed.batch));
+                        graph_loss = try mixedLoss(&tape, logits, feed.labels, feed.other_labels, mix.kept, mix_weights);
+                        try tape.backward(graph_loss);
+                        if (use_graph) graph = try gpu.?.endCapture();
+                    }
+                    if (use_graph) try gpu.?.replay(graph.?);
+                    const loss = graph_loss;
                     try shared.group.averageGrads(index, par, params);
                     try adam.step(par, params);
                     if (opts.ema_decay > 0) try average.update(par, adam.t);
@@ -477,7 +518,11 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
                 try checkpoint.save(gpa, io, path, gpu, nn.state(model) ++ adam.state() ++ average.state(), &counters);
                 try out.print("saved {s}\n", .{path});
             }
-            if (gpu) |dev| try dev.printProfile(out);
+            if (gpu) |dev| {
+                const peak = dev.peakUsage();
+                try out.print("device scratch peak {d} MiB of {d} MiB, zero arena peak {d} MiB of {d} MiB\n", .{ peak.step >> 20, dev.step_size >> 20, peak.zero >> 20, dev.zero_size >> 20 });
+                try dev.printProfile(out);
+            }
             try out.flush();
         }
 
@@ -546,6 +591,8 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
 
 /// Runs a whole program for a model description: parses the flags, loads data, trains, evaluates and writes the optional outputs.
 /// Spec supplies the layers, the forward pass, the data loader and the batch sizes it was built for; --batch picks one of them.
+/// scratch_bytes sizes the device scratch arena (the zero arena gets a quarter); --scratch=N overrides both, and a GPU run
+/// prints the peak use of each so that N can be chosen.
 /// With --replicas=N (GPU only) the batch is split into N slices, one per replica, so batch / N must be one of the built sizes.
 pub fn run(comptime Spec: type, init: std.process.Init) !void {
     const allowed = if (@hasDecl(Spec, "batches")) Spec.batches else [_]usize{Spec.batch};

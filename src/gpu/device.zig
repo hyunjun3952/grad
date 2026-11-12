@@ -384,7 +384,7 @@ fn embeddingScatterKernel(comptime E: type) type {
 // NOTE: one warp per row, like layer norm. The masked columns past the causal limit are written as zero.
 fn softmaxRowsKernel(comptime E: type) type {
     return struct {
-        fn run(x: [*]const E, y: [*]E, rows: u32, cols: u32, period: u32) callconv(.nvptx_kernel) void {
+        fn run(x: [*]const E, y: [*]E, rows: u32, cols: u32, period: u32, scale: f32) callconv(.nvptx_kernel) void {
             const at = warpRow();
             if (at.row >= rows) return;
             const xr = x + at.row * cols;
@@ -396,16 +396,16 @@ fn softmaxRowsKernel(comptime E: type) type {
             largest = warpMax(largest);
             var total: f32 = 0;
             j = at.lane;
-            while (j < limit) : (j += 32) total += act.exponential(bf16.load(E, xr, j) - largest);
+            while (j < limit) : (j += 32) total += act.exponential(scale * (bf16.load(E, xr, j) - largest));
             const inverse = 1 / warpSum(total);
             j = at.lane;
-            while (j < cols) : (j += 32) bf16.store(E, yr, j, if (j < limit) act.exponential(bf16.load(E, xr, j) - largest) * inverse else 0);
+            while (j < cols) : (j += 32) bf16.store(E, yr, j, if (j < limit) act.exponential(scale * (bf16.load(E, xr, j) - largest)) * inverse else 0);
         }
     };
 }
 fn softmaxBackwardKernel(comptime E: type) type {
     return struct {
-        fn run(y: [*]const E, dy: [*]const E, dx: [*]E, rows: u32, cols: u32) callconv(.nvptx_kernel) void {
+        fn run(y: [*]const E, dy: [*]const E, dx: [*]E, rows: u32, cols: u32, scale: f32) callconv(.nvptx_kernel) void {
             const at = warpRow();
             if (at.row >= rows) return;
             const base = at.row * cols;
@@ -414,7 +414,7 @@ fn softmaxBackwardKernel(comptime E: type) type {
             while (j < cols) : (j += 32) dot += bf16.load(E, y + base, j) * bf16.load(E, dy + base, j);
             dot = warpSum(dot);
             j = at.lane;
-            while (j < cols) : (j += 32) bf16.store(E, dx + base, j, bf16.load(E, dx + base, j) + bf16.load(E, y + base, j) * (bf16.load(E, dy + base, j) - dot));
+            while (j < cols) : (j += 32) bf16.store(E, dx + base, j, bf16.load(E, dx + base, j) + scale * bf16.load(E, y + base, j) * (bf16.load(E, dy + base, j) - dot));
         }
     };
 }
@@ -637,20 +637,20 @@ export fn batchNormGradFinish(sums: [*]const f32, gamma_grad: [*]f32, beta_grad:
     beta_grad[ch] += sums[ch];
     gamma_grad[ch] += sums[c + ch];
 }
-export fn batchNormApply(x: [*]const f32, y: [*]f32, p: nm.Affine, l: nm.Layout) callconv(.nvptx_kernel) void {
-    if (globalIndex() < l.len) nm.apply(f32, globalIndex(), x, y, p, l);
+export fn batchNormApply(x: [*]const f32, residual: [*]const f32, y: [*]f32, p: nm.Affine, l: nm.Layout) callconv(.nvptx_kernel) void {
+    if (globalIndex() < l.len) nm.apply(f32, globalIndex(), x, residual, y, p, l);
 }
 
-export fn batchNormApplyQuad(x: [*]const u16, y: [*]u16, p: nm.Affine, l: nm.Layout) callconv(.nvptx_kernel) void {
-    if (globalIndex() * 4 < l.len) nm.applyQuad(u16, globalIndex() * 4, x, y, p, l);
+export fn batchNormApplyQuad(x: [*]const u16, residual: [*]const u16, y: [*]u16, p: nm.Affine, l: nm.Layout) callconv(.nvptx_kernel) void {
+    if (globalIndex() * 4 < l.len) nm.applyQuad(u16, globalIndex() * 4, x, residual, y, p, l);
 }
 
 export fn batchNormGradInputQuad(io: nm.GradIo(u16), p: nm.Affine, l: nm.Layout) callconv(.nvptx_kernel) void {
     if (globalIndex() * 4 < l.len) nm.gradInputQuad(u16, globalIndex() * 4, io, p, l);
 }
 
-export fn batchNormApplyHalf(x: [*]const u16, y: [*]u16, p: nm.Affine, l: nm.Layout) callconv(.nvptx_kernel) void {
-    if (globalIndex() < l.len) nm.apply(u16, globalIndex(), x, y, p, l);
+export fn batchNormApplyHalf(x: [*]const u16, residual: [*]const u16, y: [*]u16, p: nm.Affine, l: nm.Layout) callconv(.nvptx_kernel) void {
+    if (globalIndex() < l.len) nm.apply(u16, globalIndex(), x, residual, y, p, l);
 }
 
 export fn batchNormGradInput(io: nm.GradIo(f32), p: nm.Affine, l: nm.Layout) callconv(.nvptx_kernel) void {
@@ -763,12 +763,12 @@ export fn maxPoolBackwardHalf(index: [*]const u32, gout: [*]const u16, gin: [*]u
     if (globalIndex() < len) cv.maxPoolBackwardHalf(@intCast(globalIndex()), index, gout, gin, d);
 }
 
-export fn dropout(src: [*]const f32, dst: [*]f32, len: u32, seed: u64, keep: f32, accumulate: u32) callconv(.nvptx_kernel) void {
-    if (globalIndex() < len) drop.applyOf(f32, globalIndex(), src, dst, seed, keep, accumulate != 0);
+export fn dropout(src: [*]const f32, dst: [*]f32, len: u32, seed: u64, step_seed: [*]const u64, keep: f32, accumulate: u32) callconv(.nvptx_kernel) void {
+    if (globalIndex() < len) drop.applyOf(f32, globalIndex(), src, dst, seed +% step_seed[0], keep, accumulate != 0);
 }
 
-export fn dropoutHalf(src: [*]const u16, dst: [*]u16, len: u32, seed: u64, keep: f32, accumulate: u32) callconv(.nvptx_kernel) void {
-    if (globalIndex() < len) drop.applyOf(u16, globalIndex(), src, dst, seed, keep, accumulate != 0);
+export fn dropoutHalf(src: [*]const u16, dst: [*]u16, len: u32, seed: u64, step_seed: [*]const u64, keep: f32, accumulate: u32) callconv(.nvptx_kernel) void {
+    if (globalIndex() < len) drop.applyOf(u16, globalIndex(), src, dst, seed +% step_seed[0], keep, accumulate != 0);
 }
 
 // ***** optimizers and data *****
@@ -880,10 +880,11 @@ fn TensorTile(comptime tile_rows: usize, comptime tile_cols: usize) type {
         const cols = tile_cols;
         const warp_m = rows * cols / 256;
         const depth = 32;
-        const stages = 3;
         const a_elems = rows * depth;
         const b_elems = depth * cols;
         const stage_elems = a_elems + b_elems;
+        // NOTE: static shared memory is limited to 48 KiB per block, so a 128 x 128 tile fits only three stages.
+        const stages = if (4 * stage_elems * 2 <= 48 * 1024) 4 else 3;
 
         var smem: [stages * stage_elems]u16 align(128) addrspace(.shared) = undefined;
 
@@ -893,6 +894,12 @@ fn TensorTile(comptime tile_rows: usize, comptime tile_cols: usize) type {
 
         inline fn bSlot(k: usize, chunk: usize) usize {
             return k * cols + ((chunk ^ (k % 8)) * 8);
+        }
+
+        // The A tile stored by k instead of by row (depth rows of rows elements), swizzled like B; the weight gradient
+        // loads the output gradient this way because it is contiguous along the rows of A.
+        inline fn aTransposedSlot(k: usize, chunk: usize) usize {
+            return k * rows + ((chunk ^ (k % 8)) * 8);
         }
 
         inline fn sharedAddress(index: usize) u32 {
@@ -1029,7 +1036,8 @@ inline fn packTransposedOf(comptime E: type, src: [*]const E, dst: [*]u16, args:
 
 // How the operands of a tensor core GEMM are read. dense reads both matrices as stored. gather_a builds the left
 // operand from the NHWC input on the fly (implicit GEMM for the forward pass and the input gradient), and gather_b
-// does the same for the right operand (weight gradient), so no im2col buffer is ever written.
+// does the same for the right operand (weight gradient), so no im2col buffer is ever written. In bf16, gather_b also
+// reads its left operand, the transposed output gradient, straight from the (positions, c_out) gradient.
 const GemmMode = enum { dense, gather_a, gather_b };
 
 const zero_geometry: ga.ConvGeometry = .{ .n = 0, .h = 0, .w = 0, .c = 0, .k = 0, .stride = 0, .pad = 0, .out_h = 0, .out_w = 0, .positions = 0, .c_out = 0 };
@@ -1048,8 +1056,9 @@ inline fn commitCopies() void {
     asm volatile ("cp.async.commit_group;" ::: .{ .memory = true });
 }
 
-inline fn waitCopies() void {
-    asm volatile ("cp.async.wait_group 1;" ::: .{ .memory = true });
+// Waits until at most pending groups of copies are still in flight; the pipeline keeps stages - 2 tiles loading ahead.
+inline fn waitCopies(comptime pending: usize) void {
+    asm volatile (std.fmt.comptimePrint("cp.async.wait_group {d};", .{pending}) ::: .{ .memory = true });
 }
 
 const Acc = [4][4][4]f32;
@@ -1070,6 +1079,11 @@ const GemmKind = struct {
     fn Tile(comptime self: GemmKind) type {
         return if (self.tf32) Tf32Tile(self.rows, self.cols) else TensorTile(self.rows, self.cols);
     }
+
+    // True when the left operand is stored transposed, as (k, rows), and loaded with ldmatrix.trans.
+    fn transposedA(comptime self: GemmKind) bool {
+        return self.mode == .gather_b and !self.tf32;
+    }
 };
 
 fn GemmLoader(comptime kind: GemmKind) type {
@@ -1086,6 +1100,7 @@ fn GemmLoader(comptime kind: GemmKind) type {
         geo: ga.ConvGeometry,
         rows_a: [a_per]usize,
         chunk_a: usize,
+        chunk_t: [a_per]usize,
         dst_a: [a_per]usize,
         dst_b: [b_per]usize,
         k_b: [b_per]usize,
@@ -1102,6 +1117,16 @@ fn GemmLoader(comptime kind: GemmKind) type {
         cursor_ky: i32,
         cursor_kx: i32,
         cursor_channel: usize,
+        // gather_b: the column (tap and channel) of each copy is fixed, and its output position p advances by depth per issue.
+        tap_ky: [b_per]i32,
+        tap_kx: [b_per]i32,
+        tap_channel: [b_per]usize,
+        p: [b_per]u32,
+        p_n: [b_per]u32,
+        p_y: [b_per]u32,
+        p_x: [b_per]u32,
+        step_y: u32,
+        step_x: u32,
 
         inline fn init(a: [*]const Elem, b: [*]const Elem, geo: ga.ConvGeometry, shape: ga.TensorShape, block: Block) @This() {
             const tid, const row0, const col0, const k_begin = .{ block.tid, block.row0, block.col0, block.k_begin };
@@ -1122,6 +1147,16 @@ fn GemmLoader(comptime kind: GemmKind) type {
                 self.rows_a[i] = tid / 4 + 64 * i;
                 self.dst_a[i] = tc.aDestination(self.rows_a[i], self.chunk_a);
             }
+            if (comptime kind.transposedA()) {
+                // NOTE: here rows_a holds the k of each copy and chunk_t its group of eight rows; a tile row of A is a
+                // contiguous run of the gradient row of one position.
+                inline for (0..a_per) |i| {
+                    const index = tid + 256 * i;
+                    self.rows_a[i] = index / (tc.rows / 8);
+                    self.chunk_t[i] = index % (tc.rows / 8);
+                    self.dst_a[i] = tc.aTransposedSlot(self.rows_a[i], self.chunk_t[i]);
+                }
+            }
             inline for (0..b_per) |j| {
                 self.k_b[j] = (tid + j * 256) / (tc.cols / lane_elems);
                 self.chunk_b[j] = (tid + j * 256) % (tc.cols / lane_elems);
@@ -1139,6 +1174,24 @@ fn GemmLoader(comptime kind: GemmKind) type {
                 self.cursor_ky = @intCast(tap / geo.k);
                 self.cursor_kx = @intCast(tap % geo.k);
                 self.cursor_channel = k_begin % geo.c;
+            }
+            if (mode == .gather_b) {
+                // NOTE: the divisions by run-time sizes are done once here; issue only adds, which matters because the
+                // weight gradient issues one gathered copy per thread and tile.
+                self.step_y = @intCast(tc.depth / geo.out_w);
+                self.step_x = @intCast(tc.depth % geo.out_w);
+                inline for (0..b_per) |j| {
+                    const col = col0 + self.chunk_b[j] * lane_elems;
+                    const tap: u32 = @intCast(col / geo.c);
+                    self.tap_channel[j] = col % geo.c;
+                    self.tap_ky[j] = @intCast(tap / geo.k);
+                    self.tap_kx[j] = @intCast(tap % geo.k);
+                    const p: u32 = @intCast(k_begin + self.k_b[j]);
+                    self.p[j] = p;
+                    self.p_n[j] = p / (geo.out_h * geo.out_w);
+                    self.p_y[j] = p / geo.out_w % geo.out_h;
+                    self.p_x[j] = p % geo.out_w;
+                }
             }
             return self;
         }
@@ -1163,6 +1216,13 @@ fn GemmLoader(comptime kind: GemmKind) type {
                         self.cursor_ky += 1;
                     }
                 }
+            } else if (comptime kind.transposedA()) {
+                inline for (0..a_per) |i| {
+                    const p = kk + self.rows_a[i];
+                    const row = self.row_base + self.chunk_t[i] * lane_elems;
+                    const valid = p < geometry.positions and row < self.rows_total;
+                    copyAsyncZfill(tc.sharedAddress(base + self.dst_a[i]), self.a + if (valid) p * self.rows_total + row else 0, valid);
+                }
             } else {
                 inline for (0..a_per) |i| {
                     const valid = self.row_base + self.rows_a[i] < self.rows_total;
@@ -1173,16 +1233,23 @@ fn GemmLoader(comptime kind: GemmKind) type {
             inline for (0..b_per) |j| {
                 const col = self.first_col + self.chunk_b[j] * lane_elems;
                 if (mode == .gather_b) {
-                    const tap: u32 = @intCast(col / geometry.c);
-                    const channel: usize = col % geometry.c;
-                    const ky: i32 = @intCast(tap / geometry.k);
-                    const kx: i32 = @intCast(tap % geometry.k);
-                    const p: u32 = @intCast(kk + self.k_b[j]);
-                    const y = @as(i32, @intCast(p / geometry.out_w % geometry.out_h * geometry.stride)) + ky - @as(i32, @intCast(geometry.pad));
-                    const x = @as(i32, @intCast(p % geometry.out_w * geometry.stride)) + kx - @as(i32, @intCast(geometry.pad));
-                    const valid = p < geometry.positions and y >= 0 and y < @as(i32, @intCast(geometry.h)) and x >= 0 and x < @as(i32, @intCast(geometry.w));
-                    const at = if (valid) ((@as(usize, p / (geometry.out_h * geometry.out_w)) * geometry.h + @as(usize, @intCast(y))) * geometry.w + @as(usize, @intCast(x))) * geometry.c + channel else 0;
+                    const y = @as(i32, @intCast(self.p_y[j] * geometry.stride)) + self.tap_ky[j] - @as(i32, @intCast(geometry.pad));
+                    const x = @as(i32, @intCast(self.p_x[j] * geometry.stride)) + self.tap_kx[j] - @as(i32, @intCast(geometry.pad));
+                    const valid = self.p[j] < geometry.positions and y >= 0 and y < @as(i32, @intCast(geometry.h)) and x >= 0 and x < @as(i32, @intCast(geometry.w));
+                    const at = if (valid) ((@as(usize, self.p_n[j]) * geometry.h + @as(usize, @intCast(y))) * geometry.w + @as(usize, @intCast(x))) * geometry.c + self.tap_channel[j] else 0;
                     copyAsyncZfill(tc.sharedAddress(base + self.dst_b[j]), self.b + at, valid);
+                    // NOTE: issue is called for consecutive tiles of K, so the position moves by exactly depth each time.
+                    self.p[j] += tc.depth;
+                    self.p_x[j] += self.step_x;
+                    self.p_y[j] += self.step_y;
+                    if (self.p_x[j] >= geometry.out_w) {
+                        self.p_x[j] -= geometry.out_w;
+                        self.p_y[j] += 1;
+                    }
+                    while (self.p_y[j] >= geometry.out_h) {
+                        self.p_y[j] -= geometry.out_h;
+                        self.p_n[j] += 1;
+                    }
                 } else {
                     const valid = col < self.stride_n;
                     const at = if (valid) (kk + self.k_b[j]) * self.stride_n + col else 0;
@@ -1202,13 +1269,13 @@ inline fn pipeline(comptime kind: GemmKind, loader: anytype, block: Block, tiles
     }
     var tile: usize = 0;
     while (tile < tiles) : (tile += 1) {
-        waitCopies();
+        waitCopies(tc.stages - 2);
         barrier();
         const ahead = tile + tc.stages - 1;
         if (ahead < tiles) loader.issue(ahead % tc.stages, block.k_begin + ahead * tc.depth);
         commitCopies();
         const base = (tile % tc.stages) * tc.stage_elems;
-        if (kind.tf32) tf32Compute(tc, warp, base, acc) else bf16Compute(tc, warp, base, acc);
+        if (kind.tf32) tf32Compute(tc, warp, base, acc) else bf16Compute(tc, kind.transposedA(), warp, base, acc);
     }
 }
 
@@ -1253,12 +1320,20 @@ inline fn tileGemm(comptime kind: GemmKind, a: [*]const kind.Elem(), b: [*]const
     pipeline(kind, &loader, block, tiles, warp, &acc);
     storeTile(kind, c, &acc, shape, block, warp);
 }
-inline fn bf16Compute(comptime tc: type, warp: Warp, base: usize, acc: *Acc) void {
+inline fn bf16Compute(comptime tc: type, comptime a_transposed: bool, warp: Warp, base: usize, acc: *Acc) void {
     inline for (0..tc.depth / 16) |step| {
         var a_frag: [4][4]u32 = undefined;
         inline for (0..tc.warp_m / 16) |mi| {
+            // NOTE: lanes 8j to 8j + 7 address the rows of 8 x 8 block j: block j covers rows + 8 (j % 2) and k + 8 (j / 2),
+            // which is the register order of the A fragment. A transposed tile is stored by k, so .trans turns it back.
             const row = warp.row * tc.warp_m + mi * 16 + warp.lane % 8 + 8 * ((warp.lane / 8) % 2);
-            a_frag[mi] = tc.ldmatrix(tc.sharedAddress(base + tc.aSlot(row, step * 2 + warp.lane / 16)));
+            if (a_transposed) {
+                const k = step * 16 + warp.lane % 8 + 8 * (warp.lane / 16);
+                const first_row = warp.row * tc.warp_m + mi * 16 + 8 * ((warp.lane / 8) % 2);
+                a_frag[mi] = tc.ldmatrixTransposed(tc.sharedAddress(base + tc.aTransposedSlot(k, first_row / 8)));
+            } else {
+                a_frag[mi] = tc.ldmatrix(tc.sharedAddress(base + tc.aSlot(row, step * 2 + warp.lane / 16)));
+            }
         }
         inline for (0..2) |pair| {
             const k = step * 16 + warp.lane % 8 + 8 * ((warp.lane / 8) % 2);

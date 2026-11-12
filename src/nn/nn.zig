@@ -130,6 +130,11 @@ pub fn BatchNorm(comptime c: usize) type {
             return tape.batchNormRelu(x, self.gamma, self.beta, .{ .mean = self.mean, .variance = self.variance });
         }
 
+        /// Computes max(norm(x) + residual, 0), the end of a residual block, in one kernel.
+        pub fn forwardAddRelu(self: Self, tape: *Tape, x: anytype, residual: anytype) autograd.Error!Var(@TypeOf(x.value)) {
+            return tape.batchNormAddRelu(x, residual, self.gamma, self.beta, .{ .mean = self.mean, .variance = self.variance });
+        }
+
         pub fn params(self: Self) struct { Var(V), Var(V) } {
             return .{ self.gamma, self.beta };
         }
@@ -208,6 +213,11 @@ pub fn ConvBn(comptime c_in: usize, comptime c_out: usize, comptime k: usize, co
 
         pub fn forwardRelu(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(autograd.ConvOut(@TypeOf(x.value), Conv.Weights, opts)) {
             return self.norm.forwardRelu(tape, try tape.conv2d(x, self.conv.inner.w, opts));
+        }
+
+        /// Convolution, batch norm, addition of residual and ReLU; the last three run as one kernel.
+        pub fn forwardAddRelu(self: Self, tape: *Tape, x: anytype, residual: anytype) autograd.Error!Var(autograd.ConvOut(@TypeOf(x.value), Conv.Weights, opts)) {
+            return self.norm.forwardAddRelu(tape, try tape.conv2d(x, self.conv.inner.w, opts), residual);
         }
 
         pub fn params(self: Self) @TypeOf(.{self.conv.inner.w} ++ self.norm.params()) {
@@ -367,12 +377,11 @@ fn Head(comptime width: usize, comptime depth: usize, comptime steps: usize) typ
         pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(@TypeOf(x.value)) {
             const rows = @TypeOf(x.value).shape[0];
             const batch = rows / steps;
-            const scale = try tape.cast(try tape.constant(try tape.filledTensor(Tensor(f32, &.{}), 1 / @sqrt(@as(f32, depth)))), @TypeOf(x.value).Elem);
             const query = autograd.reshape(try self.layers[0].forward(tape, x), &.{ batch, steps, depth });
             const key = autograd.reshape(try self.layers[1].forward(tape, x), &.{ batch, steps, depth });
             const value = autograd.reshape(try self.layers[2].forward(tape, x), &.{ batch, steps, depth });
-            const scores = try tape.mul(autograd.reshape(try tape.batchedMatmul(query, key, true), &.{ rows, steps }), scale);
-            const weights = autograd.reshape(try tape.softmax(scores, steps), &.{ batch, steps, steps });
+            const scores = autograd.reshape(try tape.batchedMatmul(query, key, true), &.{ rows, steps });
+            const weights = autograd.reshape(try tape.softmax(scores, .{ .causal_period = steps, .scale = 1 / @sqrt(@as(f32, depth)) }), &.{ batch, steps, steps });
             const mixed = autograd.reshape(try tape.batchedMatmul(weights, value, false), &.{ rows, depth });
             return self.layers[3].forward(tape, mixed);
         }

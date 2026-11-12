@@ -213,6 +213,12 @@ pub fn main(init: std.process.Init) !void {
     // NOTE: the training time excludes start-up and the sample, so runs can be compared; the loss read-back each step synchronizes the device.
     const started = std.Io.Clock.awake.now(init.io);
     var running: f64 = 0;
+    // NOTE: the step is launch-bound (small products, one softmax and layer norm per head and block), so on the GPU the forward
+    // and backward pass is recorded once into a graph and replayed; the batch is refilled in place and the scratch addresses
+    // repeat. Profiling synchronizes after every launch, which a recording cannot do, so a profiled run launches normally.
+    const use_graph = gpu != null and !profile;
+    var graph: ?grad.gpu.Gpu.Graph = null;
+    var loss: Var(Tensor(f32, &.{})) = undefined;
     for (0..iterations) |iteration| {
         for (0..batch) |row| {
             const start = rng.uintLessThan(usize, text.len - context - 1);
@@ -224,12 +230,19 @@ pub fn main(init: std.process.Init) !void {
         try par.upload(tokens, host_tokens);
         try par.upload(targets, host_targets);
 
-        _ = arena.reset(.retain_capacity);
-        if (gpu) |dev| try dev.resetStep();
-        var tape: Tape = .{ .gpa = arena.allocator(), .par = par, .training = true };
-        try grad.optim.zeroGrad(par, params);
-        const loss = try tape.crossEntropy(try forward(model, &tape, rows, tokens, positions), targets);
-        try tape.backward(loss);
+        if (!use_graph or graph == null) {
+            _ = arena.reset(.retain_capacity);
+            if (gpu) |dev| {
+                try dev.resetStep();
+                if (use_graph) try dev.beginCapture();
+            }
+            var tape: Tape = .{ .gpa = arena.allocator(), .par = par, .training = true };
+            try grad.optim.zeroGrad(par, params);
+            loss = try tape.crossEntropy(try forward(model, &tape, rows, tokens, positions), targets);
+            try tape.backward(loss);
+            if (use_graph) graph = try grad.gpu.Gpu.endCapture(gpu.?);
+        }
+        if (use_graph) try gpu.?.replay(graph.?);
         adam.lr = grad.optim.cosineLr(0.003, iteration, iterations, 50);
         try adam.step(par, params);
 

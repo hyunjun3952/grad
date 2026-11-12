@@ -161,25 +161,74 @@ pub fn col2im(par: kernels.Parallel, dcol: []const f32, dx: []f32, d: cv.Dims) v
     kernels.parallelFor(par, @as(usize, d.n) * d.h * d.w, 64, Job{ .src = dcol, .dst = dx, .d = d }, col2imPixels);
 }
 
+const PoolJob = struct { x: []const f32, out: []f32, index: []u32, d: cv.Dims };
+
+fn maxPoolRows(job: PoolJob, lo: usize, hi: usize) void {
+    const d = job.d;
+    const c: usize = d.c;
+    const oh: usize = cv.outHeight(d);
+    const ow: usize = cv.outWidth(d);
+    for (lo..hi) |row| {
+        const n = row / oh;
+        const top = row % oh * d.stride;
+        const y0 = top -| d.pad;
+        const y1 = @min(top + d.k - d.pad, d.h);
+        for (0..ow) |ox| {
+            const left = ox * d.stride;
+            const x0 = left -| d.pad;
+            const x1 = @min(left + d.k - d.pad, d.w);
+            const at = (row * ow + ox) * c;
+            const best = job.out[at..][0..c];
+            const winner = job.index[at..][0..c];
+            // NOTE: the window is walked row by row with every channel inside, so the inner loop is contiguous; a value
+            // replaces the best only when strictly larger, which keeps the first maximum as the device kernel does.
+            const first = ((n * d.h + y0) * d.w + x0) * c;
+            @memcpy(best, job.x[first..][0..c]);
+            for (winner, 0..) |*w, ch| w.* = @intCast(first + ch);
+            for (y0..y1) |y| {
+                for (x0..x1) |x| {
+                    const from = ((n * d.h + y) * d.w + x) * c;
+                    for (best, winner, job.x[from..][0..c], 0..) |*b, *w, v, ch| {
+                        if (v > b.*) {
+                            b.* = v;
+                            w.* = @intCast(from + ch);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Max pooling of an NHWC tensor that also stores the flat input index of each winner, one output row per work item.
+pub fn maxPool(par: kernels.Parallel, x: []const f32, out: []f32, index: []u32, d: cv.Dims) void {
+    const per_row = @as(usize, cv.outWidth(d)) * d.k * d.k * d.c;
+    kernels.parallelFor(par, @as(usize, d.n) * cv.outHeight(d), @max(1, 8192 / per_row), PoolJob{ .x = x, .out = out, .index = index, .d = d }, maxPoolRows);
+}
+
 const norm = @import("../gpu/math/norm.zig");
 
-const ApplyJob = struct { x: [*]const f32, y: [*]f32, p: norm.Affine, l: norm.Layout };
+const ApplyJob = struct { x: [*]const f32, residual: [*]const f32, y: [*]f32, p: norm.Affine, l: norm.Layout };
 
 fn normApplyRows(job: ApplyJob, lo: usize, hi: usize) void {
     const c: usize = job.l.channels;
-    const relu = job.l.flag != 0;
+    const relu = job.l.flag & norm.relu_flag != 0;
+    const add = job.l.flag & norm.residual_flag != 0;
     for (lo..hi) |row| {
         const x = job.x[row * c ..][0..c];
+        const r = job.residual[row * c ..][0..c];
         const y = job.y[row * c ..][0..c];
         for (0..c) |ch| {
-            const v = job.p.gamma[ch] * (x[ch] - job.p.mean[ch]) * job.p.inv_std[ch] + job.p.beta[ch];
+            var v = job.p.gamma[ch] * (x[ch] - job.p.mean[ch]) * job.p.inv_std[ch] + job.p.beta[ch];
+            if (add) v += r[ch];
             y[ch] = if (relu) @max(v, 0) else v;
         }
     }
 }
 
-pub fn normApply(par: kernels.Parallel, x: []const f32, y: []f32, p: norm.Affine, l: norm.Layout) void {
-    kernels.parallelFor(par, l.len / l.channels, 256, ApplyJob{ .x = x.ptr, .y = y.ptr, .p = p, .l = l }, normApplyRows);
+/// Applies the batch-norm affine map row by row on the worker pool; residual is added before the ReLU when l.flag has residual_flag (pass x otherwise).
+pub fn normApply(par: kernels.Parallel, x: []const f32, residual: []const f32, y: []f32, p: norm.Affine, l: norm.Layout) void {
+    kernels.parallelFor(par, l.len / l.channels, 256, ApplyJob{ .x = x.ptr, .residual = residual.ptr, .y = y.ptr, .p = p, .l = l }, normApplyRows);
 }
 
 const GradJob = struct { io: norm.GradIo(f32), p: norm.Affine, l: norm.Layout };
@@ -187,15 +236,18 @@ const GradJob = struct { io: norm.GradIo(f32), p: norm.Affine, l: norm.Layout };
 fn normGradRows(job: GradJob, lo: usize, hi: usize) void {
     const c: usize = job.l.channels;
     const n: f32 = @floatFromInt(job.l.len / job.l.channels);
-    const masked = job.l.flag != 0;
+    const masked = job.l.flag & norm.relu_flag != 0;
+    const add = job.l.flag & norm.residual_flag != 0;
     for (lo..hi) |row| {
         const x = job.io.x[row * c ..][0..c];
         const dy = job.io.dy[row * c ..][0..c];
         const mask = job.io.mask[row * c ..][0..c];
         const dx = job.io.dx[row * c ..][0..c];
+        const dr = job.io.dr[row * c ..][0..c];
         for (0..c) |ch| {
             const x_hat = (x[ch] - job.p.mean[ch]) * job.p.inv_std[ch];
             const g = if (masked and mask[ch] <= 0) 0 else dy[ch];
+            if (add) dr[ch] += g;
             dx[ch] += job.p.gamma[ch] * job.p.inv_std[ch] / n * (n * g - job.io.sums[ch] - x_hat * job.io.sums[c + ch]);
         }
     }

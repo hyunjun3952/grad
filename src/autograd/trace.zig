@@ -1,10 +1,10 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-pub const max_inputs = 5;
+pub const max_inputs = 6;
 pub const max_rank = 6;
 
-pub const Op = enum { gru_update, gru_reset_h, gru_next, linear, add, mul, matmul, batched_matmul, embedding, layer_norm, softmax, relu, sigmoid, tanh, gelu, conv, max_pool, avg_pool, batch_norm, batch_norm_relu, add_relu, cast };
+pub const Op = enum { gru_update, gru_reset_h, gru_next, linear, add, mul, matmul, batched_matmul, embedding, layer_norm, softmax, relu, sigmoid, tanh, gelu, conv, max_pool, avg_pool, batch_norm, batch_norm_relu, batch_norm_add_relu, add_relu, cast };
 
 pub const View = struct {
     id: usize,
@@ -39,8 +39,8 @@ pub const View = struct {
     }
 };
 
-/// Extra properties of a traced op: window geometry for convolutions and pooling, the causal period of a softmax (zero for none), and the transposed second operand of a batched matmul.
-pub const Attrs = struct { kernel: usize = 1, stride: usize = 1, pad: usize = 0, dilation: usize = 1, groups: usize = 1, period: usize = 0, trans_b: bool = false };
+/// Extra properties of a traced op: window geometry for convolutions and pooling, the causal period and input scale of a softmax (zero period for none), and the transposed second operand of a batched matmul.
+pub const Attrs = struct { kernel: usize = 1, stride: usize = 1, pad: usize = 0, dilation: usize = 1, groups: usize = 1, period: usize = 0, scale: f32 = 1, trans_b: bool = false };
 
 pub const Entry = struct {
     op: Op,
@@ -53,6 +53,7 @@ pub const Entry = struct {
     dilation: usize = 1,
     groups: usize = 1,
     period: usize = 0,
+    scale: f32 = 1,
     trans_b: bool = false,
 };
 
@@ -73,7 +74,7 @@ pub const Trace = struct {
     }
 
     pub fn add(self: *Trace, op: Op, inputs: anytype, output: anytype, attrs: Attrs) Allocator.Error!void {
-        var entry: Entry = .{ .op = op, .inputs = undefined, .count = inputs.len, .output = View.of(output), .kernel = attrs.kernel, .stride = attrs.stride, .pad = attrs.pad, .dilation = attrs.dilation, .groups = attrs.groups, .period = attrs.period, .trans_b = attrs.trans_b };
+        var entry: Entry = .{ .op = op, .inputs = undefined, .count = inputs.len, .output = View.of(output), .kernel = attrs.kernel, .stride = attrs.stride, .pad = attrs.pad, .dilation = attrs.dilation, .groups = attrs.groups, .period = attrs.period, .scale = attrs.scale, .trans_b = attrs.trans_b };
         inline for (inputs, 0..) |input, i| entry.inputs[i] = if (@TypeOf(input) == View) input else View.of(input);
         try self.entries.append(self.gpa, entry);
     }

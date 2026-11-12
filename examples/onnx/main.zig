@@ -28,6 +28,7 @@ fn run(init: std.process.Init) !void {
     const par: grad.kernels.Parallel = .{ .io = init.io, .threads = std.Thread.getCpuCount() catch 1 };
     const count = @min(wanted, data.count());
     var correct: usize = 0;
+    const started = std.Io.Clock.awake.now(init.io);
     for (0..count) |i| {
         var result = try model.run(gpa, par, &.{.{ .name = model.inputs[0], .dims = &.{ 1, data.pixels }, .data = data.images[i * data.pixels ..][0..data.pixels] }});
         defer result.deinit();
@@ -43,6 +44,8 @@ fn run(init: std.process.Init) !void {
             try out.writeByte('\n');
         }
     }
+    const seconds = @as(f64, @floatFromInt(std.Io.Clock.awake.now(init.io).nanoseconds - started.nanoseconds)) / 1e9;
     try out.print("{d} of {d} test images correct ({d:.2}%)\n", .{ correct, count, 100.0 * @as(f64, @floatFromInt(correct)) / @as(f64, @floatFromInt(count)) });
+    try out.print("inference took {d:.3} s ({d:.1} images/s)\n", .{ seconds, @as(f64, @floatFromInt(count)) / seconds });
     try out.flush();
 }
