@@ -212,6 +212,7 @@ comptime {
     exportPair("addInPlace", addInPlaceKernel);
     exportPair("sumTo", sumToKernel);
     exportPair("columnReduce", columnReduceKernel);
+    @export(&ColumnReduce(u16, 2).run, .{ .name = "columnReduceHalfPair" });
     exportPair("batchNormFinish", batchNormFinishKernel);
     exportGemm("sgemmNN", 128, 128, false, false);
     exportGemm("sgemmNT", 128, 128, false, true);
@@ -529,32 +530,60 @@ fn sumToKernel(comptime E: type) type {
 // ***** column reductions and batch norm *****
 
 const column = struct {
-    var first: [threads]f32 addrspace(.shared) = undefined;
-    var second: [threads]f32 addrspace(.shared) = undefined;
+    var first: [2 * threads]f32 addrspace(.shared) = undefined;
+    var second: [2 * threads]f32 addrspace(.shared) = undefined;
 };
 
 fn columnReduceKernel(comptime E: type) type {
+    return ColumnReduce(E, 1);
+}
+
+// Each lane reduces width adjacent channels. With width 2 a bf16 row segment is read as one 4-byte word per lane, so a warp
+// reads 128 contiguous bytes per row instead of 64. Every channel still adds its rows in the same order, so the result is
+// bitwise the same as with width 1; the host uses width 2 only for an even channel count.
+fn ColumnReduce(comptime E: type, comptime width: usize) type {
     return struct {
+        const V = @Vector(width, f32);
+
+        inline fn loadChannels(p: [*]const E, i: usize) V {
+            if (width == 1) return @splat(bf16.load(E, p, i));
+            if (E == u16) {
+                const raw: *align(2 * width) const [width]u16 = @ptrCast(@alignCast(p + i));
+                var out: V = undefined;
+                inline for (0..width) |j| out[j] = bf16.decode(raw[j]);
+                return out;
+            }
+            const raw: *align(4 * width) const [width]f32 = @ptrCast(@alignCast(p + i));
+            return raw.*;
+        }
+
+        inline fn loadPerChannel(p: [*]const f32, i: usize) V {
+            if (width == 1) return @splat(p[i]);
+            const raw: *align(4 * width) const [width]f32 = @ptrCast(@alignCast(p + i));
+            return raw.*;
+        }
+
         fn run(args: ga.ColumnArgs) callconv(.nvptx_kernel) void {
             const a: [*]const E = @ptrCast(args.a);
             const b: [*]const E = @ptrCast(args.b);
             const mask: [*]const E = @ptrCast(args.mask);
             const mean, const inv_std, const out = .{ args.mean, args.inv_std, args.out };
             const rows, const c, const row_stride, const kind, const scale = .{ args.rows, args.channels, args.row_stride, args.kind, args.scale };
+            const zero: V = @splat(0);
             const tid: usize = @workItemId(0);
             const lane = tid % 32;
             const group = tid / 32;
-            const ch = @as(usize, @workGroupId(1)) * 32 + lane;
+            const ch = @as(usize, @workGroupId(1)) * 32 * width + lane * width;
             const valid = ch < c;
-            var first: f32 = 0;
-            var second: f32 = 0;
+            var first: V = zero;
+            var second: V = zero;
             if (valid) {
                 // NOTE: kind 4 (layer norm) has one mean and inverse deviation per row instead of per channel, so they are read inside the loop.
-                const m = if (kind == 2) bf16.load(E, a, ch) else if (kind == 4) 0 else mean[ch] * scale;
-                const s = if (kind == 4) 0 else inv_std[ch];
+                const m: V = if (kind == 2) loadChannels(a, ch) else if (kind == 4) zero else loadPerChannel(mean, ch) * @as(V, @splat(scale));
+                const s: V = if (kind == 4) zero else loadPerChannel(inv_std, ch);
                 var r = @as(usize, @workGroupId(0)) * 8 + group;
                 while (r < rows) : (r += row_stride) {
-                    const v = bf16.load(E, a, r * c + ch);
+                    const v = loadChannels(a, r * c + ch);
                     if (kind == 0) {
                         first += v;
                     } else if (kind == 2) {
@@ -562,31 +591,35 @@ fn columnReduceKernel(comptime E: type) type {
                         second += (v - m) * (v - m);
                     } else if (kind == 4) {
                         first += v;
-                        second += v * ((bf16.load(E, b, r * c + ch) - mean[r]) * inv_std[r]);
+                        second += v * ((loadChannels(b, r * c + ch) - @as(V, @splat(mean[r]))) * @as(V, @splat(inv_std[r])));
                     } else {
-                        const g = if (kind == 3 and bf16.load(E, mask, r * c + ch) <= 0) 0 else v;
+                        const g = if (kind == 3) @select(f32, loadChannels(mask, r * c + ch) <= zero, zero, v) else v;
                         first += g;
-                        second += g * ((bf16.load(E, b, r * c + ch) - m) * s);
+                        second += g * ((loadChannels(b, r * c + ch) - m) * s);
                     }
                 }
             }
-            column.first[tid] = first;
-            column.second[tid] = second;
+            inline for (0..width) |j| {
+                column.first[tid * width + j] = first[j];
+                column.second[tid * width + j] = second[j];
+            }
             barrier();
             if (group == 0 and valid) {
-                var total_first: f32 = 0;
-                var total_second: f32 = 0;
-                inline for (0..8) |g| {
-                    total_first += column.first[lane + 32 * g];
-                    total_second += column.second[lane + 32 * g];
-                }
-                if (args.ordered != 0) {
-                    const mine = args.partial + @as(usize, @workGroupId(0)) * 2 * c;
-                    mine[ch] = total_first;
-                    mine[c + ch] = total_second;
-                } else {
-                    _ = @atomicRmw(f32, &out[ch], .Add, total_first, .monotonic);
-                    if (kind != 0) _ = @atomicRmw(f32, &out[c + ch], .Add, total_second, .monotonic);
+                inline for (0..width) |j| {
+                    var total_first: f32 = 0;
+                    var total_second: f32 = 0;
+                    inline for (0..8) |g| {
+                        total_first += column.first[(lane + 32 * g) * width + j];
+                        total_second += column.second[(lane + 32 * g) * width + j];
+                    }
+                    if (args.ordered != 0) {
+                        const mine = args.partial + @as(usize, @workGroupId(0)) * 2 * c;
+                        mine[ch + j] = total_first;
+                        mine[c + ch + j] = total_second;
+                    } else {
+                        _ = @atomicRmw(f32, &out[ch + j], .Add, total_first, .monotonic);
+                        if (kind != 0) _ = @atomicRmw(f32, &out[c + ch + j], .Add, total_second, .monotonic);
+                    }
                 }
             }
         }

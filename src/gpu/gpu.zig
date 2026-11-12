@@ -145,6 +145,7 @@ const Kernel = enum {
     dropoutHalf,
     columnReduce,
     columnReduceHalf,
+    columnReduceHalfPair,
     batchNormApplyHalf,
     batchNormGradInputHalf,
     columnCombine,
@@ -1099,7 +1100,11 @@ pub const Gpu = struct {
         defer scope.restore();
         const partial: []f32 = if (self.deterministic) try self.scratch(f32, @as(usize, blocks) * 2 * args.channels) else &.{};
         launched.partial = partial.ptr;
-        try self.launch(if (E == u16) .columnReduceHalf else .columnReduce, .{ blocks, ceilDiv(args.channels, 32), 1 }, .{launched});
+        // NOTE: a lane reads two adjacent bf16 channels as one word, which needs an even channel count to stay aligned. Four
+        // channels per lane measured only 2.5% faster than two on the CIFAR network and was dropped.
+        const paired = E == u16 and args.channels % 2 == 0;
+        const kernel: Kernel = if (paired) .columnReduceHalfPair else if (E == u16) .columnReduceHalf else .columnReduce;
+        try self.launch(kernel, .{ blocks, ceilDiv(args.channels, if (paired) 64 else 32), 1 }, .{launched});
         if (self.deterministic) {
             const width = args.channels * @as(usize, if (args.kind == 0) 1 else 2);
             try self.launchFlat(.columnCombine, width, .{ partial, args.out[0..width], blocks, width, 2 * args.channels });
