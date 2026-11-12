@@ -250,8 +250,8 @@ pub fn splitFor(comptime T: type, comptime cfg: TileConfig, par: Parallel, m: us
 
 fn partWorkLen(comptime T: type, comptime cfg: TileConfig, s: Split, m: usize, k: usize, n: usize) usize {
     const d = tiledDims(T, cfg, k, if (s.axis == .cols) @min(n, s.chunk) else n);
-    // A part of a K split also needs its own output.
-    return d.kc * d.nc + if (s.axis == .depth) m * n else 0;
+    // A part holds the packed B panel, the packed A block when packsA applies, and for a K split its own output.
+    return d.kc * d.nc + (if (packsA(T, cfg, m, k)) cfg.mc * d.kc else 0) + if (s.axis == .depth) m * n else 0;
 }
 
 pub fn matmulTiledWorkLen(comptime T: type, comptime cfg: TileConfig, par: Parallel, m: usize, k: usize, n: usize) usize {
@@ -292,10 +292,35 @@ fn packB(comptime T: type, comptime NR: usize, comptime trans: bool, problem: Pr
     }
 }
 
+/// Copies the mc x kc block of A at (ic, pc) into micro-panels of MR rows, panel element (r, q) at q*MR + r, so the
+/// micro-kernel reads A from one contiguous buffer instead of MR rows strided by k (or by m when trans). Edge panels
+/// repeat the last valid row; the extra values are computed but never stored.
+fn packA(comptime T: type, comptime MR: usize, comptime trans: bool, p: Problem(T), ic: usize, pc: usize, mc: usize, kc: usize, dst: []T) void {
+    var ir: usize = 0;
+    while (ir < mc) : (ir += MR) {
+        const panel = dst[(ir / MR) * MR * kc ..];
+        var row: [MR]usize = undefined;
+        inline for (0..MR) |r| row[r] = ic + ir + @min(r, mc - ir - 1);
+        for (0..kc) |q| {
+            inline for (0..MR) |r| {
+                panel[q * MR + r] = if (trans) p.a[(pc + q) * p.m + row[r]] else p.a[row[r] * p.k + pc + q];
+            }
+        }
+    }
+}
+
+/// The micro-kernel reads MR rows of A this many bytes apart; past a page the strided reads thrash the TLB (a 4K stride
+/// also aliases every row into the same cache sets), so those shapes pay for packA and the rest read A in place.
+fn packsA(comptime T: type, comptime cfg: TileConfig, m: usize, k: usize) bool {
+    const stride = if (cfg.trans_a) m else k;
+    return stride * @sizeOf(T) >= 4096;
+}
+
 inline fn microTile(
     comptime T: type,
     comptime MR: usize,
     comptime NV: usize,
+    comptime packed_a: bool,
     kc: usize,
     a: []const T,
     a_off: [MR]usize,
@@ -313,7 +338,7 @@ inline fn microTile(
             bv[v] = bp[p * NR + v * lanes ..][0..lanes].*;
         }
         inline for (0..MR) |r| {
-            const av: Vec = @splat(a[a_off[r] + p * a_step]);
+            const av: Vec = @splat(if (packed_a) a[p * MR + r] else a[a_off[r] + p * a_step]);
             inline for (0..NV) |v| {
                 acc[r][v] = @mulAdd(Vec, av, bv[v], acc[r][v]);
             }
@@ -327,7 +352,7 @@ pub fn matmulTiled(comptime T: type, comptime cfg: TileConfig, par: Parallel, p:
     const part_len = partWorkLen(T, cfg, s, p.m, p.k, p.n);
     std.debug.assert(work.len >= s.parts * part_len);
     const whole: Range = .{ .rows = .{ 0, p.m }, .cols = .{ 0, p.n }, .depth = .{ 0, p.k } };
-    if (s.parts == 1) return matmulTiledRange(T, cfg, p, whole, work);
+    if (s.parts == 1) return runRange(T, cfg, p, whole, work);
 
     const Ctx = struct { s: Split, part_len: usize, p: Problem(T), work: []T };
     const Task = struct {
@@ -341,7 +366,7 @@ pub fn matmulTiled(comptime T: type, comptime cfg: TileConfig, par: Parallel, p:
                 .cols => range.cols = .{ lo, @min(lo + c.s.chunk, c.p.n) },
                 .depth => range.depth = .{ lo, @min(lo + c.s.chunk, c.p.k) },
             }
-            if (c.s.axis != .depth or part == 0) return matmulTiledRange(T, cfg, c.p, range, w);
+            if (c.s.axis != .depth or part == 0) return runRange(T, cfg, c.p, range, w);
             // Later parts of a K split write a private output that starts at zero; the caller adds them in order.
             const fresh = comptime blk: {
                 var copy = cfg;
@@ -350,7 +375,7 @@ pub fn matmulTiled(comptime T: type, comptime cfg: TileConfig, par: Parallel, p:
             };
             var own = c.p;
             own.out = w[w.len - c.p.m * c.p.n ..];
-            matmulTiledRange(T, fresh, own, range, w);
+            runRange(T, fresh, own, range, w);
         }
     };
     const ctx: Ctx = .{ .s = s, .part_len = part_len, .p = p, .work = work };
@@ -367,7 +392,12 @@ pub fn matmulTiled(comptime T: type, comptime cfg: TileConfig, par: Parallel, p:
 // The rows, columns and K range one part of a split product computes.
 const Range = struct { rows: [2]usize, cols: [2]usize, depth: [2]usize };
 
-fn matmulTiledRange(comptime T: type, comptime cfg: TileConfig, p: Problem(T), range: Range, work: []T) void {
+fn runRange(comptime T: type, comptime cfg: TileConfig, p: Problem(T), range: Range, work: []T) void {
+    if (packsA(T, cfg, p.m, p.k)) return matmulTiledRange(T, cfg, true, p, range, work);
+    return matmulTiledRange(T, cfg, false, p, range, work);
+}
+
+fn matmulTiledRange(comptime T: type, comptime cfg: TileConfig, comptime packed_a: bool, p: Problem(T), range: Range, work: []T) void {
     const m, const k, const n, const a, const out = .{ p.m, p.k, p.n, p.a, p.out };
     const r0, const r1 = range.rows;
     const c0, const c1 = range.cols;
@@ -386,8 +416,9 @@ fn matmulTiledRange(comptime T: type, comptime cfg: TileConfig, p: Problem(T), r
     }
     p.check();
     const d = tiledDims(T, cfg, k, c1 - c0);
-    std.debug.assert(work.len >= d.kc * d.nc);
+    std.debug.assert(work.len >= d.kc * d.nc + if (packed_a) MC * d.kc else 0);
     const b_pack = work[0 .. d.kc * d.nc];
+    const a_pack = work[d.kc * d.nc ..];
 
     if (!cfg.accumulate) {
         for (r0..r1) |r| @memset(out[r * n + c0 .. r * n + c1], 0);
@@ -404,6 +435,7 @@ fn matmulTiledRange(comptime T: type, comptime cfg: TileConfig, p: Problem(T), r
             var ic: usize = r0;
             while (ic < r1) : (ic += MC) {
                 const mc = @min(MC, r1 - ic);
+                if (packed_a) packA(T, MR, cfg.trans_a, p, ic, pc, mc, kc, a_pack);
 
                 var jr: usize = 0;
                 while (jr < nc) : (jr += NR) {
@@ -414,11 +446,12 @@ fn matmulTiledRange(comptime T: type, comptime cfg: TileConfig, p: Problem(T), r
                     while (ir < mc) : (ir += MR) {
                         const mr_eff = @min(MR, mc - ir);
                         var a_off: [MR]usize = undefined;
-                        inline for (0..MR) |r| {
+                        if (!packed_a) inline for (0..MR) |r| {
                             const row = ic + ir + @min(r, mr_eff - 1);
                             a_off[r] = if (cfg.trans_a) pc * m + row else row * k + pc;
-                        }
-                        const acc = microTile(T, MR, NV, kc, a, a_off, if (cfg.trans_a) m else 1, bp);
+                        };
+                        const ap = if (packed_a) a_pack[(ir / MR) * MR * kc ..] else a;
+                        const acc = microTile(T, MR, NV, packed_a, kc, ap, a_off, if (cfg.trans_a) m else 1, bp);
                         const c = out[(ic + ir) * n + jc + jr ..];
 
                         if (mr_eff == MR and nr_eff == NR) {
