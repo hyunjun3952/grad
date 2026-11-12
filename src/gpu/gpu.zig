@@ -390,6 +390,11 @@ pub const Gpu = struct {
         if (self.profile != null) return error.ProfilingWhileCapturing;
         try self.cu.beginCapture();
         self.capturing = true;
+        // NOTE: a capture that stays open would make every later launch on the stream fail, so a failed setStream ends it.
+        errdefer {
+            self.capturing = false;
+            if (self.cu.endCapture()) |exec| self.cu.destroyGraph(exec) else |_| {}
+        }
         if (self.cudnn_lib) |*lib| try lib.setStream(self.cu.stream);
     }
 
@@ -647,6 +652,8 @@ pub const Gpu = struct {
     /// mean a dense operand.
     pub const Grouped = struct { pitch: u32 = 0, offset: u32 = 0 };
 
+    /// Rotates (k, k, c_in, c_out) weights by 180 degrees and swaps their channel roles for the input gradient, padded to whole tiles.
+    /// The src argument selects one group's columns of the weights; zeros mean dense weights.
     pub fn rotateWeightsF32(self: *Gpu, w: []const f32, k: usize, c_in: usize, c_out: usize, src: Grouped) Error![]f32 {
         const rows = k * k * c_out;
         const cols_padded = std.mem.alignForward(usize, c_in, 64);
@@ -655,6 +662,8 @@ pub const Gpu = struct {
         return dst;
     }
 
+    /// Transposes an f32 matrix into a zero-padded (cols_padded x rows_padded) copy. The read argument selects one group's
+    /// columns of a wider matrix; zeros mean a dense source.
     pub fn transposeF32(self: *Gpu, src: []const f32, rows: usize, cols: usize, rows_padded: usize, cols_padded: usize, read: Grouped) Error![]f32 {
         const dst = try self.scratch(f32, rows_padded * cols_padded);
         const args = pack(ga.PackArgs, .{ .rows = rows, .cols = cols, .rows_padded = rows_padded, .cols_padded = cols_padded, .src_stride = if (read.pitch != 0) read.pitch else rows, .transpose = true });

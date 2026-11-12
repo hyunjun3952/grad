@@ -80,7 +80,7 @@ const Attribute = struct {
     ints: []const i64 = &.{},
 };
 
-const Node = struct {
+pub const Node = struct {
     op: []const u8 = "",
     inputs: []const []const u8 = &.{},
     outputs: []const []const u8 = &.{},
@@ -239,7 +239,7 @@ pub const Model = struct {
         // The NHWC convolution handles square windows only; anything else keeps the transpose path.
         if (weights.dims.len != 4 or weights.dims[2] != weights.dims[3]) return null;
         if (pair(conv.ints("strides"), 0, 1) != pair(conv.ints("strides"), 1, 1)) return null;
-        if (pair(conv.ints("pads"), 0, 0) != pair(conv.ints("pads"), 1, 0)) return null;
+        if (!padsAreUniform(conv)) return null;
         if (pair(conv.ints("dilations"), 0, 1) != pair(conv.ints("dilations"), 1, 1)) return null;
         const x = try input(values, lead, 0);
         const out = try convolveNhwc(a, par, conv, x, weights, maybeInput(values, conv, 2));
@@ -247,6 +247,17 @@ pub const Model = struct {
         return 3;
     }
 };
+
+/// Returns true when a convolution node pads all four sides by the same amount and has no auto_pad rule.
+/// NOTE: the NHWC kernel pads every side alike, so asymmetric pads and any auto_pad other than NOTSET must keep the transpose path.
+pub fn padsAreUniform(conv: Node) bool {
+    const auto_pad = conv.text("auto_pad", "NOTSET");
+    if (auto_pad.len != 0 and !std.mem.eql(u8, auto_pad, "NOTSET")) return false;
+    const pads = conv.ints("pads");
+    if (pads.len == 0) return true;
+    if (pads.len != 4) return false;
+    return std.mem.allEqual(i64, pads, pads[0]);
+}
 
 fn isPermuted(node: Node, comptime perm: [4]i64) bool {
     if (!std.mem.eql(u8, node.op, "Transpose")) return false;
@@ -724,6 +735,8 @@ pub fn convolveNhwc(a: Allocator, par: kernels.Parallel, node: Node, x: Array, w
     const dy = pair(node.ints("dilations"), 0, 1);
     const dx = pair(node.ints("dilations"), 1, 1);
     if (sx != sy or px != py or dx != dy) return error.UnsupportedOp;
+    // The dilated window must fit the padded input, otherwise the unsigned output size below would underflow.
+    if (dy * (k - 1) + 1 > h + 2 * py or dx * (k - 1) + 1 > width + 2 * px) return error.ShapeMismatch;
     const oh = (h + 2 * py - dy * (k - 1) - 1) / sy + 1;
     const ow = (width + 2 * px - dx * (k - 1) - 1) / sx + 1;
     const out = try make(a, &.{ n, oh, ow, m });

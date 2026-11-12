@@ -181,9 +181,11 @@ const Builder = struct {
         if (self.values.get(view.id)) |known| {
             if (std.mem.eql(usize, known.view.shape(), view.shape())) return known.name;
             const name = try self.fresh("reshaped");
-            // NOTE: a reshape that keeps the batch as its first axis on both sides stays valid for any batch size.
+            // NOTE: a reshape whose first axis is the batch or a multiple of it (batch * height * width after a flatten) on both
+            // sides stays valid for any batch size with -1 there. A tensor that does not scale with the batch gets the same
+            // value back from the inference, so a coincidental multiple is harmless.
             const dims = view.shape();
-            const keeps_batch = self.batch != 0 and dims.len > 0 and known.view.shape().len > 0 and dims[0] == self.batch and known.view.shape()[0] == self.batch;
+            const keeps_batch = self.batch != 0 and dims.len > 0 and known.view.shape().len > 0 and dims[0] % self.batch == 0 and known.view.shape()[0] % self.batch == 0;
             try self.node("Reshape", &.{ known.name, try self.shapeConstant(dims, keeps_batch) }, name, &.{});
             try self.values.put(view.id, .{ .name = name, .view = view });
             return name;

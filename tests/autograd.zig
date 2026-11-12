@@ -1502,6 +1502,9 @@ test "grouped, depthwise and dilated convolutions match a direct convolution, fi
         .{ ConvOpts{ .pad = 2, .dilation = 2 }, 3, 3, 4 },
         .{ ConvOpts{ .stride = 2, .pad = 2, .dilation = 2, .groups = 2 }, 3, 4, 2 },
         .{ ConvOpts{ .dilation = 2, .groups = 2 }, 2, 2, 4 },
+        // Padding beyond the reverse geometry (dilation * (k - 1) < pad) used to fail to compile.
+        .{ ConvOpts{ .pad = 1 }, 1, 3, 4 },
+        .{ ConvOpts{ .pad = 1, .groups = 2 }, 1, 4, 6 },
     }) |config| {
         const Case = ConvCase(config[0], config[1], config[2], config[3]);
         try Case.expectDirectConvolution();
