@@ -37,12 +37,15 @@ pub const GatherArgs = extern struct { start: u32, rows: u32, pixels: u32, max_s
 
 pub const PackArgs = extern struct { rows: u32, cols: u32, rows_padded: u32, cols_padded: u32, src_stride: u32, transpose: u32 };
 
-pub const TensorShape = extern struct { m: u32, n: u32, k_padded: u32, n_padded: u32, accumulate: u32, chunk: u32, transpose_out: u32, output_half: u32, split_stride: u32 };
+// c_pitch and c_offset address one group's slice of a grouped convolution's output (or weight gradient) inside the full
+// tensor: zero means a dense product, where C rows are n long (m after transpose_out) and start at zero.
+pub const TensorShape = extern struct { m: u32, n: u32, k_padded: u32, n_padded: u32, accumulate: u32, chunk: u32, transpose_out: u32, output_half: u32, split_stride: u32, c_pitch: u32 = 0, c_offset: u32 = 0 };
 
 // c_step is the channel stride in memory, c the logical channel count of the operand: per-group launches of a grouped
 // convolution offset the base pointer by a whole number of groups and pass c_step as the full channel count.
 pub const ConvGeometry = extern struct { n: u32, h: u32, w: u32, c: u32, k: u32, stride: u32, pad: u32, out_h: u32, out_w: u32, positions: u32, c_out: u32, dilation: u32 = 1, c_step: u32 = 0 };
 
-pub const RotateArgs = extern struct { k: u32, c_in: u32, c_out: u32, rows_padded: u32, cols_padded: u32 };
+// src_pitch and src_offset read one group's columns out of the full weight matrix, whose rows are the full c_out long.
+pub const RotateArgs = extern struct { k: u32, c_in: u32, c_out: u32, rows_padded: u32, cols_padded: u32, src_pitch: u32 = 0, src_offset: u32 = 0 };
 
 pub const LayoutArgs = extern struct { r: u32, c: u32, k: u32 };

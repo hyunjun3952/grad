@@ -644,33 +644,39 @@ pub const Gpu = struct {
         return m * n * k >= self.tensor_core_min_work;
     }
 
-    pub fn rotateWeightsF32(self: *Gpu, w: []const f32, k: usize, c_in: usize, c_out: usize) Error![]f32 {
+    /// A pitch and offset for reading or writing one group's slice out of a tensor whose rows hold all the groups; zeros
+    /// mean a dense operand.
+    pub const Grouped = struct { pitch: u32 = 0, offset: u32 = 0 };
+
+    pub fn rotateWeightsF32(self: *Gpu, w: []const f32, k: usize, c_in: usize, c_out: usize, src: Grouped) Error![]f32 {
         const rows = k * k * c_out;
         const cols_padded = std.mem.alignForward(usize, c_in, 64);
         const dst = try self.scratch(f32, rows * cols_padded);
-        try self.launchFlat(.rotateWeightsF32, dst.len, .{ w, dst, pack(ga.RotateArgs, .{ .k = k, .c_in = c_in, .c_out = c_out, .rows_padded = rows, .cols_padded = cols_padded }) });
+        try self.launchFlat(.rotateWeightsF32, dst.len, .{ w[src.offset..], dst, pack(ga.RotateArgs, .{ .k = k, .c_in = c_in, .c_out = c_out, .rows_padded = rows, .cols_padded = cols_padded, .src_pitch = src.pitch, .src_offset = 0 }) });
         return dst;
     }
 
-    pub fn transposeF32(self: *Gpu, src: []const f32, rows: usize, cols: usize, rows_padded: usize, cols_padded: usize) Error![]f32 {
+    pub fn transposeF32(self: *Gpu, src: []const f32, rows: usize, cols: usize, rows_padded: usize, cols_padded: usize, read: Grouped) Error![]f32 {
         const dst = try self.scratch(f32, rows_padded * cols_padded);
-        const args = pack(ga.PackArgs, .{ .rows = rows, .cols = cols, .rows_padded = rows_padded, .cols_padded = cols_padded, .src_stride = rows, .transpose = true });
-        try self.launch(.transposeF32, .{ toU32(cols_padded / 32), toU32(rows_padded / 32), 1 }, .{ src, dst, args });
+        const args = pack(ga.PackArgs, .{ .rows = rows, .cols = cols, .rows_padded = rows_padded, .cols_padded = cols_padded, .src_stride = if (read.pitch != 0) read.pitch else rows, .transpose = true });
+        try self.launch(.transposeF32, .{ toU32(cols_padded / 32), toU32(rows_padded / 32), 1 }, .{ src[read.offset..], dst, args });
         return dst;
     }
 
     /// Forward (or, with reversed geometry and rotated weights, input-gradient) implicit GEMM over f32 activations: rounded to
-    /// TF32 on tensor cores when tf32 is set, strict f32 on the CUDA cores otherwise.
-    pub fn convF32Forward(self: *Gpu, x: []const f32, w: []const f32, w_pitch: usize, out: []f32, geo: ga.ConvGeometry, accumulate: bool) Error!void {
+    /// TF32 on tensor cores when tf32 is set, strict f32 on the CUDA cores otherwise. With a nonzero c_layout the result is
+    /// one group's slice of a grouped convolution's output, written with c_layout.pitch as the row stride.
+    pub fn convF32Forward(self: *Gpu, x: []const f32, w: []const f32, w_pitch: usize, out: []f32, geo: ga.ConvGeometry, accumulate: bool, c_layout: Grouped) Error!void {
         const c_out: usize = geo.c_out;
         const m = @as(usize, geo.n) * geo.out_h * geo.out_w;
         const k_total = @as(usize, geo.k) * geo.k * geo.c;
-        const kernel_shape = pack(ga.TensorShape, .{ .m = m, .n = c_out, .k_padded = k_total, .n_padded = w_pitch, .accumulate = accumulate, .chunk = k_total, .transpose_out = false, .output_half = false, .split_stride = 0 });
+        const kernel_shape = pack(ga.TensorShape, .{ .m = m, .n = c_out, .k_padded = k_total, .n_padded = w_pitch, .accumulate = accumulate, .chunk = k_total, .transpose_out = false, .output_half = false, .split_stride = 0, .c_pitch = c_layout.pitch, .c_offset = c_layout.offset });
         try self.launch(if (self.tf32) .convTf32Forward else .convExactForward, .{ ceilDiv(c_out, 64), ceilDiv(m, 128), 1 }, .{ x, w, out, kernel_shape, geo });
     }
 
     /// Weight gradient of the implicit GEMM over f32 activations; dy_t is the transposed output gradient (see transposeF32).
-    pub fn convF32WeightGrad(self: *Gpu, dy_t: []const f32, x: []const f32, out: []f32, geo: ga.ConvGeometry) Error!void {
+    /// out is the full (taps, c_out) weight gradient, and with a nonzero c_layout only the group's columns are accumulated into.
+    pub fn convF32WeightGrad(self: *Gpu, dy_t: []const f32, x: []const f32, out: []f32, geo: ga.ConvGeometry, c_layout: Grouped) Error!void {
         const c_out: usize = geo.c_out;
         const taps = @as(usize, geo.k) * geo.k * geo.c;
         const positions_padded = std.mem.alignForward(usize, geo.positions, 32);
@@ -680,12 +686,15 @@ pub const Gpu = struct {
         const blocks = @as(usize, ceilDiv(c_out, tile_rows)) * ceilDiv(taps, tile_cols);
         const splits = @max(1, @min(positions_padded / 256, (128 + blocks - 1) / blocks));
         const chunk = std.mem.alignForward(usize, (positions_padded + splits - 1) / splits, 16);
-        const kernel_shape = pack(ga.TensorShape, .{ .m = c_out, .n = taps, .k_padded = positions_padded, .n_padded = taps, .accumulate = true, .chunk = chunk, .transpose_out = true, .output_half = false, .split_stride = 0 });
+        const kernel_shape = pack(ga.TensorShape, .{ .m = c_out, .n = taps, .k_padded = positions_padded, .n_padded = taps, .accumulate = true, .chunk = chunk, .transpose_out = true, .output_half = false, .split_stride = 0, .c_pitch = c_layout.pitch, .c_offset = c_layout.offset });
         const kernel: Kernel = if (self.tf32) (if (short) .convTf32WeightGradShort else .convTf32WeightGrad) else (if (short) .convExactWeightGradShort else .convExactWeightGrad);
         const mark = self.step_used;
         defer self.step_used = mark;
         const parts = ceilDiv(positions_padded, chunk);
         const target, const shape = try self.orderedTarget(out, kernel_shape, parts);
+        // NOTE: a grouped launch writes only its slice of C, so the split-K workspaces of a deterministic run hold
+        // untouched memory outside it; zero them before the parts accumulate their slices.
+        if (target.ptr != out.ptr and c_layout.pitch != 0) try self.fill(target, 0);
         try self.launch(kernel, .{ ceilDiv(taps, tile_cols), ceilDiv(c_out, tile_rows), parts }, .{ dy_t, x, target, shape, geo });
         try self.combineSplits(target, out, shape, parts, true);
     }
@@ -694,7 +703,7 @@ pub const Gpu = struct {
         const rows = k * k * c_out;
         const cols_padded = std.mem.alignForward(usize, c_in, 64);
         const dst = try self.scratch(u16, rows * cols_padded);
-        try self.launchFlat(.packWeightsRotated, dst.len, .{ w, dst, pack(ga.RotateArgs, .{ .k = k, .c_in = c_in, .c_out = c_out, .rows_padded = rows, .cols_padded = cols_padded }) });
+        try self.launchFlat(.packWeightsRotated, dst.len, .{ w, dst, pack(ga.RotateArgs, .{ .k = k, .c_in = c_in, .c_out = c_out, .rows_padded = rows, .cols_padded = cols_padded, .src_pitch = 0, .src_offset = 0 }) });
         return .{ .data = dst, .rows_padded = rows, .cols_padded = cols_padded };
     }
 
@@ -702,7 +711,7 @@ pub const Gpu = struct {
         const half_out = @typeInfo(@TypeOf(out)).pointer.child == u16;
         const c_out: usize = geo.c_out;
         const m = @as(usize, geo.n) * geo.out_h * geo.out_w;
-        const kernel_shape = pack(ga.TensorShape, .{ .m = m, .n = c_out, .k_padded = w.rows_padded, .n_padded = w.cols_padded, .accumulate = accumulate, .chunk = w.rows_padded, .transpose_out = false, .output_half = half_out, .split_stride = 0 });
+        const kernel_shape = pack(ga.TensorShape, .{ .m = m, .n = c_out, .k_padded = w.rows_padded, .n_padded = w.cols_padded, .accumulate = accumulate, .chunk = w.rows_padded, .transpose_out = false, .output_half = half_out, .split_stride = 0, .c_pitch = 0, .c_offset = 0 });
         const wide = c_out % 128 == 0 and ceilDiv(m, 128) * (c_out / 128) >= 96;
         try self.launch(if (wide) .convGemmForwardWide else .convGemmForward, .{ ceilDiv(c_out, if (wide) 128 else 64), ceilDiv(m, 128), 1 }, .{ x_half, w.data, out, kernel_shape, geo });
     }
@@ -722,7 +731,7 @@ pub const Gpu = struct {
         const blocks = ceilDiv(c_out, tile_rows) * (n_padded / tile_cols);
         const splits = @max(1, @min(k_padded / 256, (128 + blocks - 1) / blocks));
         const chunk = std.mem.alignForward(usize, (k_padded + splits - 1) / splits, 32);
-        const kernel_shape = pack(ga.TensorShape, .{ .m = c_out, .n = taps, .k_padded = k_padded, .n_padded = n_padded, .accumulate = true, .chunk = chunk, .transpose_out = true, .output_half = false, .split_stride = 0 });
+        const kernel_shape = pack(ga.TensorShape, .{ .m = c_out, .n = taps, .k_padded = k_padded, .n_padded = n_padded, .accumulate = true, .chunk = chunk, .transpose_out = true, .output_half = false, .split_stride = 0, .c_pitch = 0, .c_offset = 0 });
         const kernel: Kernel = if (short) .convGemmWeightGradShort else if (wide) .convGemmWeightGradWide else .convGemmWeightGrad;
         const mark = self.step_used;
         defer self.step_used = mark;
@@ -753,7 +762,7 @@ pub const Gpu = struct {
         const chunk = std.mem.alignForward(usize, (a.cols_padded + splits - 1) / splits, 32);
         std.debug.assert(!half_out or (chunk >= a.cols_padded and !transpose_out));
         if (!half_out and chunk < a.cols_padded and !accumulate) try self.fill(out, 0);
-        const kernel_shape = pack(ga.TensorShape, .{ .m = shape.m, .n = shape.n, .k_padded = a.cols_padded, .n_padded = b.cols_padded, .accumulate = accumulate, .chunk = chunk, .transpose_out = transpose_out, .output_half = half_out, .split_stride = 0 });
+        const kernel_shape = pack(ga.TensorShape, .{ .m = shape.m, .n = shape.n, .k_padded = a.cols_padded, .n_padded = b.cols_padded, .accumulate = accumulate, .chunk = chunk, .transpose_out = transpose_out, .output_half = half_out, .split_stride = 0, .c_pitch = 0, .c_offset = 0 });
         const mark = self.step_used;
         defer self.step_used = mark;
         const parts = ceilDiv(a.cols_padded, chunk);

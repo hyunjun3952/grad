@@ -410,17 +410,17 @@ fn implicitGemm(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
             tflops[variant] = flops * 20 / ns / 1000;
         }
         const positions_padded = std.mem.alignForward(usize, rows, 32);
-        const dy_t32 = try dev.transposeF32(y, case.c_out, rows, std.mem.alignForward(usize, case.c_out, 32), positions_padded);
+        const dy_t32 = try dev.transposeF32(y, case.c_out, rows, std.mem.alignForward(usize, case.c_out, 32), positions_padded, .{});
         // Rows: TF32 on tensor cores, then strict f32; columns: forward, weight gradient.
         var f32_rates: [2][2]f64 = undefined;
         for (0..2) |mode| {
             dev.tf32 = mode == 0;
             for (0..2) |variant| {
-                if (variant == 0) try dev.convF32Forward(x, w, case.c_out, y, geo, false) else try dev.convF32WeightGrad(dy_t32, x, dw, geo);
+                if (variant == 0) try dev.convF32Forward(x, w, case.c_out, y, geo, false, .{}) else try dev.convF32WeightGrad(dy_t32, x, dw, geo, .{});
                 try dev.cu.sync();
                 const t0 = Io.Clock.awake.now(io);
                 for (0..20) |_| {
-                    if (variant == 0) try dev.convF32Forward(x, w, case.c_out, y, geo, false) else try dev.convF32WeightGrad(dy_t32, x, dw, geo);
+                    if (variant == 0) try dev.convF32Forward(x, w, case.c_out, y, geo, false, .{}) else try dev.convF32WeightGrad(dy_t32, x, dw, geo, .{});
                 }
                 try dev.cu.sync();
                 const ns = nanoseconds(io, t0);

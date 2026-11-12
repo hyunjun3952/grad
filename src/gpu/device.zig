@@ -1300,7 +1300,10 @@ inline fn storeTile(comptime kind: GemmKind, c: [*]f32, acc: *const Acc, shape: 
                 const r = block.row0 + warp.row * tc.warp_m + mi * 16 + warp.lane / 4 + (q / 2) * 8;
                 const col = block.col0 + warp.col * 32 + ni * 8 + (warp.lane % 4) * 2 + q % 2;
                 if (r < shape.m and col < shape.n) {
-                    const at = if (shape.transpose_out != 0) col * shape.m + r else r * shape.n + col;
+                    // NOTE: a grouped launch stores its slice of C with c_pitch as the row stride and c_offset as the column
+                    // base; both are zero for a dense product.
+                    const pitch = if (shape.c_pitch != 0) shape.c_pitch else if (shape.transpose_out != 0) shape.m else shape.n;
+                    const at = (if (shape.transpose_out != 0) col * pitch + r else r * pitch + col) + shape.c_offset;
                     if (half_output and shape.output_half != 0) {
                         const half_out: [*]u16 = @ptrCast(@alignCast(c));
                         half_out[at] = bf16.encode((if (shape.accumulate != 0) bf16.decode(half_out[at]) else 0) + acc[mi][ni][q]);
@@ -1548,7 +1551,8 @@ export fn rotateWeightsF32(src: [*]const f32, dst: [*]f32, args: ga.RotateArgs) 
     const tap = i / args.c_out;
     const co = i % args.c_out;
     const source_tap = (args.k - 1 - tap / args.k) * args.k + (args.k - 1 - tap % args.k);
-    dst[t] = if (j < args.c_in) src[(source_tap * args.c_in + j) * args.c_out + co] else 0;
+    const pitch = if (args.src_pitch != 0) args.src_pitch else args.c_out;
+    dst[t] = if (j < args.c_in) src[args.src_offset + (source_tap * args.c_in + j) * pitch + co] else 0;
 }
 
 export fn transposeF32(src: [*]const f32, dst: [*]f32, args: ga.PackArgs) callconv(.nvptx_kernel) void {

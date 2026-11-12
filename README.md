@@ -230,7 +230,7 @@ A layer is any struct with `init`, `deinit`, `toGpu`, `forward`, `params` and `s
 ## Limitations
 
 - The Linux GPU loader compiles but is untested; activations are f32 or (on the GPU, for a subset of ops) bf16, in NHWC, tensors of rank 6 or less on the GPU.
-- Grouped and dilated convolutions use a simple one-thread-per-output kernel (correct but not tuned); only the dense stride-1 shapes get the tensor-core paths.
+- Dilated convolutions run the implicit GEMM, and grouped stride-1 convolutions with a multiple of 16 channels per group and large enough work run it per group; other grouped shapes use a simple one-thread-per-output kernel (correct but not tuned).
 - Batch sizes are compile-time constants; a program lists the sizes it is built for (`--batch=N` picks one).
 - ONNX files can be imported for CPU inference only. Exported graphs have a symbolic batch dimension and run for any batch size.
 - The trainer replays its step graph on the GPU in every mode except `--profile`, which waits for the device after each launch and so cannot record; a profiled run launches every kernel each step. Only the convolutions that still run im2col (the stem and the shapes whose channels are not multiples of 64) keep a column matrix for the weight gradient unless `--recompute` is given; the strict f32 peak was 470 MiB of device scratch at batch 64.
