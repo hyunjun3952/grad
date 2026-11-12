@@ -6,6 +6,7 @@ const input = lib.onnx_runtime.input;
 const broadcast = lib.onnx_runtime.broadcast;
 const pool = lib.onnx_runtime.pool;
 const convolve = lib.onnx_runtime.convolve;
+const convolveNhwc = lib.onnx_runtime.convolveNhwc;
 const transpose = lib.onnx_runtime.transpose;
 const Model = lib.onnx_runtime.Model;
 const Array = lib.onnx_runtime.Array;
@@ -309,4 +310,49 @@ test "a causal transformer with token and position inputs survives export and im
     defer result.deinit();
     try testing.expectEqualSlices(usize, &.{ rows, vocab }, result.outputs[0].dims);
     for (logits.value.data, result.outputs[0].data) |want, got| try testing.expectApproxEqAbs(want, got, 1e-4);
+}
+
+test "an nhwc convolution matches the transpose conv transpose reference" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const par: lib.kernels.Parallel = .{ .io = testing.io, .threads = 3 };
+    var prng = std.Random.DefaultPrng.init(7);
+    const rng = prng.random();
+    const x: Array = .{ .dims = &.{ 2, 5, 6, 3 }, .data = try a.alloc(f32, 2 * 5 * 6 * 3) };
+    for (x.data) |*v| v.* = rng.floatNorm(f32);
+    const w: Array = .{ .dims = &.{ 4, 3, 3, 3 }, .data = try a.alloc(f32, 4 * 3 * 3 * 3) };
+    for (w.data) |*v| v.* = rng.floatNorm(f32);
+    const bias: Array = .{ .dims = &.{4}, .data = try a.alloc(f32, 4) };
+    for (bias.data) |*v| v.* = rng.floatNorm(f32);
+
+    const plain_nchw = try transpose(a, par, .{ .attributes = &.{.{ .name = "perm", .ints = &.{ @as(i64, 0), 3, 1, 2 } }} }, x);
+    const plain = try convolve(a, par, .{ .attributes = &.{.{ .name = "pads", .ints = &.{ 1, 1, 1, 1 } }} }, plain_nchw, w, null);
+    const plain_want = try transpose(a, par, .{ .attributes = &.{.{ .name = "perm", .ints = &.{ @as(i64, 0), 2, 3, 1 } }} }, plain);
+    const plain_got = try convolveNhwc(a, par, .{ .attributes = &.{.{ .name = "pads", .ints = &.{ 1, 1, 1, 1 } }} }, x, w, null);
+    try testing.expectEqualSlices(usize, plain_want.dims, plain_got.dims);
+    for (plain_want.data, plain_got.data) |want, got| try testing.expectApproxEqAbs(want, got, 1e-4);
+
+    const strides_nchw = try transpose(a, par, .{ .attributes = &.{.{ .name = "perm", .ints = &.{ @as(i64, 0), 3, 1, 2 } }} }, x);
+    const strides = try convolve(a, par, .{
+        .attributes = &.{
+            .{ .name = "strides", .ints = &.{ 2, 2 } },
+            .{ .name = "pads", .ints = &.{ 1, 1, 1, 1 } },
+            .{ .name = "dilations", .ints = &.{ 2, 2 } },
+        },
+    }, strides_nchw, w, bias);
+    const strides_want = try transpose(a, par, .{ .attributes = &.{.{ .name = "perm", .ints = &.{ @as(i64, 0), 2, 3, 1 } }} }, strides);
+    const strides_got = try convolveNhwc(a, par, .{
+        .attributes = &.{
+            .{ .name = "strides", .ints = &.{ 2, 2 } },
+            .{ .name = "pads", .ints = &.{ 1, 1, 1, 1 } },
+            .{ .name = "dilations", .ints = &.{ 2, 2 } },
+        },
+    }, x, w, bias);
+    try testing.expectEqualSlices(usize, strides_want.dims, strides_got.dims);
+    for (strides_want.data, strides_got.data) |want, got| try testing.expectApproxEqAbs(want, got, 1e-4);
+
+    try testing.expectError(error.UnsupportedOp, convolveNhwc(a, par, .{
+        .attributes = &.{.{ .name = "strides", .ints = &.{ 2, 1 } }},
+    }, x, w, null));
 }
