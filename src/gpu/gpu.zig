@@ -11,7 +11,7 @@ const ptx = @embedFile("kernels_ptx");
 
 /// Everything that can fail on the device path. The CUDA driver and cuDNN are loaded at run time,
 /// so a missing library is an error value rather than a link failure.
-pub const Error = Allocator.Error || error{ NoDevice, NoGraphSupport, ProfilingWhileCapturing, NoSuchDevice, DriverNotFound, MissingSymbol, CudaFailed, CudnnNotFound, CudnnFailed, NoAlgorithm };
+pub const Error = Allocator.Error || error{ NoDevice, NoGraphSupport, ProfilingWhileCapturing, CudnnPlanWhileCapturing, NoSuchDevice, DriverNotFound, MissingSymbol, CudaFailed, CudnnNotFound, CudnnFailed, NoAlgorithm };
 
 pub const BinaryOp = enum { add, mul };
 
@@ -41,6 +41,9 @@ const Kernel = enum {
     sgemmSmallNN,
     sgemmSmallNT,
     sgemmSmallTN,
+    sgemmMidNN,
+    sgemmMidNT,
+    sgemmMidTN,
     packHalf,
     packHalfCopy,
     packHalfTransposed,
@@ -50,6 +53,9 @@ const Kernel = enum {
     convTf32Forward,
     convTf32WeightGrad,
     convTf32WeightGradShort,
+    convExactForward,
+    convExactWeightGrad,
+    convExactWeightGradShort,
     rotateWeightsF32,
     transposeF32,
     addKrscGradient,
@@ -385,12 +391,16 @@ pub const Gpu = struct {
         if (self.profile != null) return error.ProfilingWhileCapturing;
         try self.cu.beginCapture();
         self.capturing = true;
+        if (self.cudnn_lib) |*lib| try lib.setStream(self.cu.stream);
     }
 
     /// Ends the recording. Nothing has run yet, so call replay to execute the recorded step the first time too.
     pub fn endCapture(self: *Gpu) Error!Graph {
         self.capturing = false;
-        const exec = try self.cu.endCapture();
+        // NOTE: cuDNN refuses to leave the capturing stream before the capture has ended.
+        const ended = self.cu.endCapture();
+        if (self.cudnn_lib) |*lib| try lib.setStream(null);
+        const exec = try ended;
         errdefer self.cu.destroyGraph(exec);
         try self.graphs.append(self.gpa, exec);
         return .{ .exec = exec, .zero_bytes = self.zero_used };
@@ -412,10 +422,15 @@ pub const Gpu = struct {
         for (self.cudnn_plans.items) |entry| {
             if (std.meta.eql(entry.geometry, geometry)) return entry.plan;
         }
+        // NOTE: choosing a plan times real convolutions and may allocate, neither of which a recording allows, so every geometry
+        // a recorded step uses must have been planned by a step that ran normally before.
+        if (self.capturing) return error.CudnnPlanWhileCapturing;
         const plan = try self.cudnn_lib.?.plan(geometry, .float, 512 << 20, self.deterministic);
         try self.cudnn_plans.append(self.gpa, .{ .geometry = geometry, .plan = plan });
         if (plan.workspaceBytes() > self.cudnn_workspace_bytes) {
-            if (self.cudnn_workspace != 0) self.cu.free(self.cudnn_workspace);
+            // NOTE: a recorded graph keeps the address of the workspace it was recorded with, so a bigger one (the evaluation batch
+            // may need it) must not free the old one; it stays allocated until deinit.
+            if (self.cudnn_workspace != 0) try self.owned.append(self.gpa, self.cudnn_workspace);
             self.cudnn_workspace_bytes = plan.workspaceBytes();
             self.cudnn_workspace = try self.cu.alloc(self.cudnn_workspace_bytes);
         }
@@ -568,8 +583,7 @@ pub const Gpu = struct {
         const tile = self.gemmTile(shape);
         const transpose: usize = if (opts.trans_a) 2 else if (opts.trans_b) 1 else 0;
         const kernel: Kernel = @fromBackingInt(@backingInt(Kernel.sgemmNN) + @as(u5, @intCast(tile * 3 + transpose)));
-        const tile_m: usize = if (tile == 2) 32 else 128;
-        const tile_n: usize = if (tile == 0) 128 else 32;
+        const tile_m, const tile_n = f32_tiles[tile];
         const blocks = @as(usize, ceilDiv(shape.n, tile_n)) * ceilDiv(shape.m, tile_m);
         const splits = if (batched) 1 else self.splitCount(@max(1, @min(shape.k / 256, (128 + blocks - 1) / blocks)));
         const chunk = std.mem.alignForward(usize, (shape.k + splits - 1) / splits, 8);
@@ -578,15 +592,22 @@ pub const Gpu = struct {
         try self.launch(kernel, .{ ceilDiv(shape.n, tile_n), ceilDiv(shape.m, tile_m), if (batched) toU32(shape.batch) else ceilDiv(shape.k, chunk) }, .{ a, b, out, kernel_shape });
     }
 
-    // Picks the f32 tile: 0 is 128 x 128, 1 is 128 x 32 (narrow products), 2 is 32 x 32 (small ones).
+    // Rows and columns of the f32 tiles, in the order of the kernels sgemmNN, sgemmTall*, sgemmSmall* and sgemmMid*.
+    const f32_tiles = [_][2]usize{ .{ 128, 128 }, .{ 128, 32 }, .{ 32, 32 }, .{ 128, 64 } };
+
+    // Picks the f32 tile: 0 is 128 x 128, 1 is 128 x 32 (narrow products), 2 is 32 x 32 (small ones), 3 is 128 x 64.
+    // NOTE: the kernel multiplies the padded columns of a tile too, so a product with 64 columns (the 64-channel convolutions of
+    // CIFAR) in a 128 x 128 tile wasted half of its multiply-adds; measured 2.5 against 4.9 TFLOPS for the same m and k.
     // NOTE: a small product (a GRU step has 32 rows, its weight gradients a K of 32) gets only a handful of 128 x 128
     // blocks, and splitting K cannot help when K is short. Such a product takes the 32 x 32 tile when even the largest
     // split leaves multiprocessors idle; otherwise the big tile with split K measured faster.
     fn gemmTile(self: *const Gpu, shape: MatmulShape) usize {
         if (shape.n <= 32) return if (shape.m <= 64) 2 else 1;
-        const big_blocks = shape.batch * ceilDiv(shape.m, 128) * ceilDiv(shape.n, 128);
+        const wide = shape.n > 64;
+        const big_blocks = shape.batch * ceilDiv(shape.m, 128) * ceilDiv(shape.n, if (wide) 128 else 64);
         const most_splits = if (shape.batch > 1) 1 else self.splitCount(@max(1, shape.k / 256));
-        return if (big_blocks * most_splits < self.multiprocessors) 2 else 0;
+        if (big_blocks * most_splits < self.multiprocessors) return 2;
+        return if (wide) 0 else 3;
     }
 
     /// A bf16 matrix padded to whole tiles, ready for the tensor core kernels.
@@ -617,8 +638,10 @@ pub const Gpu = struct {
         return .{ .data = dst, .rows_padded = rows_padded, .cols_padded = cols_padded };
     }
 
-    pub fn tf32Worthwhile(self: *Gpu, m: usize, n: usize, k: usize) bool {
-        return self.tf32 and m * n * k >= self.tensor_core_min_work;
+    /// Returns true when an f32 convolution of this size should run as an implicit GEMM (TF32 tensor cores when tf32 is set,
+    /// strict f32 otherwise) instead of building an im2col matrix.
+    pub fn f32ImplicitWorthwhile(self: *Gpu, m: usize, n: usize, k: usize) bool {
+        return m * n * k >= self.tensor_core_min_work;
     }
 
     pub fn rotateWeightsF32(self: *Gpu, w: []const f32, k: usize, c_in: usize, c_out: usize) Error![]f32 {
@@ -636,15 +659,18 @@ pub const Gpu = struct {
         return dst;
     }
 
-    pub fn convTf32Forward(self: *Gpu, x: []const f32, w: []const f32, w_pitch: usize, out: []f32, geo: ga.ConvGeometry, accumulate: bool) Error!void {
+    /// Forward (or, with reversed geometry and rotated weights, input-gradient) implicit GEMM over f32 activations: rounded to
+    /// TF32 on tensor cores when tf32 is set, strict f32 on the CUDA cores otherwise.
+    pub fn convF32Forward(self: *Gpu, x: []const f32, w: []const f32, w_pitch: usize, out: []f32, geo: ga.ConvGeometry, accumulate: bool) Error!void {
         const c_out: usize = geo.c_out;
         const m = @as(usize, geo.n) * geo.out_h * geo.out_w;
         const k_total = @as(usize, geo.k) * geo.k * geo.c;
         const kernel_shape = pack(ga.TensorShape, .{ .m = m, .n = c_out, .k_padded = k_total, .n_padded = w_pitch, .accumulate = accumulate, .chunk = k_total, .transpose_out = false, .output_half = false, .split_stride = 0 });
-        try self.launch(.convTf32Forward, .{ ceilDiv(c_out, 64), ceilDiv(m, 128), 1 }, .{ x, w, out, kernel_shape, geo });
+        try self.launch(if (self.tf32) .convTf32Forward else .convExactForward, .{ ceilDiv(c_out, 64), ceilDiv(m, 128), 1 }, .{ x, w, out, kernel_shape, geo });
     }
 
-    pub fn convTf32WeightGrad(self: *Gpu, dy_t: []const f32, x: []const f32, out: []f32, geo: ga.ConvGeometry) Error!void {
+    /// Weight gradient of the implicit GEMM over f32 activations; dy_t is the transposed output gradient (see transposeF32).
+    pub fn convF32WeightGrad(self: *Gpu, dy_t: []const f32, x: []const f32, out: []f32, geo: ga.ConvGeometry) Error!void {
         const c_out: usize = geo.c_out;
         const taps = @as(usize, geo.k) * geo.k * geo.c;
         const positions_padded = std.mem.alignForward(usize, geo.positions, 32);
@@ -655,7 +681,7 @@ pub const Gpu = struct {
         const splits = @max(1, @min(positions_padded / 256, (128 + blocks - 1) / blocks));
         const chunk = std.mem.alignForward(usize, (positions_padded + splits - 1) / splits, 16);
         const kernel_shape = pack(ga.TensorShape, .{ .m = c_out, .n = taps, .k_padded = positions_padded, .n_padded = taps, .accumulate = true, .chunk = chunk, .transpose_out = true, .output_half = false, .split_stride = 0 });
-        const kernel: Kernel = if (short) .convTf32WeightGradShort else .convTf32WeightGrad;
+        const kernel: Kernel = if (self.tf32) (if (short) .convTf32WeightGradShort else .convTf32WeightGrad) else (if (short) .convExactWeightGradShort else .convExactWeightGrad);
         const mark = self.step_used;
         defer self.step_used = mark;
         const parts = ceilDiv(positions_padded, chunk);

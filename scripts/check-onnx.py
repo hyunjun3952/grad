@@ -32,7 +32,8 @@ else:
     image = ((planar - mean) / deviation).T.reshape(-1).astype(np.float32)
 
 if image is not None:
-    shape = [d.dim_value for d in model.graph.input[0].type.tensor_type.shape.dim]
+    # A symbolic batch dimension has no dim_value (0); one image is fed in that case.
+    shape = [d.dim_value or 1 for d in model.graph.input[0].type.tensor_type.shape.dim]
     logits = ReferenceEvaluator(model).run(None, {"input": image.reshape(shape)})[0].reshape(-1)
 print("onnx  :", " ".join(f"{v:.5f}" for v in logits))
 print("engine:", " ".join(f"{v:.5f}" for v in expected))

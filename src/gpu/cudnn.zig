@@ -22,6 +22,7 @@ const Perf = extern struct {
 const Api = struct {
     cudnnCreate: *const fn (handle: *Handle) callconv(.c) Status,
     cudnnDestroy: *const fn (handle: Handle) callconv(.c) Status,
+    cudnnSetStream: *const fn (handle: Handle, stream: Handle) callconv(.c) Status,
     cudnnGetVersion: *const fn () callconv(.c) usize,
     cudnnGetErrorString: *const fn (status: Status) callconv(.c) [*:0]const u8,
     cudnnCreateTensorDescriptor: *const fn (desc: *Handle) callconv(.c) Status,
@@ -86,6 +87,11 @@ pub const Cudnn = struct {
     pub fn close(self: *Cudnn) void {
         _ = self.api.cudnnDestroy(self.handle);
         self.lib.close();
+    }
+
+    /// Makes the calls of this handle go to stream (null: the default stream), which a graph recording needs.
+    pub fn setStream(self: *const Cudnn, stream: Handle) Error!void {
+        try self.check(self.api.cudnnSetStream(self.handle, stream));
     }
 
     pub fn version(self: *const Cudnn) usize {

@@ -97,10 +97,11 @@ test "gpu batched matmul matches one product per matrix for every transpose, til
     const gpu = try Gpu.forTest(64 << 20);
     defer gpu.deinit();
 
-    // Tile kernels are chosen by n and m: 128x128, 128x32 and 32x32; k above 256 would split a single product.
+    // Tile kernels are chosen by n and m: 128x128, 128x32, 32x32 and 128x64 (the last three rows: batched, plain and split along k).
     const shapes = [_][4]usize{
-        .{ 3, 5, 7, 3 },    .{ 8, 64, 64, 16 },  .{ 5, 65, 70, 17 },   .{ 4, 16, 16, 64 },
-        .{ 6, 40, 20, 33 }, .{ 2, 20, 12, 700 }, .{ 12, 33, 129, 40 }, .{ 1, 7, 9, 11 },
+        .{ 3, 5, 7, 3 },      .{ 8, 64, 64, 16 },    .{ 5, 65, 70, 17 },    .{ 4, 16, 16, 64 },
+        .{ 6, 40, 20, 33 },   .{ 2, 20, 12, 700 },   .{ 12, 33, 129, 40 },  .{ 1, 7, 9, 11 },
+        .{ 16, 300, 48, 40 }, .{ 1, 4096, 64, 300 }, .{ 1, 640, 64, 4096 },
     };
     for (shapes) |s| {
         for ([_][2]bool{ .{ false, false }, .{ true, false }, .{ false, true } }) |t| {

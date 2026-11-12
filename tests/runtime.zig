@@ -123,6 +123,54 @@ test "transposes and broadcasts on their fast paths give the same values as an i
     }
 }
 
+fn imageNet(layers: anytype, tape: *autograd.Tape, comptime n: usize, image: anytype) !autograd.Var(Tensor(f32, &.{ n, 3 })) {
+    const conv, const fc = layers;
+    const pooled = try tape.maxPool(try conv.forwardRelu(tape, autograd.reshape(image, &.{ n, 8, 8, 1 })), .{});
+    return fc.forward(tape, autograd.reshape(pooled, &.{ n, 64 }));
+}
+
+test "a network exported with a dynamic batch axis runs for batch sizes other than the traced one" {
+    const gpa = testing.allocator;
+    const Layers = struct { nn.ConvBn(1, 4, 3, .{ .pad = 1 }), nn.Linear(64, 3) };
+    var prng = std.Random.DefaultPrng.init(17);
+    const rng = prng.random();
+    const layers = try nn.initAll(Layers, gpa, rng);
+    defer nn.deinitAll(layers, gpa);
+    inline for (nn.state(layers)) |slice| {
+        for (slice) |*v| v.* += rng.float(f32) * 0.5;
+    }
+    layers[0].norm.variance.data[0] = 2;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var trace: onnx.Trace = .{ .gpa = gpa };
+    defer trace.deinit();
+    var traced: autograd.Tape = .{ .gpa = arena.allocator(), .trace = &trace };
+    const image = try traced.constant(try Tensor(f32, &.{ 2, 64 }).empty(arena.allocator()));
+    for (image.value.data) |*v| v.* = rng.floatNorm(f32);
+    const logits = try imageNet(layers, &traced, 2, image);
+
+    const state = nn.state(layers);
+    var weights: [state.len]onnx.Weight = undefined;
+    inline for (state, 0..) |slice, i| weights[i] = .{ .id = @intFromPtr(slice.ptr), .data = slice };
+    const bytes = try onnx.build(gpa, .{ .trace = &trace, .weights = &weights, .inputs = &.{onnx.View.of(image)}, .outputs = &.{onnx.View.of(logits)}, .dynamic_batch = true });
+    defer gpa.free(bytes);
+    // The leading axis is symbolic, so the file must not contain the traced batch size as a fixed dimension of the input.
+    try testing.expect(std.mem.indexOf(u8, bytes, "batch") != null);
+
+    var model = try Model.parse(gpa, bytes);
+    defer model.deinit();
+    inline for (.{ 1, 2, 5 }) |n| {
+        var tape: autograd.Tape = .{ .gpa = arena.allocator() };
+        const sample = try tape.constant(try Tensor(f32, &.{ n, 64 }).empty(arena.allocator()));
+        for (sample.value.data) |*v| v.* = rng.floatNorm(f32);
+        const want = try imageNet(layers, &tape, n, sample);
+        var result = try model.run(gpa, .{ .threads = 1 }, &.{.{ .name = "input", .dims = &.{ n, 64 }, .data = sample.value.data }});
+        defer result.deinit();
+        try testing.expectEqualSlices(usize, &.{ n, 3 }, result.outputs[0].dims);
+        for (want.value.data, result.outputs[0].data) |w, got| try testing.expectApproxEqAbs(w, got, 1e-4);
+    }
+}
 test "a gru step with two inputs and two outputs survives export and import" {
     const gpa = testing.allocator;
     const Layers = struct { nn.Gru(3, 4), nn.Linear(4, 2) };

@@ -254,13 +254,14 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
             var trace: onnx.Trace = .{ .gpa = gpa };
             defer trace.deinit();
             var tape: Tape = .{ .gpa = arena.allocator(), .par = par, .trace = &trace };
-            const input = try tape.constant(try tape.zeroedTensor(Tensor(f32, &.{ 1, pixels })));
+            // NOTE: traced with two images, not one, so that the leading axis of the exported graph can be told from a size-one axis; it is dynamic.
+            const input = try tape.constant(try tape.zeroedTensor(Tensor(f32, &.{ 2, pixels })));
             const logits = try Spec.forward(model, &tape, input);
 
             const slices = nn.state(model);
             const weights = try onnx.WeightSet(slices.len).collect(gpa, par, slices);
             defer weights.deinit(gpa);
-            try onnx.save(gpa, io, path, .{ .trace = &trace, .weights = &weights.items, .inputs = &.{onnx.View.of(input)}, .outputs = &.{onnx.View.of(logits)} });
+            try onnx.save(gpa, io, path, .{ .trace = &trace, .weights = &weights.items, .inputs = &.{onnx.View.of(input)}, .outputs = &.{onnx.View.of(logits)}, .dynamic_batch = true });
         }
 
         const Feed = struct {
@@ -428,10 +429,13 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
             // NOTE: a training step is the same sequence of launches every time, so on the GPU the forward and backward pass is
             // recorded once and replayed. What changes per step stays outside or in device buffers: the batch is gathered in
             // place, the dropout seed offset and the CutMix weights are uploaded before each replay, and Adam, EMA and the
-            // loss sum run after it. Profiling cannot record, replicas exchange gradients through the host and cuDNN plans
-            // are not captured, so those runs launch every step normally.
-            const use_graph = gpu != null and !opts.profile and replicas == 1 and opts.cudnn_dir == null;
+            // loss sum run after it. Replicas record too, since their gradient exchange happens after the replay. Only profiling
+            // cannot record, because it waits for the device after every launch, so a profiled run launches every step normally.
+            // cuDNN chooses its algorithms by timing real convolutions the first time it sees a shape, which a recording cannot
+            // do, so with it the first step runs normally and the second one is recorded.
+            const use_graph = gpu != null and !opts.profile;
             var graph: ?Gpu.Graph = null;
+            var steps_run: usize = 0;
             var graph_loss: autograd.Var(Tensor(f32, &.{})) = undefined;
             const mix_weights: ?[]f32 = if (use_graph and opts.cutmix > 0) try gpu.?.alloc(f32, 2) else null;
             for (start_epoch..@max(start_epoch, stop_epoch)) |epoch| {
@@ -458,20 +462,22 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
                         try dev.setStepSeed(step_seed);
                         if (mix_weights) |w| try dev.upload(w, &[2]f32{ mix.kept, 1 - mix.kept });
                     }
+                    const record = use_graph and graph == null and (opts.cudnn_dir == null or steps_run > 0);
                     if (!use_graph or graph == null) {
                         _ = arena.reset(.retain_capacity);
                         if (gpu) |dev| {
                             try dev.resetStep();
-                            if (use_graph) try dev.beginCapture();
+                            if (record) try dev.beginCapture();
                         }
                         var tape: Tape = .{ .gpa = arena.allocator(), .par = par, .training = true, .smoothing = opts.smoothing, .seed = index * 8 + if (use_graph) 0 else step_seed };
                         try optim.zeroGrad(par, params);
                         const logits = try Spec.forward(model, &tape, try tape.constant(feed.batch));
                         graph_loss = try mixedLoss(&tape, logits, feed.labels, feed.other_labels, mix.kept, mix_weights);
                         try tape.backward(graph_loss);
-                        if (use_graph) graph = try gpu.?.endCapture();
+                        if (record) graph = try gpu.?.endCapture();
                     }
-                    if (use_graph) try gpu.?.replay(graph.?);
+                    if (graph) |recorded| try gpu.?.replay(recorded);
+                    steps_run += 1;
                     const loss = graph_loss;
                     try shared.group.averageGrads(index, par, params);
                     try adam.step(par, params);

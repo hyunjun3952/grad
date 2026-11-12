@@ -95,6 +95,8 @@ const Builder = struct {
     values: std.AutoHashMap(usize, Known),
     emitted: std.AutoHashMap(usize, []const u8),
     outputs: []const View,
+    // The batch size the graph was traced with when the leading axis is exported as dynamic, else zero.
+    batch: usize = 0,
     // The output id of a batch norm whose scale and shift went into the convolution before it (zero for none).
     folded_norm: usize = 0,
     counter: usize = 0,
@@ -127,10 +129,12 @@ const Builder = struct {
         return name;
     }
 
-    fn shapeConstant(self: *Builder, dims: []const usize) ![]const u8 {
+    // leading_dynamic writes -1 for the first axis, which Reshape then infers from the input.
+    fn shapeConstant(self: *Builder, dims: []const usize, leading_dynamic: bool) ![]const u8 {
         const name = try self.fresh("shape");
         var values: [trace_mod.max_rank]i64 = undefined;
         for (dims, 0..) |d, i| values[i] = @intCast(d);
+        if (leading_dynamic) values[0] = -1;
         try self.tensor(name, &.{dims.len}, int64_type, std.mem.sliceAsBytes(values[0..dims.len]));
         return name;
     }
@@ -177,7 +181,10 @@ const Builder = struct {
         if (self.values.get(view.id)) |known| {
             if (std.mem.eql(usize, known.view.shape(), view.shape())) return known.name;
             const name = try self.fresh("reshaped");
-            try self.node("Reshape", &.{ known.name, try self.shapeConstant(view.shape()) }, name, &.{});
+            // NOTE: a reshape that keeps the batch as its first axis on both sides stays valid for any batch size.
+            const dims = view.shape();
+            const keeps_batch = self.batch != 0 and dims.len > 0 and known.view.shape().len > 0 and dims[0] == self.batch and known.view.shape()[0] == self.batch;
+            try self.node("Reshape", &.{ known.name, try self.shapeConstant(dims, keeps_batch) }, name, &.{});
             try self.values.put(view.id, .{ .name = name, .view = view });
             return name;
         }
@@ -342,12 +349,12 @@ const Builder = struct {
                         for (0..cols) |j| mask[i * cols + j] = if (j <= i) 0 else -1e9;
                     }
                     const grouped = try self.fresh("grouped");
-                    try self.node("Reshape", &.{ x, try self.shapeConstant(&.{ rows / e.period, e.period, cols }) }, grouped, &.{});
+                    try self.node("Reshape", &.{ x, try self.shapeConstant(&.{ rows / e.period, e.period, cols }, false) }, grouped, &.{});
                     const masked = try self.fresh("masked");
                     try self.node("Add", &.{ grouped, try self.floats("mask", &.{ e.period, cols }, mask) }, masked, &.{});
                     const weights = try self.fresh("weights");
                     try self.node("Softmax", &.{masked}, weights, &.{.{ .int = .{ "axis", -1 } }});
-                    try self.node("Reshape", &.{ weights, try self.shapeConstant(&.{ rows, cols }) }, out, &.{});
+                    try self.node("Reshape", &.{ weights, try self.shapeConstant(&.{ rows, cols }, false) }, out, &.{});
                 }
             },
             .relu => try self.node("Relu", &.{try self.use(e.inputs[0])}, out, &.{}),
@@ -440,10 +447,12 @@ const Builder = struct {
     fn valueInfo(self: *Builder, field: u32, name: []const u8, view: View) !void {
         var shape: Proto = .{};
         defer shape.bytes.deinit(self.gpa);
-        for (view.shape()) |d| {
+        // The first axis is the batch when the graph is dynamic and the tensor leads with it; ids (integer inputs) never do.
+        const dynamic = self.batch != 0 and !view.integer and view.shape().len > 0 and view.shape()[0] == self.batch;
+        for (view.shape(), 0..) |d, i| {
             var dim: Proto = .{};
             defer dim.bytes.deinit(self.gpa);
-            try dim.int(self.gpa, 1, @intCast(d));
+            if (dynamic and i == 0) try dim.bytesField(self.gpa, 2, "batch") else try dim.int(self.gpa, 1, @intCast(d));
             try shape.message(self.gpa, 1, &dim);
         }
         var tensor_type: Proto = .{};
@@ -461,7 +470,10 @@ const Builder = struct {
     }
 };
 
-pub const Graph = struct { trace: *const Trace, weights: []const Weight, inputs: []const View, outputs: []const View };
+/// What build turns into a model: the recorded trace, the weight slices, and the views that are graph inputs and outputs.
+/// With dynamic_batch the leading axis of the first input (the batch it was traced with) is exported as a symbolic dimension,
+/// and reshapes that keep it use -1, so the file runs for any batch size; this suits image models whose tensors lead with the batch.
+pub const Graph = struct { trace: *const Trace, weights: []const Weight, inputs: []const View, outputs: []const View, dynamic_batch: bool = false };
 
 pub fn build(gpa: Allocator, graph: Graph) Error![]u8 {
     const trace, const weights, const inputs, const outputs = .{ graph.trace, graph.weights, graph.inputs, graph.outputs };
@@ -473,6 +485,7 @@ pub fn build(gpa: Allocator, graph: Graph) Error![]u8 {
         .values = .init(gpa),
         .emitted = .init(gpa),
         .outputs = outputs,
+        .batch = if (graph.dynamic_batch and inputs.len > 0 and inputs[0].shape().len > 0) inputs[0].shape()[0] else 0,
     };
     defer {
         b.names.deinit();

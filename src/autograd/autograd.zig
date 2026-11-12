@@ -71,7 +71,7 @@ pub const Activation = activation_math.Kind;
 pub const ConvOpts = struct { stride: usize = 1, pad: usize = 0, dilation: usize = 1, groups: usize = 1 };
 pub const PoolOpts = struct { kernel: usize = 2, stride: usize = 2, pad: usize = 0 };
 pub const SoftmaxOpts = struct { causal_period: usize = 0, scale: f32 = 1 };
-const ConvPath = enum { direct, packed_im2col, implicit, tf32, cudnn, grouped };
+const ConvPath = enum { direct, packed_im2col, implicit, f32_implicit, cudnn, grouped };
 const Packed = gpu_mod.Gpu.Packed;
 
 fn sliceOf(comptime Tn: type, data: anytype, index: usize) Tn {
@@ -828,7 +828,7 @@ pub const Tape = struct {
         const dev = self.par.gpu;
         const unit_stride_blocks = opts.stride == 1 and c_in % 64 == 0;
         const general = opts.groups > 1 or opts.dilation > 1;
-        const path: ConvPath = if (general) .grouped else if (dev == null) .direct else if (dev.?.cudnn_lib != null) .cudnn else if (dev.?.tensorWorthwhile(rows, c_out, kc)) (if (unit_stride_blocks and c_out % 32 == 0) .implicit else .packed_im2col) else if (unit_stride_blocks and c_out % 16 == 0 and dev.?.tf32Worthwhile(rows, c_out, kc)) .tf32 else .direct;
+        const path: ConvPath = if (general) .grouped else if (dev == null) .direct else if (dev.?.cudnn_lib != null) .cudnn else if (dev.?.tensorWorthwhile(rows, c_out, kc)) (if (unit_stride_blocks and c_out % 32 == 0) .implicit else .packed_im2col) else if (unit_stride_blocks and c_out % 16 == 0 and dev.?.f32ImplicitWorthwhile(rows, c_out, kc)) .f32_implicit else .direct;
 
         const value = try self.newTensor(Out);
         // NOTE: the column matrix is k*k times the input. It is kept for the weight gradient unless recompute_columns is set;
@@ -865,7 +865,8 @@ pub const Tape = struct {
                 const w_half = try g.packMatrix(w.value.data, kc, c_out, kc, aligned_out, false);
                 try g.convImplicitForward(x_half, w_half, value.data, geometry, false);
             },
-            .tf32 => try dev.?.convTf32Forward(x.value.data, w.value.data, c_out, value.data, geometry, false),
+            .f32_implicit => try dev.?.convF32Forward(x.value.data, w.value.data, c_out, value.data, geometry, false),
+
             .cudnn => {
                 const g = dev.?;
                 const mark = g.step_used;
@@ -938,16 +939,16 @@ pub const Tape = struct {
                         }
                         if (c.w.needs_grad) try g.convImplicitWeightGrad(grad_half.data, c.x_half, c.w.grad.data, geometry);
                     },
-                    .tf32 => {
+                    .f32_implicit => {
                         const g = t.par.gpu.?;
                         if (c.x.needs_grad) {
                             const rotated = try g.rotateWeightsF32(c.w.value.data, k, c_in, c_out);
-                            try g.convTf32Forward(grad.data, rotated, std.mem.alignForward(usize, c_in, 64), c.x.grad.data, reverse, true);
+                            try g.convF32Forward(grad.data, rotated, std.mem.alignForward(usize, c_in, 64), c.x.grad.data, reverse, true);
                         }
                         if (c.w.needs_grad) {
                             const positions_padded = std.mem.alignForward(usize, rows, 32);
                             const grad_t = try g.transposeF32(grad.data, c_out, rows, std.mem.alignForward(usize, c_out, 32), positions_padded);
-                            try g.convTf32WeightGrad(grad_t, c.x.value.data, c.w.grad.data, geometry);
+                            try g.convF32WeightGrad(grad_t, c.x.value.data, c.w.grad.data, geometry);
                         }
                     },
                     .cudnn => {

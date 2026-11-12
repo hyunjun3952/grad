@@ -271,7 +271,7 @@ fn gpuMatmul(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
         else => return err,
     };
     defer dev.deinit();
-    const shapes = [_][3]usize{ .{ 512, 512, 512 }, .{ 2048, 2048, 2048 }, .{ 4096, 4096, 4096 }, .{ 512, 4096, 784 }, .{ 784, 4096, 512 }, .{ 512, 784, 4096 } };
+    const shapes = [_][3]usize{ .{ 512, 512, 512 }, .{ 2048, 2048, 2048 }, .{ 4096, 4096, 4096 }, .{ 512, 4096, 784 }, .{ 784, 4096, 512 }, .{ 512, 784, 4096 }, .{ 65536, 64, 576 }, .{ 65536, 128, 576 }, .{ 576, 64, 65536 } };
     try out.print("gpu sgemm (best of 20)\n{s:<18}{s:>10}{s:>10}{s:>10}   {s}\n", .{ "m x n x k", "nn", "nt", "tn", "TFLOPS" });
     for (shapes) |s| {
         const m, const n, const k = s;
@@ -376,7 +376,7 @@ fn implicitGemm(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
         .{ .name = "stage 2: 64x16x16, 128->128", .n = 64, .side = 16, .c_in = 128, .c_out = 128 },
         .{ .name = "stage 3: 64x8x8, 256->256", .n = 64, .side = 8, .c_in = 256, .c_out = 256 },
     };
-    try out.print("implicit-GEMM 3x3 convolution kernels (bf16 in, f32 out), kernel only, best of 20\n{s:<30}{s:>14}{s:>14}{s:>14}{s:>14}\n", .{ "case", "bf16 forward", "bf16 dW", "tf32 forward", "tf32 dW" });
+    try out.print("implicit-GEMM 3x3 convolution kernels, kernel only, best of 20 (bf16 in; TF32 tensor cores; strict f32 on the CUDA cores)\n{s:<30}{s:>14}{s:>14}{s:>14}{s:>14}{s:>14}{s:>14}\n", .{ "case", "bf16 forward", "bf16 dW", "tf32 forward", "tf32 dW", "f32 forward", "f32 dW" });
     for (cases) |case| {
         const rows: usize = case.n * case.side * case.side;
         const kc: usize = 9 * case.c_in;
@@ -411,19 +411,23 @@ fn implicitGemm(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
         }
         const positions_padded = std.mem.alignForward(usize, rows, 32);
         const dy_t32 = try dev.transposeF32(y, case.c_out, rows, std.mem.alignForward(usize, case.c_out, 32), positions_padded);
-        var tf32_rates: [2]f64 = undefined;
-        for (0..2) |variant| {
-            if (variant == 0) try dev.convTf32Forward(x, w, case.c_out, y, geo, false) else try dev.convTf32WeightGrad(dy_t32, x, dw, geo);
-            try dev.cu.sync();
-            const t0 = Io.Clock.awake.now(io);
-            for (0..20) |_| {
-                if (variant == 0) try dev.convTf32Forward(x, w, case.c_out, y, geo, false) else try dev.convTf32WeightGrad(dy_t32, x, dw, geo);
+        // Rows: TF32 on tensor cores, then strict f32; columns: forward, weight gradient.
+        var f32_rates: [2][2]f64 = undefined;
+        for (0..2) |mode| {
+            dev.tf32 = mode == 0;
+            for (0..2) |variant| {
+                if (variant == 0) try dev.convF32Forward(x, w, case.c_out, y, geo, false) else try dev.convF32WeightGrad(dy_t32, x, dw, geo);
+                try dev.cu.sync();
+                const t0 = Io.Clock.awake.now(io);
+                for (0..20) |_| {
+                    if (variant == 0) try dev.convF32Forward(x, w, case.c_out, y, geo, false) else try dev.convF32WeightGrad(dy_t32, x, dw, geo);
+                }
+                try dev.cu.sync();
+                const ns = nanoseconds(io, t0);
+                f32_rates[mode][variant] = flops * 20 / ns / 1000;
             }
-            try dev.cu.sync();
-            const ns = nanoseconds(io, t0);
-            tf32_rates[variant] = flops * 20 / ns / 1000;
         }
-        try out.print("{s:<30}{d:>14.2}{d:>14.2}{d:>14.2}{d:>14.2}\n", .{ case.name, tflops[0], tflops[1], tf32_rates[0], tf32_rates[1] });
+        try out.print("{s:<30}{d:>14.2}{d:>14.2}{d:>14.2}{d:>14.2}{d:>14.2}{d:>14.2}\n", .{ case.name, tflops[0], tflops[1], f32_rates[0][0], f32_rates[0][1], f32_rates[1][0], f32_rates[1][1] });
     }
     try out.writeAll("\n");
 }

@@ -222,6 +222,9 @@ comptime {
     exportGemm("sgemmSmallNN", 32, 32, false, false);
     exportGemm("sgemmSmallNT", 32, 32, false, true);
     exportGemm("sgemmSmallTN", 32, 32, true, false);
+    exportGemm("sgemmMidNN", 128, 64, false, false);
+    exportGemm("sgemmMidNT", 128, 64, false, true);
+    exportGemm("sgemmMidTN", 128, 64, true, false);
 }
 // ***** elementwise and reductions *****
 
@@ -1068,6 +1071,9 @@ const Block = struct { tid: usize, row0: usize, col0: usize, k_begin: usize };
 // Chooses a tensor core GEMM at compile time: bf16 or TF32 inputs, the block tile size and the operand mode.
 const GemmKind = struct {
     tf32: bool = false,
+    // With tf32 set: multiply in full f32 on the CUDA cores instead of rounding to TF32 for the tensor cores. The tile, the
+    // gathers and the pipeline are the same, so a strict f32 convolution needs no im2col matrix either.
+    exact: bool = false,
     rows: usize = 128,
     cols: usize = 64,
     mode: GemmMode,
@@ -1275,7 +1281,7 @@ inline fn pipeline(comptime kind: GemmKind, loader: anytype, block: Block, tiles
         if (ahead < tiles) loader.issue(ahead % tc.stages, block.k_begin + ahead * tc.depth);
         commitCopies();
         const base = (tile % tc.stages) * tc.stage_elems;
-        if (kind.tf32) tf32Compute(tc, warp, base, acc) else bf16Compute(tc, kind.transposedA(), warp, base, acc);
+        if (kind.exact) f32Compute(tc, warp, base, acc) else if (kind.tf32) tf32Compute(tc, warp, base, acc) else bf16Compute(tc, kind.transposedA(), warp, base, acc);
     }
 }
 
@@ -1341,6 +1347,29 @@ inline fn bf16Compute(comptime tc: type, comptime a_transposed: bool, warp: Warp
             inline for (0..tc.warp_m / 16) |mi| {
                 tc.mma(&acc[mi][pair * 2], a_frag[mi], .{ frag[0], frag[1] });
                 tc.mma(&acc[mi][pair * 2 + 1], a_frag[mi], .{ frag[2], frag[3] });
+            }
+        }
+    }
+}
+
+// Strict f32 on the CUDA cores, for the elements that the mma fragments of tf32Compute would hold: a thread owns rows r and r + 8 of
+// every 16-row group and two neighbouring columns of every group of eight, so storeTile needs no second layout.
+inline fn f32Compute(comptime tc: type, warp: Warp, base: usize, acc: *Acc) void {
+    inline for (0..tc.depth) |k| {
+        var a: [tc.warp_m / 16][2]f32 = undefined;
+        inline for (0..tc.warp_m / 16) |mi| {
+            const r = warp.row * tc.warp_m + mi * 16 + warp.lane / 4;
+            a[mi] = .{ tc.smem[base + r * tc.a_pitch + k], tc.smem[base + (r + 8) * tc.a_pitch + k] };
+        }
+        inline for (0..4) |ni| {
+            const n = warp.col * 32 + ni * 8 + (warp.lane % 4) * 2;
+            const b0 = tc.smem[base + tc.a_elems + k * tc.b_pitch + n];
+            const b1 = tc.smem[base + tc.a_elems + k * tc.b_pitch + n + 1];
+            inline for (0..tc.warp_m / 16) |mi| {
+                acc[mi][ni][0] = @mulAdd(f32, a[mi][0], b0, acc[mi][ni][0]);
+                acc[mi][ni][1] = @mulAdd(f32, a[mi][0], b1, acc[mi][ni][1]);
+                acc[mi][ni][2] = @mulAdd(f32, a[mi][1], b0, acc[mi][ni][2]);
+                acc[mi][ni][3] = @mulAdd(f32, a[mi][1], b1, acc[mi][ni][3]);
             }
         }
     }
@@ -1493,6 +1522,18 @@ export fn convTf32WeightGrad(dy_t: [*]const f32, x: [*]const f32, c: [*]f32, sha
 
 export fn convTf32WeightGradShort(dy_t: [*]const f32, x: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
     tileGemm(.{ .tf32 = true, .rows = 64, .cols = 128, .mode = .gather_b }, dy_t, x, c, shape, geo);
+}
+
+export fn convExactForward(x: [*]const f32, w: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
+    tileGemm(.{ .tf32 = true, .exact = true, .mode = .gather_a }, x, w, c, shape, geo);
+}
+
+export fn convExactWeightGrad(dy_t: [*]const f32, x: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
+    tileGemm(.{ .tf32 = true, .exact = true, .mode = .gather_b }, dy_t, x, c, shape, geo);
+}
+
+export fn convExactWeightGradShort(dy_t: [*]const f32, x: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
+    tileGemm(.{ .tf32 = true, .exact = true, .rows = 64, .cols = 128, .mode = .gather_b }, dy_t, x, c, shape, geo);
 }
 
 export fn rotateWeightsF32(src: [*]const f32, dst: [*]f32, args: ga.RotateArgs) callconv(.nvptx_kernel) void {

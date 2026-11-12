@@ -13,11 +13,12 @@ fn run(init: std.process.Init) !void {
 
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 3) {
-        try out.writeAll("usage: onnx MODEL.onnx mnist|cifar [images]\n");
+        try out.writeAll("usage: onnx MODEL.onnx mnist|cifar [images] [batch]\n");
         try out.flush();
         return;
     }
     const wanted: usize = if (args.len > 3) try std.fmt.parseInt(usize, args[3], 10) else 1000;
+    const batch: usize = if (args.len > 4) try std.fmt.parseInt(usize, args[4], 10) else 1;
 
     var model = try grad.onnx.Model.load(gpa, init.io, args[1]);
     defer model.deinit();
@@ -29,20 +30,28 @@ fn run(init: std.process.Init) !void {
     const count = @min(wanted, data.count());
     var correct: usize = 0;
     const started = std.Io.Clock.awake.now(init.io);
-    for (0..count) |i| {
-        var result = try model.run(gpa, par, &.{.{ .name = model.inputs[0], .dims = &.{ 1, data.pixels }, .data = data.images[i * data.pixels ..][0..data.pixels] }});
+    var done: usize = 0;
+    while (done < count) {
+        // A dynamic-batch graph takes any leading count; a fixed one only the size it was exported with.
+        const n = @min(batch, count - done);
+        var result = try model.run(gpa, par, &.{.{ .name = model.inputs[0], .dims = &.{ n, data.pixels }, .data = data.images[done * data.pixels ..][0 .. n * data.pixels] }});
         defer result.deinit();
         const scores = result.outputs[0].data;
-        var best: usize = 0;
-        for (scores, 0..) |s, j| {
-            if (s > scores[best]) best = j;
+        const classes = scores.len / n;
+        for (0..n) |row| {
+            const row_scores = scores[row * classes ..][0..classes];
+            var best: usize = 0;
+            for (row_scores, 0..) |s, j| {
+                if (s > row_scores[best]) best = j;
+            }
+            correct += @intFromBool(best == data.labels[done + row]);
         }
-        correct += @intFromBool(best == data.labels[i]);
-        if (i == 0) {
+        if (done == 0) {
             try out.writeAll("logits of image 0:");
-            for (scores) |s| try out.print(" {d:.5}", .{s});
+            for (scores[0..classes]) |s| try out.print(" {d:.5}", .{s});
             try out.writeByte('\n');
         }
+        done += n;
     }
     const seconds = @as(f64, @floatFromInt(std.Io.Clock.awake.now(init.io).nanoseconds - started.nanoseconds)) / 1e9;
     try out.print("{d} of {d} test images correct ({d:.2}%)\n", .{ correct, count, 100.0 * @as(f64, @floatFromInt(correct)) / @as(f64, @floatFromInt(count)) });
