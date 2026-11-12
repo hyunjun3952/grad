@@ -23,6 +23,7 @@ pub const dataset = @import("data/dataset.zig");
 pub const gpu_args = @import("gpu/args.zig");
 pub const gpu_cuda = @import("gpu/cuda.zig");
 pub const gpu_cudnn = @import("gpu/cudnn.zig");
+pub const onnx_gpu = @import("onnx/gpu.zig");
 pub const onnx_runtime = @import("onnx/runtime.zig");
 pub const trace = @import("autograd/trace.zig");
 

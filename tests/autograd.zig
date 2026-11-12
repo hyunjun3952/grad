@@ -733,7 +733,16 @@ const BnAddReluCase = struct {
     pub const names = .{ "x", "r", "gamma", "beta", "v" };
     pub const value_names = BnCase.value_names;
     pub const labels = BnCase.labels;
-    const Result = struct { loss: Var(Tensor(f32, &.{})), x: Var(BnCase.X), r: Var(BnCase.X), gamma: Var(BnCase.Channels), beta: Var(BnCase.Channels), v: Var(BnCase.V), running_mean: BnCase.Channels, running_var: BnCase.Channels };
+    const Result = struct {
+        loss: Var(Tensor(f32, &.{})),
+        x: Var(BnCase.X),
+        r: Var(BnCase.X),
+        gamma: Var(BnCase.Channels),
+        beta: Var(BnCase.Channels),
+        v: Var(BnCase.V),
+        running_mean: BnCase.Channels,
+        running_var: BnCase.Channels,
+    };
 
     fn network(t: *Tape, p: Inputs, label_slice: []const u8, comptime fused: bool) !Result {
         const x = try t.leaf(p.x);

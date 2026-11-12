@@ -69,7 +69,17 @@ test "grouped and dilated convolutions, pooling, softmax and broadcasting follow
     try testing.expectEqualSlices(usize, &.{ 1, 2, 2, 2 }, grouped.dims);
     try testing.expectEqualSlices(f32, &.{ 6, 8, 12, 14, 2, 2, 2, 2 }, grouped.data);
 
-    const dilated = try convolve(a, .{}, .{ .attributes = &.{ .{ .name = "dilations", .ints = &.{ 2, 2 } }, .{ .name = "pads", .ints = &.{ 1, 1, 1, 1 } } } }, .{ .dims = &.{ 1, 1, 3, 3 }, .data = x.data[0..9] }, .{ .dims = &.{ 1, 1, 2, 2 }, .data = @constCast(&[_]f32{ 1, 1, 1, 1 }) }, null);
+    const dilated = try convolve(
+        a,
+        .{},
+        .{ .attributes = &.{
+            .{ .name = "dilations", .ints = &.{ 2, 2 } },
+            .{ .name = "pads", .ints = &.{ 1, 1, 1, 1 } },
+        } },
+        .{ .dims = &.{ 1, 1, 3, 3 }, .data = x.data[0..9] },
+        .{ .dims = &.{ 1, 1, 2, 2 }, .data = @constCast(&[_]f32{ 1, 1, 1, 1 }) },
+        null,
+    );
     try testing.expectEqualSlices(usize, &.{ 1, 1, 3, 3 }, dilated.dims);
     try testing.expectEqualSlices(f32, &.{ 5, 10, 5, 10, 20, 10, 5, 10, 5 }, dilated.data[0..9]);
 

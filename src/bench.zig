@@ -271,7 +271,17 @@ fn gpuMatmul(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
         else => return err,
     };
     defer dev.deinit();
-    const shapes = [_][3]usize{ .{ 512, 512, 512 }, .{ 2048, 2048, 2048 }, .{ 4096, 4096, 4096 }, .{ 512, 4096, 784 }, .{ 784, 4096, 512 }, .{ 512, 784, 4096 }, .{ 65536, 64, 576 }, .{ 65536, 128, 576 }, .{ 576, 64, 65536 } };
+    const shapes = [_][3]usize{
+        .{ 512, 512, 512 },
+        .{ 2048, 2048, 2048 },
+        .{ 4096, 4096, 4096 },
+        .{ 512, 4096, 784 },
+        .{ 784, 4096, 512 },
+        .{ 512, 784, 4096 },
+        .{ 65536, 64, 576 },
+        .{ 65536, 128, 576 },
+        .{ 576, 64, 65536 },
+    };
     try out.print("gpu sgemm (best of 20)\n{s:<18}{s:>10}{s:>10}{s:>10}   {s}\n", .{ "m x n x k", "nn", "nt", "tn", "TFLOPS" });
     for (shapes) |s| {
         const m, const n, const k = s;
@@ -282,12 +292,9 @@ fn gpuMatmul(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
         try dev.fill(b, 0.25);
         try out.print("{d:>5}x{d:>5}x{d:>5}", .{ m, n, k });
         for ([_][2]bool{ .{ false, false }, .{ false, true }, .{ true, false } }) |t| {
-            try dev.matmul(a, b, c, .{ .m = m, .n = n, .k = k }, .{ .trans_a = t[0], .trans_b = t[1] });
-            try dev.cu.sync();
-            const t0 = Io.Clock.awake.now(io);
-            for (0..20) |_| try dev.matmul(a, b, c, .{ .m = m, .n = n, .k = k }, .{ .trans_a = t[0], .trans_b = t[1] });
-            try dev.cu.sync();
-            const ns = nanoseconds(io, t0);
+            const shape: grad.gpu.MatmulShape = .{ .m = m, .n = n, .k = k };
+            const opts: grad.gpu.MatmulOpts = .{ .trans_a = t[0], .trans_b = t[1] };
+            const ns = try measureGpu(io, dev, grad.gpu.Gpu.matmul, .{ dev, a, b, c, shape, opts });
             try out.print("{d:>10.2}", .{2.0 * @as(f64, @floatFromInt(m * n * k)) * 20 / ns / 1000});
         }
         try out.writeAll("\n");
@@ -341,22 +348,11 @@ fn cudnnConvolutions(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, dir: [:0]c
                 }
             }.of;
             for (0..3) |direction| {
-                switch (direction) {
-                    0 => try lib.forward(plan, addr(x), addr(w), addr(y), addr(workspace), false),
-                    1 => try lib.backwardData(plan, addr(w), addr(y), addr(x), addr(workspace), false),
-                    else => try lib.backwardFilter(plan, addr(x), addr(y), addr(w), addr(workspace), false),
-                }
-                try dev.cu.sync();
-                const t0 = Io.Clock.awake.now(io);
-                for (0..20) |_| {
-                    switch (direction) {
-                        0 => try lib.forward(plan, addr(x), addr(w), addr(y), addr(workspace), false),
-                        1 => try lib.backwardData(plan, addr(w), addr(y), addr(x), addr(workspace), false),
-                        else => try lib.backwardFilter(plan, addr(x), addr(y), addr(w), addr(workspace), false),
-                    }
-                }
-                try dev.cu.sync();
-                const ns = nanoseconds(io, t0);
+                const ns = switch (direction) {
+                    0 => try measureGpu(io, dev, grad.gpu.cudnn.Cudnn.forward, .{ &lib, plan, addr(x), addr(w), addr(y), addr(workspace), false }),
+                    1 => try measureGpu(io, dev, grad.gpu.cudnn.Cudnn.backwardData, .{ &lib, plan, addr(w), addr(y), addr(x), addr(workspace), false }),
+                    else => try measureGpu(io, dev, grad.gpu.cudnn.Cudnn.backwardFilter, .{ &lib, plan, addr(x), addr(y), addr(w), addr(workspace), false }),
+                };
                 tflops[direction] = flops * 20 / ns / 1000;
             }
             try out.print("{s:<30}{s:<10}{d:>10.2}{d:>10.2}{d:>10.2}\n", .{ case.name, @tagName(data), tflops[0], tflops[1], tflops[2] });
@@ -376,7 +372,10 @@ fn implicitGemm(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
         .{ .name = "stage 2: 64x16x16, 128->128", .n = 64, .side = 16, .c_in = 128, .c_out = 128 },
         .{ .name = "stage 3: 64x8x8, 256->256", .n = 64, .side = 8, .c_in = 256, .c_out = 256 },
     };
-    try out.print("implicit-GEMM 3x3 convolution kernels, kernel only, best of 20 (bf16 in; TF32 tensor cores; strict f32 on the CUDA cores)\n{s:<30}{s:>14}{s:>14}{s:>14}{s:>14}{s:>14}{s:>14}\n", .{ "case", "bf16 forward", "bf16 dW", "tf32 forward", "tf32 dW", "f32 forward", "f32 dW" });
+    try out.print(
+        "implicit-GEMM 3x3 convolution kernels, kernel only, best of 20 (bf16 in; TF32 tensor cores; strict f32 on the CUDA cores)\n{s:<30}{s:>14}{s:>14}{s:>14}{s:>14}{s:>14}{s:>14}\n",
+        .{ "case", "bf16 forward", "bf16 dW", "tf32 forward", "tf32 dW", "f32 forward", "f32 dW" },
+    );
     for (cases) |case| {
         const rows: usize = case.n * case.side * case.side;
         const kc: usize = 9 * case.c_in;
@@ -392,38 +391,42 @@ fn implicitGemm(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
         try dev.upload(y, host[0..y.len]);
         try dev.upload(w, host[0..w.len]);
 
-        const geo: grad.gpu.ConvGeometry = .{ .n = case.n, .h = case.side, .w = case.side, .c = case.c_in, .k = 3, .stride = 1, .pad = 1, .out_h = case.side, .out_w = case.side, .positions = @intCast(rows), .c_out = case.c_out };
-        const x_half = (try dev.packMatrix(x, rows, case.c_in, rows, case.c_in, false)).data;
-        const w_half = try dev.packMatrix(w, kc, case.c_out, kc, case.c_out, false);
-        const dy_half = (try dev.packMatrix(y, rows, case.c_out, rows, case.c_out, false)).data;
+        const geo: grad.gpu.ConvGeometry = .{
+            .n = case.n,
+            .h = case.side,
+            .w = case.side,
+            .c = case.c_in,
+            .k = 3,
+            .stride = 1,
+            .pad = 1,
+            .out_h = case.side,
+            .out_w = case.side,
+            .positions = @intCast(rows),
+            .c_out = case.c_out,
+        };
+        const x_half = (try dev.packMatrix(x, rows, case.c_in, .{})).data;
+        const w_half = try dev.packMatrix(w, kc, case.c_out, .{});
+        const dy_half = (try dev.packMatrix(y, rows, case.c_out, .{})).data;
         const flops = 2.0 * @as(f64, @floatFromInt(rows)) * @as(f64, @floatFromInt(kc)) * @as(f64, @floatFromInt(case.c_out));
         var tflops: [2]f64 = undefined;
         for (0..2) |variant| {
-            if (variant == 0) try dev.convImplicitForward(x_half, w_half, y, geo, false) else try dev.convImplicitWeightGrad(dy_half, x_half, dw, geo);
-            try dev.cu.sync();
-            const t0 = Io.Clock.awake.now(io);
-            for (0..20) |_| {
-                if (variant == 0) try dev.convImplicitForward(x_half, w_half, y, geo, false) else try dev.convImplicitWeightGrad(dy_half, x_half, dw, geo);
-            }
-            try dev.cu.sync();
-            const ns = nanoseconds(io, t0);
+            const ns = if (variant == 0)
+                try measureGpu(io, dev, grad.gpu.Gpu.convImplicitForward, .{ dev, x_half, w_half, y, geo, false })
+            else
+                try measureGpu(io, dev, grad.gpu.Gpu.convImplicitWeightGrad, .{ dev, dy_half, x_half, dw, geo });
             tflops[variant] = flops * 20 / ns / 1000;
         }
-        const positions_padded = std.mem.alignForward(usize, rows, 32);
-        const dy_t32 = try dev.transposeF32(y, case.c_out, rows, std.mem.alignForward(usize, case.c_out, 32), positions_padded, .{});
+        const positions_padded = grad.gpu.padTo(rows, .depth);
+        const dy_t32 = try dev.transposeF32(y, case.c_out, rows, grad.gpu.padTo(case.c_out, .depth), positions_padded, null);
         // Rows: TF32 on tensor cores, then strict f32; columns: forward, weight gradient.
         var f32_rates: [2][2]f64 = undefined;
         for (0..2) |mode| {
             dev.tf32 = mode == 0;
             for (0..2) |variant| {
-                if (variant == 0) try dev.convF32Forward(x, w, case.c_out, y, geo, false, .{}) else try dev.convF32WeightGrad(dy_t32, x, dw, geo, .{});
-                try dev.cu.sync();
-                const t0 = Io.Clock.awake.now(io);
-                for (0..20) |_| {
-                    if (variant == 0) try dev.convF32Forward(x, w, case.c_out, y, geo, false, .{}) else try dev.convF32WeightGrad(dy_t32, x, dw, geo, .{});
-                }
-                try dev.cu.sync();
-                const ns = nanoseconds(io, t0);
+                const ns = if (variant == 0)
+                    try measureGpu(io, dev, grad.gpu.Gpu.convF32Forward, .{ dev, x, w, y, geo, grad.gpu.Gpu.ConvF32ForwardOpts{} })
+                else
+                    try measureGpu(io, dev, grad.gpu.Gpu.convF32WeightGrad, .{ dev, dy_t32, x, dw, geo, null });
                 f32_rates[mode][variant] = flops * 20 / ns / 1000;
             }
         }
@@ -447,7 +450,10 @@ fn gpuTensorCore(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
         .{ .name = "conv dX  65536x576x64", .m = 65536, .n = 576, .k = 64, .opts = .{ .trans_b = true } },
         .{ .name = "mlp fwd  512x4096x784", .m = 512, .n = 4096, .k = 784, .opts = .{} },
     };
-    try out.print("matmul including operand packing, f32 vs bf16 tensor cores (best of 20)\n{s:<24}{s:>12}{s:>12}{s:>10}{s:>14}{s:>14}\n", .{ "case", "f32 TFLOPS", "bf16 TFLOPS", "speedup", "kernel only", "rms rel err" });
+    try out.print(
+        "matmul including operand packing, f32 vs bf16 tensor cores (best of 20)\n{s:<24}{s:>12}{s:>12}{s:>10}{s:>14}{s:>14}\n",
+        .{ "case", "f32 TFLOPS", "bf16 TFLOPS", "speedup", "kernel only", "rms rel err" },
+    );
     for (cases) |case| {
         const a = try dev.alloc(T, @max(case.m * case.k, case.k * case.n));
         const b = try dev.alloc(T, @max(case.m * case.k, case.k * case.n));
@@ -466,26 +472,16 @@ fn gpuTensorCore(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
         for (0..2) |variant| {
             dev.tensor_cores = variant == 1;
             const target = if (variant == 0) c32 else c16;
-            try dev.matmul(a, b, target, .{ .m = case.m, .n = case.n, .k = case.k }, case.opts);
-            try dev.cu.sync();
-            const t0 = Io.Clock.awake.now(io);
-            for (0..20) |_| try dev.matmul(a, b, target, .{ .m = case.m, .n = case.n, .k = case.k }, case.opts);
-            try dev.cu.sync();
-            const ns = nanoseconds(io, t0);
+            const ns = try measureGpu(io, dev, grad.gpu.Gpu.matmul, .{ dev, a, b, target, grad.gpu.MatmulShape{ .m = case.m, .n = case.n, .k = case.k }, case.opts });
             tflops[variant] = flops * 20 / ns / 1000;
         }
 
-        const mark = dev.step_used;
-        const a_packed = try dev.packMatrix(a, case.m, case.k, std.mem.alignForward(usize, case.m, 128), std.mem.alignForward(usize, case.k, 32), case.opts.trans_a);
-        const b_packed = try dev.packMatrix(b, case.k, case.n, std.mem.alignForward(usize, case.k, 32), std.mem.alignForward(usize, case.n, 64), case.opts.trans_b);
-        try dev.matmulPacked(a_packed, b_packed, c16, .{ .m = case.m, .n = case.n, .k = case.k }, false, false);
-        try dev.cu.sync();
-        const kernel_start = Io.Clock.awake.now(io);
-        for (0..20) |_| try dev.matmulPacked(a_packed, b_packed, c16, .{ .m = case.m, .n = case.n, .k = case.k }, false, false);
-        try dev.cu.sync();
-        const kernel_ns = nanoseconds(io, kernel_start);
+        const scope = dev.scratchScope();
+        const a_packed = try dev.packMatrix(a, case.m, case.k, .{ .rows_padded = grad.gpu.padTo(case.m, .rows), .cols_padded = grad.gpu.padTo(case.k, .depth), .transpose = case.opts.trans_a });
+        const b_packed = try dev.packMatrix(b, case.k, case.n, .{ .rows_padded = grad.gpu.padTo(case.k, .depth), .cols_padded = grad.gpu.padTo(case.n, .columns), .transpose = case.opts.trans_b });
+        const kernel_ns = try measureGpu(io, dev, grad.gpu.Gpu.matmulPacked, .{ dev, a_packed, b_packed, c16, grad.gpu.MatmulShape{ .m = case.m, .n = case.n, .k = case.k }, false, false });
         const kernel_tflops = flops * 20 / kernel_ns / 1000;
-        dev.step_used = mark;
+        scope.restore();
 
         const full = try gpa.alloc(T, case.m * case.n);
         defer gpa.free(full);
@@ -511,6 +507,15 @@ fn nanoseconds(io: Io, since: Io.Timestamp) f64 {
 
 fn milliseconds(io: Io, since: Io.Timestamp) f64 {
     return nanoseconds(io, since) / 1e6;
+}
+
+fn measureGpu(io: Io, dev: *grad.gpu.Gpu, comptime operation: anytype, args: anytype) !f64 {
+    try @call(.auto, operation, args);
+    try dev.cu.sync();
+    const started = Io.Clock.awake.now(io);
+    for (0..20) |_| try @call(.auto, operation, args);
+    try dev.cu.sync();
+    return nanoseconds(io, started);
 }
 
 fn cpuOps(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {

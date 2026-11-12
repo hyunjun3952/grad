@@ -37,6 +37,65 @@ fn statisticToGpu(statistic: anytype, gpu: *Gpu) autograd.Error!@TypeOf(statisti
     return .{ .data = copy };
 }
 
+fn deinitFields(self: anytype, gpa: Allocator) void {
+    inline for (@typeInfo(@TypeOf(self)).@"struct".field_names) |field| {
+        const value = @field(self, field);
+        if (comptime @hasDecl(@TypeOf(value), "deinit")) value.deinit(gpa) else freeParam(value, gpa);
+    }
+}
+
+fn toGpuFields(self: anytype, gpu: *Gpu) autograd.Error!@TypeOf(self) {
+    const Self = @TypeOf(self);
+    var out: Self = undefined;
+    inline for (@typeInfo(Self).@"struct".field_names) |field| {
+        const value = @field(self, field);
+        const Field = @TypeOf(value);
+        @field(out, field) = if (comptime @hasDecl(Field, "toGpu"))
+            try value.toGpu(gpu)
+        else if (comptime @hasField(Field, "grad"))
+            try paramToGpu(value, gpu)
+        else
+            try statisticToGpu(value, gpu);
+    }
+    return out;
+}
+
+fn DirectParams(comptime Self: type) type {
+    comptime var types: []const type = &.{};
+    inline for (@typeInfo(Self).@"struct".field_types) |Field| {
+        if (@hasField(Field, "grad")) types = types ++ &[1]type{Field};
+    }
+    return @Tuple(types);
+}
+
+fn directParams(self: anytype) DirectParams(@TypeOf(self)) {
+    var out: DirectParams(@TypeOf(self)) = undefined;
+    comptime var at = 0;
+    inline for (@typeInfo(@TypeOf(self)).@"struct".field_names) |field| {
+        const value = @field(self, field);
+        if (comptime @hasField(@TypeOf(value), "grad")) {
+            out[at] = value;
+            at += 1;
+        }
+    }
+    return out;
+}
+
+fn DirectState(comptime Self: type) type {
+    comptime var types: []const type = &.{};
+    inline for (@typeInfo(Self).@"struct".field_names) |_| types = types ++ &[1]type{[]f32};
+    return @Tuple(types);
+}
+
+fn directState(self: anytype) DirectState(@TypeOf(self)) {
+    var out: DirectState(@TypeOf(self)) = undefined;
+    inline for (@typeInfo(@TypeOf(self)).@"struct".field_names, 0..) |field, i| {
+        const value = @field(self, field);
+        out[i] = if (comptime @hasField(@TypeOf(value), "grad")) value.value.data else value.data;
+    }
+    return out;
+}
+
 /// A fully connected layer, y = x * w + b, with He-normal weights and zero bias.
 /// x has shape (rows, n_in) and the result has shape (rows, n_out).
 pub fn Linear(comptime n_in: usize, comptime n_out: usize) type {
@@ -59,12 +118,11 @@ pub fn Linear(comptime n_in: usize, comptime n_out: usize) type {
         }
 
         pub fn deinit(self: Self, gpa: Allocator) void {
-            freeParam(self.w, gpa);
-            freeParam(self.b, gpa);
+            deinitFields(self, gpa);
         }
 
         pub fn toGpu(self: Self, gpu: *Gpu) autograd.Error!Self {
-            return .{ .w = try paramToGpu(self.w, gpu), .b = try paramToGpu(self.b, gpu) };
+            return toGpuFields(self, gpu);
         }
 
         pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(Tensor(@TypeOf(x.value).Elem, &.{ @TypeOf(x.value).shape[0], n_out })) {
@@ -73,12 +131,12 @@ pub fn Linear(comptime n_in: usize, comptime n_out: usize) type {
             return tape.add(try tape.matmul(x, self.w), try tape.cast(self.b, @TypeOf(x.value).Elem));
         }
 
-        pub fn params(self: Self) struct { Var(W), Var(B) } {
-            return .{ self.w, self.b };
+        pub fn params(self: Self) DirectParams(Self) {
+            return directParams(self);
         }
 
-        pub fn state(self: Self) struct { []f32, []f32 } {
-            return .{ self.w.value.data, self.b.value.data };
+        pub fn state(self: Self) DirectState(Self) {
+            return directState(self);
         }
     };
 }
@@ -108,39 +166,36 @@ pub fn BatchNorm(comptime c: usize) type {
         }
 
         pub fn deinit(self: Self, gpa: Allocator) void {
-            freeParam(self.gamma, gpa);
-            freeParam(self.beta, gpa);
-            self.mean.deinit(gpa);
-            self.variance.deinit(gpa);
+            deinitFields(self, gpa);
         }
 
         pub fn toGpu(self: Self, gpu: *Gpu) autograd.Error!Self {
-            return .{
-                .gamma = try paramToGpu(self.gamma, gpu),
-                .beta = try paramToGpu(self.beta, gpu),
-                .mean = try statisticToGpu(self.mean, gpu),
-                .variance = try statisticToGpu(self.variance, gpu),
-            };
+            return toGpuFields(self, gpu);
         }
+
+        fn stats(self: Self) @TypeOf(.{ .mean = self.mean, .variance = self.variance }) {
+            return .{ .mean = self.mean, .variance = self.variance };
+        }
+
         pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(@TypeOf(x.value)) {
-            return tape.batchNorm(x, self.gamma, self.beta, .{ .mean = self.mean, .variance = self.variance });
+            return tape.batchNorm(x, self.gamma, self.beta, self.stats());
         }
 
         pub fn forwardRelu(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(@TypeOf(x.value)) {
-            return tape.batchNormRelu(x, self.gamma, self.beta, .{ .mean = self.mean, .variance = self.variance });
+            return tape.batchNormRelu(x, self.gamma, self.beta, self.stats());
         }
 
         /// Computes max(norm(x) + residual, 0), the end of a residual block, in one kernel.
         pub fn forwardAddRelu(self: Self, tape: *Tape, x: anytype, residual: anytype) autograd.Error!Var(@TypeOf(x.value)) {
-            return tape.batchNormAddRelu(x, residual, self.gamma, self.beta, .{ .mean = self.mean, .variance = self.variance });
+            return tape.batchNormAddRelu(x, residual, self.gamma, self.beta, self.stats());
         }
 
-        pub fn params(self: Self) struct { Var(V), Var(V) } {
-            return .{ self.gamma, self.beta };
+        pub fn params(self: Self) DirectParams(Self) {
+            return directParams(self);
         }
 
-        pub fn state(self: Self) struct { []f32, []f32, []f32, []f32 } {
-            return .{ self.gamma.value.data, self.beta.value.data, self.mean.data, self.variance.data };
+        pub fn state(self: Self) DirectState(Self) {
+            return directState(self);
         }
     };
 }
@@ -199,12 +254,11 @@ pub fn ConvBn(comptime c_in: usize, comptime c_out: usize, comptime k: usize, co
         }
 
         pub fn deinit(self: Self, gpa: Allocator) void {
-            self.conv.deinit(gpa);
-            self.norm.deinit(gpa);
+            deinitFields(self, gpa);
         }
 
         pub fn toGpu(self: Self, gpu: *Gpu) autograd.Error!Self {
-            return .{ .conv = try self.conv.toGpu(gpu), .norm = try self.norm.toGpu(gpu) };
+            return toGpuFields(self, gpu);
         }
 
         pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(autograd.ConvOut(@TypeOf(x.value), Conv.Weights, opts)) {
@@ -250,13 +304,11 @@ pub fn Gru(comptime n_in: usize, comptime hidden: usize) type {
         }
 
         pub fn deinit(self: Self, gpa: Allocator) void {
-            inline for (@typeInfo(Self).@"struct".field_names) |name| @field(self, name).deinit(gpa);
+            deinitFields(self, gpa);
         }
 
         pub fn toGpu(self: Self, gpu: *Gpu) autograd.Error!Self {
-            var out: Self = undefined;
-            inline for (@typeInfo(Self).@"struct".field_names) |name| @field(out, name) = try @field(self, name).toGpu(gpu);
-            return out;
+            return toGpuFields(self, gpu);
         }
 
         pub fn forward(self: Self, tape: *Tape, x: anytype, h: anytype) autograd.Error!@TypeOf(h) {
@@ -295,23 +347,22 @@ pub fn LayerNorm(comptime c: usize) type {
         }
 
         pub fn deinit(self: Self, gpa: Allocator) void {
-            freeParam(self.gamma, gpa);
-            freeParam(self.beta, gpa);
+            deinitFields(self, gpa);
         }
 
         pub fn toGpu(self: Self, gpu: *Gpu) autograd.Error!Self {
-            return .{ .gamma = try paramToGpu(self.gamma, gpu), .beta = try paramToGpu(self.beta, gpu) };
+            return toGpuFields(self, gpu);
         }
         pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(@TypeOf(x.value)) {
             return tape.layerNorm(x, self.gamma, self.beta);
         }
 
-        pub fn params(self: Self) struct { Var(V), Var(V) } {
-            return .{ self.gamma, self.beta };
+        pub fn params(self: Self) DirectParams(Self) {
+            return directParams(self);
         }
 
-        pub fn state(self: Self) struct { []f32, []f32 } {
-            return .{ self.gamma.value.data, self.beta.value.data };
+        pub fn state(self: Self) DirectState(Self) {
+            return directState(self);
         }
     };
 }
@@ -332,22 +383,22 @@ pub fn Embedding(comptime vocab: usize, comptime width: usize) type {
         }
 
         pub fn deinit(self: Self, gpa: Allocator) void {
-            freeParam(self.table, gpa);
+            deinitFields(self, gpa);
         }
 
         pub fn toGpu(self: Self, gpu: *Gpu) autograd.Error!Self {
-            return .{ .table = try paramToGpu(self.table, gpu) };
+            return toGpuFields(self, gpu);
         }
         pub fn forward(self: Self, tape: *Tape, comptime n: usize, ids: []const u32, comptime Out: type) autograd.Error!Var(Tensor(Out, &.{ n, width })) {
             return tape.embedding(self.table, n, ids, Out);
         }
 
-        pub fn params(self: Self) struct { Var(W) } {
-            return .{self.table};
+        pub fn params(self: Self) DirectParams(Self) {
+            return directParams(self);
         }
 
-        pub fn state(self: Self) struct { []f32 } {
-            return .{self.table.value.data};
+        pub fn state(self: Self) DirectState(Self) {
+            return directState(self);
         }
     };
 }

@@ -372,7 +372,18 @@ pub fn normGradSums(par: kernels.Parallel, x: []const f32, dy: []const f32, p: n
     var partial: [parts][2 * norm.max_channels]f64 = undefined;
     var centre: [norm.max_channels]f64 = undefined;
     for (centre[0..c], p.mean) |*m, v| m.* = v;
-    const job: Pass = .{ .x = x.ptr, .other = dy.ptr, .mask = if (mask.len != 0) mask.ptr else dy.ptr, .centre = &centre, .inv_std = p.inv_std, .rows = x.len / c, .channels = c, .partial = &partial, .masked = mask.len != 0, .kind = .gradients };
+    const job: Pass = .{
+        .x = x.ptr,
+        .other = dy.ptr,
+        .mask = if (mask.len != 0) mask.ptr else dy.ptr,
+        .centre = &centre,
+        .inv_std = p.inv_std,
+        .rows = x.len / c,
+        .channels = c,
+        .partial = &partial,
+        .masked = mask.len != 0,
+        .kind = .gradients,
+    };
     var beta: [norm.max_channels]f64 = undefined;
     var gamma: [norm.max_channels]f64 = undefined;
     kernels.parallelFor(par, parts, 1, job, accumulate);

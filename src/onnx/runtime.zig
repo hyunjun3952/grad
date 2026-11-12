@@ -86,28 +86,28 @@ pub const Node = struct {
     outputs: []const []const u8 = &.{},
     attributes: []const Attribute = &.{},
 
-    fn int(self: Node, name: []const u8, default: i64) i64 {
+    pub fn int(self: Node, name: []const u8, default: i64) i64 {
         for (self.attributes) |a| {
             if (std.mem.eql(u8, a.name, name)) return a.int;
         }
         return default;
     }
 
-    fn float(self: Node, name: []const u8, default: f32) f32 {
+    pub fn float(self: Node, name: []const u8, default: f32) f32 {
         for (self.attributes) |a| {
             if (std.mem.eql(u8, a.name, name)) return a.float;
         }
         return default;
     }
 
-    fn text(self: Node, name: []const u8, default: []const u8) []const u8 {
+    pub fn text(self: Node, name: []const u8, default: []const u8) []const u8 {
         for (self.attributes) |a| {
             if (std.mem.eql(u8, a.name, name)) return a.text;
         }
         return default;
     }
 
-    fn ints(self: Node, name: []const u8) []const i64 {
+    pub fn ints(self: Node, name: []const u8) []const i64 {
         for (self.attributes) |a| {
             if (std.mem.eql(u8, a.name, name)) return a.ints;
         }
@@ -208,7 +208,7 @@ pub const Model = struct {
     }
 
     // Counts the users of a tensor name: every node input plus the graph outputs.
-    fn uses(self: *const Model, name: []const u8) usize {
+    pub fn uses(self: *const Model, name: []const u8) usize {
         var count: usize = 0;
         for (self.nodes) |node| {
             for (node.inputs) |arg| {
@@ -259,7 +259,7 @@ pub fn padsAreUniform(conv: Node) bool {
     return std.mem.allEqual(i64, pads, pads[0]);
 }
 
-fn isPermuted(node: Node, comptime perm: [4]i64) bool {
+pub fn isPermuted(node: Node, comptime perm: [4]i64) bool {
     if (!std.mem.eql(u8, node.op, "Transpose")) return false;
     return std.mem.eql(i64, node.ints("perm"), &perm);
 }
@@ -487,8 +487,35 @@ fn normalizeAxis(axis: i64, rank: usize) usize {
     return @intCast(if (axis < 0) axis + @as(i64, @intCast(rank)) else axis);
 }
 
-fn execute(a: Allocator, par: kernels.Parallel, node: Node, values: *std.StringHashMap(Array)) Error![]const Array {
-    const Kind = enum { Add, Sub, Mul, Div, Relu, Sigmoid, Tanh, Gelu, Sqrt, MatMul, Gemm, Conv, MaxPool, AveragePool, GlobalAveragePool, BatchNormalization, Flatten, Reshape, Transpose, Concat, Softmax, Identity, Dropout, Gather, LayerNormalization, Slice };
+pub fn execute(a: Allocator, par: kernels.Parallel, node: Node, values: *std.StringHashMap(Array)) Error![]const Array {
+    const Kind = enum {
+        Add,
+        Sub,
+        Mul,
+        Div,
+        Relu,
+        Sigmoid,
+        Tanh,
+        Gelu,
+        Sqrt,
+        MatMul,
+        Gemm,
+        Conv,
+        MaxPool,
+        AveragePool,
+        GlobalAveragePool,
+        BatchNormalization,
+        Flatten,
+        Reshape,
+        Transpose,
+        Concat,
+        Softmax,
+        Identity,
+        Dropout,
+        Gather,
+        LayerNormalization,
+        Slice,
+    };
     const kind = std.meta.stringToEnum(Kind, node.op) orelse return error.UnsupportedOp;
     const out = try a.alloc(Array, 1);
     out[0] = switch (kind) {
@@ -572,7 +599,7 @@ fn transposed2d(a: Allocator, x: Array) Error!Array {
     return out;
 }
 
-fn pair(list: []const i64, index: usize, default: usize) usize {
+pub fn pair(list: []const i64, index: usize, default: usize) usize {
     return if (index < list.len) @intCast(list[index]) else default;
 }
 
@@ -606,6 +633,38 @@ fn planarColumns(job: ColumnJob, lo: usize, hi: usize) void {
     }
 }
 
+const BiasLayout = enum { nchw, nhwc };
+
+fn addBias(par: kernels.Parallel, out: []f32, bias: []const f32, channels: usize, comptime layout: BiasLayout) void {
+    const BiasJob = struct {
+        out: []f32,
+        bias: []const f32,
+        channels: usize,
+        positions: usize,
+
+        fn run(job: @This(), lo: usize, hi: usize) void {
+            if (layout == .nchw) {
+                for (lo..hi) |channel| {
+                    for (job.out[channel * job.positions ..][0..job.positions]) |*v| v.* += job.bias[channel];
+                }
+                return;
+            }
+            var channel = lo % job.channels;
+            for (job.out[lo..hi]) |*v| {
+                v.* += job.bias[channel];
+                channel += 1;
+                if (channel == job.channels) channel = 0;
+            }
+        }
+    };
+    const positions = if (layout == .nchw) out.len / channels else 1;
+    const job = BiasJob{ .out = out, .bias = bias, .channels = channels, .positions = positions };
+    switch (layout) {
+        .nchw => kernels.parallelFor(par, channels, @max(1, 8192 / positions), job, BiasJob.run),
+        .nhwc => kernels.parallelFor(par, out.len, 1 << 14, job, BiasJob.run),
+    }
+}
+
 pub fn convolve(a: Allocator, par: kernels.Parallel, node: Node, x: Array, w: Array, bias: ?Array) Error!Array {
     if (x.dims.len != 4 or w.dims.len != 4) return error.UnsupportedOp;
     const n = x.dims[0];
@@ -636,19 +695,12 @@ pub fn convolve(a: Allocator, par: kernels.Parallel, node: Node, x: Array, w: Ar
         const col = try a.alloc(f32, taps * positions);
         const work = try a.alloc(f32, kernels.matmulTiledWorkLen(f32, .{}, par, m, taps, positions));
         const view: Window = .{ .c = c, .h = h, .w = width, .kh = kh, .kw = kw, .sy = sy, .sx = sx, .py = py, .px = px, .dy = dy, .dx = dx, .oh = oh, .ow = ow };
-        const BiasJob = struct { image: []f32, bias: []const f32, positions: usize };
         for (0..n) |b| {
             kernels.parallelFor(par, c, @max(1, 4096 / (kh * kw * positions)), ColumnJob{ .x = x.data[b * c * h * width ..], .col = col, .v = view }, planarColumns);
             const image = out.data[b * m * positions ..][0 .. m * positions];
             kernels.matmulTiled(f32, .{}, par, .{ .m = m, .k = taps, .n = positions, .a = w.data, .b = col, .out = image }, work);
             const extra = bias orelse continue;
-            kernels.parallelFor(par, m, @max(1, 8192 / positions), BiasJob{ .image = image, .bias = extra.data, .positions = positions }, struct {
-                fn run(job: BiasJob, lo: usize, hi: usize) void {
-                    for (lo..hi) |oc| {
-                        for (job.image[oc * job.positions ..][0..job.positions]) |*v| v.* += job.bias[oc];
-                    }
-                }
-            }.run);
+            addBias(par, image, extra.data, m, .nchw);
         }
         return out;
     }
@@ -695,7 +747,7 @@ pub fn convolve(a: Allocator, par: kernels.Parallel, node: Node, x: Array, w: Ar
 }
 
 // Rearranges OIHW filters to (kh * kw * c) x m, the (ky, kx, ic) tap order the chunked convolution multiplies.
-fn reorderOihw(a: Allocator, par: kernels.Parallel, w: Array) Error![]f32 {
+pub fn reorderOihw(a: Allocator, par: kernels.Parallel, w: Array) Error![]f32 {
     const m = w.dims[0];
     const c = w.dims[1];
     const khkw = w.dims[2] * w.dims[3];
@@ -743,19 +795,7 @@ pub fn convolveNhwc(a: Allocator, par: kernels.Parallel, node: Node, x: Array, w
     const wt = try reorderOihw(a, par, w);
     const d: cv.Dims = .{ .n = @intCast(n), .h = @intCast(h), .w = @intCast(width), .c = @intCast(c), .k = @intCast(k), .stride = @intCast(sy), .pad = @intCast(py), .dilation = @intCast(dy), .c_out = @intCast(m) };
     try cpu_ops.convForward(a, par, x.data, wt, out.data, d);
-    if (bias) |extra| {
-        const BiasJob = struct { out: []f32, bias: []const f32, filters: usize };
-        kernels.parallelFor(par, out.data.len, 1 << 14, BiasJob{ .out = out.data, .bias = extra.data, .filters = m }, struct {
-            fn run(job: BiasJob, lo: usize, hi: usize) void {
-                var j = lo % job.filters;
-                for (job.out[lo..hi]) |*v| {
-                    v.* += job.bias[j];
-                    j += 1;
-                    if (j == job.filters) j = 0;
-                }
-            }
-        }.run);
-    }
+    if (bias) |extra| addBias(par, out.data, extra.data, m, .nhwc);
     return out;
 }
 
@@ -840,7 +880,7 @@ fn batchNorm(a: Allocator, node: Node, x: Array, scale: Array, shift: Array, mea
     return out;
 }
 
-fn reshape(a: Allocator, x: Array, shape: Array) Error!Array {
+pub fn reshape(a: Allocator, x: Array, shape: Array) Error!Array {
     if (shape.ints.len == 0) return error.UnsupportedOp;
     const dims = try a.alloc(usize, shape.ints.len);
     var known: usize = 1;

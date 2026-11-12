@@ -866,7 +866,16 @@ export fn gather(images: [*]const f32, labels_src: [*]const u8, order: [*]const 
     const side = aug.side(args.pixels, args.channels);
     const from = if (box.contains(p, side, args.channels)) partner else r;
     const idx: usize = order[args.start + from];
-    const config: aug.Config = .{ .max_shift = args.max_shift, .max_angle = args.max_angle, .max_scale = args.max_scale, .flip = args.flip != 0, .mirror = args.mirror != 0, .cutout = args.cutout, .channels = args.channels, .seed = args.seed };
+    const config: aug.Config = .{
+        .max_shift = args.max_shift,
+        .max_angle = args.max_angle,
+        .max_scale = args.max_scale,
+        .flip = args.flip != 0,
+        .mirror = args.mirror != 0,
+        .cutout = args.cutout,
+        .channels = args.channels,
+        .seed = args.seed,
+    };
     const source = images + idx * args.pixels;
     batch[t] = if (config.active()) aug.pixel(source, p, side, args.channels, aug.transformOf(args.start + from, config)) else source[p];
     if (p == 0) {
@@ -1214,7 +1223,11 @@ fn GemmLoader(comptime kind: GemmKind) type {
                     const y = self.origin_y[i] + self.cursor_ky * dil;
                     const x = self.origin_x[i] + self.cursor_kx * dil;
                     const valid = self.origin_valid[i] and y >= 0 and y < @as(i32, @intCast(geometry.h)) and x >= 0 and x < @as(i32, @intCast(geometry.w));
-                    const at = if (valid) ((@as(usize, self.origin_n[i]) * geometry.h + @as(usize, @intCast(y))) * geometry.w + @as(usize, @intCast(x))) * channel_step + self.cursor_channel + self.chunk_a * lane_elems else 0;
+                    const at = if (valid)
+                        ((@as(usize, self.origin_n[i]) * geometry.h + @as(usize, @intCast(y))) * geometry.w +
+                            @as(usize, @intCast(x))) * channel_step + self.cursor_channel + self.chunk_a * lane_elems
+                    else
+                        0;
                     copyAsyncZfill(tc.sharedAddress(base + self.dst_a[i]), self.a + at, valid);
                 }
                 self.cursor_channel += tc.depth;
