@@ -274,14 +274,20 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
             // NOTE: on the CPU the shuffled order is read in place, so order_device aliases order.
             fn init(gpa: Allocator, par: kernels.Parallel, host: Dataset, device: Dataset) !Feed {
                 const order = try gpa.alloc(u32, host.count());
+                errdefer gpa.free(order);
+                const order_device = if (par.gpu) |dev| try dev.alloc(u32, order.len) else order;
+                const batch = try par.alloc(f32, gpa, batch_size * pixels);
+                errdefer par.free(gpa, batch);
+                const labels = try par.alloc(u8, gpa, batch_size);
+                errdefer par.free(gpa, labels);
                 return .{
                     .par = par,
                     .host = host,
                     .device = device,
                     .order = order,
-                    .order_device = if (par.gpu) |dev| try dev.alloc(u32, order.len) else order,
-                    .batch = .{ .data = try par.alloc(f32, gpa, batch_size * pixels) },
-                    .labels = try par.alloc(u8, gpa, batch_size),
+                    .order_device = order_device,
+                    .batch = .{ .data = batch },
+                    .labels = labels,
                     .other_labels = try par.alloc(u8, gpa, batch_size),
                 };
             }

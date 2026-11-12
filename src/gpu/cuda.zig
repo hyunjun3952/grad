@@ -20,6 +20,7 @@ const Api = struct {
     cuMemcpyHtoD_v2: *const fn (dst: DevicePtr, src: *const anyopaque, bytes: usize) callconv(.c) Status,
     cuMemcpyDtoH_v2: *const fn (dst: *anyopaque, src: DevicePtr, bytes: usize) callconv(.c) Status,
     cuModuleLoadData: *const fn (module: *Handle, image: *const anyopaque) callconv(.c) Status,
+    cuModuleUnload: *const fn (module: Handle) callconv(.c) Status,
     cuModuleGetFunction: *const fn (func: *Handle, module: Handle, name: [*:0]const u8) callconv(.c) Status,
     cuLaunchKernel: *const fn (
         f: Handle,
@@ -56,6 +57,8 @@ pub const Cuda = struct {
     graph_api: ?GraphApi,
     device: c_int,
     context: Handle,
+    // The module that loadModule returned, unloaded by close.
+    module: Handle = null,
     // The stream that launches go to: null (the default stream) normally, the capture stream while a graph is recorded.
     stream: Handle = null,
     capture_stream: Handle = null,
@@ -102,8 +105,12 @@ pub const Cuda = struct {
         try self.check(self.api.cuCtxSetCurrent(self.context));
     }
 
+    /// Destroys the capture stream, unloads the module and closes the driver library. Device memory must be freed before.
+    /// NOTE: the primary context stays retained on purpose. It is shared by every Gpu of the process, so keeping it alive spares
+    /// the later ones from creating it again; the module is per Gpu and would otherwise pile up inside that context.
     pub fn close(self: *Cuda) void {
         if (self.capture_stream != null) _ = self.graph_api.?.cuStreamDestroy_v2(self.capture_stream);
+        if (self.module != null) _ = self.api.cuModuleUnload(self.module);
         self.lib.close();
     }
 
@@ -172,13 +179,16 @@ pub const Cuda = struct {
         try self.check(self.api.cuMemcpyDtoH_v2(bytes.ptr, src, bytes.len));
     }
 
-    pub fn loadModule(self: *const Cuda, gpa: Allocator, ptx: []const u8) !Handle {
+    /// Loads the PTX image as the module of this Cuda, which close unloads. Call it once.
+    pub fn loadModule(self: *Cuda, gpa: Allocator, ptx: []const u8) !Handle {
+        std.debug.assert(self.module == null);
         const text = try gpa.alloc(u8, ptx.len + 1);
         defer gpa.free(text);
         @memcpy(text[0..ptx.len], ptx);
         text[ptx.len] = 0;
         var module: Handle = null;
         try self.check(self.api.cuModuleLoadData(&module, text.ptr));
+        self.module = module;
         return module;
     }
 
