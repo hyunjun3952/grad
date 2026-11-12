@@ -1229,24 +1229,6 @@ test "a convolution on bf16 activations agrees with the f32 convolution within b
     for (wide_dw, half_dw) |want, got| try testing.expectApproxEqAbs(want, got, 0.6 + 0.03 * @abs(want));
 }
 
-test "a gpu im2col convolution that rebuilds its column matrix in the backward pass gives the same outputs and gradients" {
-    const gpu = try gpu_mod.Gpu.forTest(32 << 20);
-    defer gpu.deinit();
-    var prng = std.Random.DefaultPrng.init(38);
-    const rng = prng.random();
-    var values: [2 * 8 * 8 * 64 + 576 * 32 + 2 * 8 * 8 * 32]f32 = undefined;
-    for (&values) |*v| v.* = rng.floatNorm(f32) * 0.3;
-    const x = values[0 .. 2 * 8 * 8 * 64];
-    const w = values[x.len..][0 .. 576 * 32];
-    const g = values[x.len + w.len ..];
-    var results: [2][2 * 8 * 8 * 32 + 2 * 8 * 8 * 64 + 576 * 32]f32 = undefined;
-    for (&results, [_]bool{ false, true }) |*r, recompute| {
-        gpu.recompute_columns = recompute;
-        try runConvChain(false, gpu, x, w, g, r[0..g.len], r[g.len..][0..x.len], r[g.len + x.len ..]);
-    }
-    try testing.expectEqualSlices(f32, &results[0], &results[1]);
-}
-
 test "softmax rows, with and without a causal mask, have correct values and gradients on the cpu and the gpu" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

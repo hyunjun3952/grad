@@ -60,7 +60,6 @@ const Options = struct {
     tensor_cores: bool = false,
     tf32: bool = false,
     deterministic: bool = false,
-    recompute: bool = false,
     progress: bool = false,
     mirrored: bool = false,
     cudnn_dir: ?[:0]const u8 = null,
@@ -93,8 +92,6 @@ const Options = struct {
                 o.progress = true;
             } else if (std.mem.eql(u8, arg, "--deterministic")) {
                 o.deterministic = true;
-            } else if (std.mem.eql(u8, arg, "--recompute")) {
-                o.recompute = true;
             } else if (std.mem.eql(u8, arg, "--tf32")) {
                 o.tf32 = true;
             } else if (std.mem.eql(u8, arg, "--tensor-cores")) {
@@ -377,7 +374,6 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
                 dev.tensor_cores = opts.tensor_cores;
                 dev.tf32 = opts.tf32;
                 dev.deterministic = opts.deterministic;
-                dev.recompute_columns = opts.recompute;
                 if (opts.cudnn_dir) |dir| dev.enableCudnn(dir) catch |err| if (index == 0) try out.print("cuDNN unavailable ({s}), using the built-in kernels\n", .{@errorName(err)});
             }
             // NOTE: replica threads must not share the CPU worker pool, which is a single global one.

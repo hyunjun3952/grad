@@ -845,9 +845,7 @@ pub const Tape = struct {
         const path: ConvPath = if (grouped_implicit) .grouped_implicit else if (dense_only) .grouped else if (dev == null) .direct else if (dev.?.cudnn_lib != null and !dilated) .cudnn else if (dev.?.tensorWorthwhile(rows, c_out, kc)) (if (unit_stride_blocks and c_out % 32 == 0) .implicit else .packed_im2col) else if (unit_stride_blocks and c_out % 16 == 0 and dev.?.f32ImplicitWorthwhile(rows, c_out, kc)) .f32_implicit else .direct;
 
         const value = try self.newTensor(Out);
-        // NOTE: the column matrix is k*k times the input. It is kept for the weight gradient unless recompute_columns is set;
-        // then it goes back to the arena right after the product and the backward pass rebuilds it. Keeping one per layer
-        // took 2.8 GiB at batch 128 in the strict f32 CIFAR network, and rebuilding made that epoch about 13% slower.
+        // NOTE: the column matrix is k*k times the input and is kept for the weight gradient.
         var col: []f32 = &.{};
         var col_half: Packed = .{ .data = &.{}, .rows_padded = 0, .cols_padded = 0 };
         var x_half: []const u16 = &.{};
@@ -861,21 +859,19 @@ pub const Tape = struct {
                     try cpu.convForward(self.gpa, self.par, x.value.data, w.value.data, value.data, d);
                 } else {
                     const g = dev.?;
-                    const mark = g.step_used;
                     const columns: Col = .{ .data = try g.scratch(f32, Col.len) };
                     try self.convKernel(.im2col, .{ x.value.data, columns.data }, d);
                     try tensor.matmulInto(self.gpa, self.par, columns, w.value, Flat{ .data = value.data }, .{});
-                    if (g.recompute_columns) g.step_used = mark else col = columns.data;
+                    col = columns.data;
                 }
             },
             .packed_im2col => {
                 if (dense_only) unreachable;
                 const g = dev.?;
-                const mark = g.step_used;
                 const columns = try g.im2colPacked(x.value.data, d);
                 const w_half = try g.packMatrix(w.value.data, kc, c_out, columns.cols_padded, aligned_out, false);
                 try g.matmulPacked(columns, w_half, value.data, .{ .m = rows, .n = c_out, .k = kc }, false, false);
-                if (g.recompute_columns) g.step_used = mark else col_half = columns;
+                col_half = columns;
             },
             .implicit => {
                 if (dense_only) unreachable;
@@ -937,11 +933,7 @@ pub const Tape = struct {
                             if (device == null) {
                                 try cpu.convWeightGrad(t.gpa, t.par, c.x.value.data, grad.data, c.w.grad.data, d);
                             } else {
-                                var columns: Col = .{ .data = c.col };
-                                if (c.col.len == 0) {
-                                    columns.data = try device.?.scratch(f32, Col.len);
-                                    try t.convKernel(.im2col, .{ c.x.value.data, columns.data }, d);
-                                }
+                                const columns: Col = .{ .data = c.col };
                                 try tensor.matmulInto(t.gpa, t.par, columns, grad, c.w.grad, .{ .trans_a = true, .accumulate = true });
                             }
                         }
@@ -957,7 +949,7 @@ pub const Tape = struct {
                             try t.convKernel(.col2imHalf, .{ dcol_half, c.x.grad.data }, d);
                         }
                         if (c.w.needs_grad) {
-                            const columns = if (c.col_half.data.len != 0) c.col_half else try g.im2colPacked(c.x.value.data, d);
+                            const columns = c.col_half;
                             const grad_t = try g.packMatrix(grad.data, c_out, rows, std.mem.alignForward(usize, c_out, 128), columns.rows_padded, true);
                             try g.matmulPacked(grad_t, columns, c.w.grad.data, .{ .m = c_out, .n = kc, .k = rows }, true, true);
                         }

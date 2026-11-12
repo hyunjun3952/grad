@@ -226,8 +226,6 @@ pub const Gpu = struct {
     tf32: bool = false,
     tensor_core_min_work: usize = 1 << 22,
     deterministic: bool = false,
-    // Trades time for memory: im2col convolutions rebuild their column matrix in the backward pass instead of keeping it.
-    recompute_columns: bool = false,
     gpa: Allocator,
     cu: cuda.Cuda,
     fns: [kernel_count]cuda.Handle,
@@ -268,7 +266,6 @@ pub const Gpu = struct {
         self.tf32 = false;
         self.tensor_core_min_work = 1 << 22;
         self.deterministic = false;
-        self.recompute_columns = false;
         self.owned = .empty;
         self.cudnn_lib = null;
         self.cudnn_plans = .empty;
