@@ -116,15 +116,12 @@ var spawned: usize = 0;
 
 pub fn flushDenormals() void {
     if (comptime @import("builtin").cpu.arch != .x86_64) return;
-    var csr: u32 = 0;
-    asm volatile ("stmxcsr (%[p])"
+    var csr: u32 = undefined;
+    // One output operand on purpose: input "m" constraints are miscompiled, so the whole read-modify-write
+    // of MXCSR stays inside a single asm block. 0x8040 is FZ | DAZ.
+    asm volatile ("stmxcsr %[m]\n\torl $0x8040, %[m]\n\tldmxcsr %[m]"
+        : [m] "=m" (csr),
         :
-        : [p] "r" (&csr),
-        : .{ .memory = true });
-    csr |= 0x8040;
-    asm volatile ("ldmxcsr (%[p])"
-        :
-        : [p] "r" (&csr),
         : .{ .memory = true });
 }
 

@@ -56,7 +56,8 @@ fn expectSameResult(comptime T: type, par: Parallel, m: usize, k: usize, n: usiz
         for (0..n) |j| bt[j * k + p] = b[p * n + j];
     }
 
-    const small: TileConfig = .{ .mr = 4, .nv = 2, .mc = 8, .kc = 5, .nc = 16 };
+    // nc must be a multiple of nv * lanes on any host: f32 lanes reach 16 on AVX-512 machines.
+    const small: TileConfig = .{ .mr = 4, .nv = 2, .mc = 8, .kc = 5, .nc = 4 * (std.simd.suggestVectorLength(f32) orelse 1) };
     const work_small = try gpa.alloc(T, matmulTiledWorkLen(T, small, par, m, k, n));
     defer gpa.free(work_small);
     try expectTiledCombos(T, small, par, problem, .{ at, bt }, want, work_small);
