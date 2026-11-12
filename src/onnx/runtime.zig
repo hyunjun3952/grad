@@ -3,6 +3,8 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 const kernels = @import("../cpu/kernels.zig");
+const cpu_ops = @import("../cpu/ops.zig");
+const cv = @import("../gpu/math/conv.zig");
 
 pub const Error = error{ BadModel, UnsupportedOp, MissingInput, ShapeMismatch } || Allocator.Error;
 
@@ -78,34 +80,34 @@ const Attribute = struct {
     ints: []const i64 = &.{},
 };
 
-const Node = struct {
+pub const Node = struct {
     op: []const u8 = "",
     inputs: []const []const u8 = &.{},
     outputs: []const []const u8 = &.{},
     attributes: []const Attribute = &.{},
 
-    fn int(self: Node, name: []const u8, default: i64) i64 {
+    pub fn int(self: Node, name: []const u8, default: i64) i64 {
         for (self.attributes) |a| {
             if (std.mem.eql(u8, a.name, name)) return a.int;
         }
         return default;
     }
 
-    fn float(self: Node, name: []const u8, default: f32) f32 {
+    pub fn float(self: Node, name: []const u8, default: f32) f32 {
         for (self.attributes) |a| {
             if (std.mem.eql(u8, a.name, name)) return a.float;
         }
         return default;
     }
 
-    fn text(self: Node, name: []const u8, default: []const u8) []const u8 {
+    pub fn text(self: Node, name: []const u8, default: []const u8) []const u8 {
         for (self.attributes) |a| {
             if (std.mem.eql(u8, a.name, name)) return a.text;
         }
         return default;
     }
 
-    fn ints(self: Node, name: []const u8) []const i64 {
+    pub fn ints(self: Node, name: []const u8) []const i64 {
         for (self.attributes) |a| {
             if (std.mem.eql(u8, a.name, name)) return a.ints;
         }
@@ -186,18 +188,81 @@ pub const Model = struct {
         for (self.inputs) |name| {
             if (!values.contains(name)) return error.MissingInput;
         }
-        for (self.nodes) |node| {
+        var at: usize = 0;
+        while (at < self.nodes.len) {
+            if (try self.fusedConv(a, par, &values, at)) |used| {
+                at += used;
+                continue;
+            }
+            const node = self.nodes[at];
             const outputs = try execute(a, par, node, &values);
             for (node.outputs, 0..) |name, i| {
                 if (i < outputs.len) try values.put(name, outputs[i]);
             }
+            at += 1;
         }
         const outputs = try a.alloc(Array, self.outputs.len);
         for (self.outputs, outputs) |name, *slot| slot.* = values.get(name) orelse return error.BadModel;
         result.outputs = outputs;
         return result;
     }
+
+    // Counts the users of a tensor name: every node input plus the graph outputs.
+    pub fn uses(self: *const Model, name: []const u8) usize {
+        var count: usize = 0;
+        for (self.nodes) |node| {
+            for (node.inputs) |arg| {
+                if (std.mem.eql(u8, arg, name)) count += 1;
+            }
+        }
+        for (self.outputs) |output| {
+            if (std.mem.eql(u8, output, name)) count += 1;
+        }
+        return count;
+    }
+
+    // Runs the exporter's Transpose-Conv-Transpose wrapper as one NHWC convolution when the pattern is exact and the
+    // wrapped tensors have no other users; returns the number of nodes consumed, or null when the pattern does not
+    // match so the caller falls back to executing the nodes one by one.
+    fn fusedConv(self: *const Model, a: Allocator, par: kernels.Parallel, values: *std.StringHashMap(Array), at: usize) Error!?usize {
+        if (at + 3 > self.nodes.len) return null;
+        const lead = self.nodes[at];
+        const conv = self.nodes[at + 1];
+        const trail = self.nodes[at + 2];
+        if (!isPermuted(lead, .{ 0, 3, 1, 2 }) or !isPermuted(trail, .{ 0, 2, 3, 1 })) return null;
+        if (!std.mem.eql(u8, conv.op, "Conv") or conv.int("group", 1) != 1) return null;
+        if (lead.outputs.len != 1 or conv.outputs.len != 1 or trail.inputs.len != 1) return null;
+        if (!std.mem.eql(u8, trail.inputs[0], conv.outputs[0])) return null;
+        // Fusing skips the wrapped tensors entirely, so a second user would silently read a missing value.
+        if (self.uses(lead.outputs[0]) != 1 or self.uses(conv.outputs[0]) != 1) return null;
+        const weights = try input(values, conv, 1);
+        // The NHWC convolution handles square windows only; anything else keeps the transpose path.
+        if (weights.dims.len != 4 or weights.dims[2] != weights.dims[3]) return null;
+        if (pair(conv.ints("strides"), 0, 1) != pair(conv.ints("strides"), 1, 1)) return null;
+        if (!padsAreUniform(conv)) return null;
+        if (pair(conv.ints("dilations"), 0, 1) != pair(conv.ints("dilations"), 1, 1)) return null;
+        const x = try input(values, lead, 0);
+        const out = try convolveNhwc(a, par, conv, x, weights, maybeInput(values, conv, 2));
+        try values.put(trail.outputs[0], out);
+        return 3;
+    }
 };
+
+/// Returns true when a convolution node pads all four sides by the same amount and has no auto_pad rule.
+/// NOTE: the NHWC kernel pads every side alike, so asymmetric pads and any auto_pad other than NOTSET must keep the transpose path.
+pub fn padsAreUniform(conv: Node) bool {
+    const auto_pad = conv.text("auto_pad", "NOTSET");
+    if (auto_pad.len != 0 and !std.mem.eql(u8, auto_pad, "NOTSET")) return false;
+    const pads = conv.ints("pads");
+    if (pads.len == 0) return true;
+    if (pads.len != 4) return false;
+    return std.mem.allEqual(i64, pads, pads[0]);
+}
+
+pub fn isPermuted(node: Node, comptime perm: [4]i64) bool {
+    if (!std.mem.eql(u8, node.op, "Transpose")) return false;
+    return std.mem.eql(i64, node.ints("perm"), &perm);
+}
 
 fn parseNode(a: Allocator, bytes: []const u8) Error!Node {
     var node: Node = .{};
@@ -422,8 +487,35 @@ fn normalizeAxis(axis: i64, rank: usize) usize {
     return @intCast(if (axis < 0) axis + @as(i64, @intCast(rank)) else axis);
 }
 
-fn execute(a: Allocator, par: kernels.Parallel, node: Node, values: *std.StringHashMap(Array)) Error![]const Array {
-    const Kind = enum { Add, Sub, Mul, Div, Relu, Sigmoid, Tanh, Gelu, Sqrt, MatMul, Gemm, Conv, MaxPool, AveragePool, GlobalAveragePool, BatchNormalization, Flatten, Reshape, Transpose, Concat, Softmax, Identity, Dropout, Gather, LayerNormalization, Slice };
+pub fn execute(a: Allocator, par: kernels.Parallel, node: Node, values: *std.StringHashMap(Array)) Error![]const Array {
+    const Kind = enum {
+        Add,
+        Sub,
+        Mul,
+        Div,
+        Relu,
+        Sigmoid,
+        Tanh,
+        Gelu,
+        Sqrt,
+        MatMul,
+        Gemm,
+        Conv,
+        MaxPool,
+        AveragePool,
+        GlobalAveragePool,
+        BatchNormalization,
+        Flatten,
+        Reshape,
+        Transpose,
+        Concat,
+        Softmax,
+        Identity,
+        Dropout,
+        Gather,
+        LayerNormalization,
+        Slice,
+    };
     const kind = std.meta.stringToEnum(Kind, node.op) orelse return error.UnsupportedOp;
     const out = try a.alloc(Array, 1);
     out[0] = switch (kind) {
@@ -507,7 +599,7 @@ fn transposed2d(a: Allocator, x: Array) Error!Array {
     return out;
 }
 
-fn pair(list: []const i64, index: usize, default: usize) usize {
+pub fn pair(list: []const i64, index: usize, default: usize) usize {
     return if (index < list.len) @intCast(list[index]) else default;
 }
 
@@ -541,6 +633,38 @@ fn planarColumns(job: ColumnJob, lo: usize, hi: usize) void {
     }
 }
 
+const BiasLayout = enum { nchw, nhwc };
+
+fn addBias(par: kernels.Parallel, out: []f32, bias: []const f32, channels: usize, comptime layout: BiasLayout) void {
+    const BiasJob = struct {
+        out: []f32,
+        bias: []const f32,
+        channels: usize,
+        positions: usize,
+
+        fn run(job: @This(), lo: usize, hi: usize) void {
+            if (layout == .nchw) {
+                for (lo..hi) |channel| {
+                    for (job.out[channel * job.positions ..][0..job.positions]) |*v| v.* += job.bias[channel];
+                }
+                return;
+            }
+            var channel = lo % job.channels;
+            for (job.out[lo..hi]) |*v| {
+                v.* += job.bias[channel];
+                channel += 1;
+                if (channel == job.channels) channel = 0;
+            }
+        }
+    };
+    const positions = if (layout == .nchw) out.len / channels else 1;
+    const job = BiasJob{ .out = out, .bias = bias, .channels = channels, .positions = positions };
+    switch (layout) {
+        .nchw => kernels.parallelFor(par, channels, @max(1, 8192 / positions), job, BiasJob.run),
+        .nhwc => kernels.parallelFor(par, out.len, 1 << 14, job, BiasJob.run),
+    }
+}
+
 pub fn convolve(a: Allocator, par: kernels.Parallel, node: Node, x: Array, w: Array, bias: ?Array) Error!Array {
     if (x.dims.len != 4 or w.dims.len != 4) return error.UnsupportedOp;
     const n = x.dims[0];
@@ -571,19 +695,12 @@ pub fn convolve(a: Allocator, par: kernels.Parallel, node: Node, x: Array, w: Ar
         const col = try a.alloc(f32, taps * positions);
         const work = try a.alloc(f32, kernels.matmulTiledWorkLen(f32, .{}, par, m, taps, positions));
         const view: Window = .{ .c = c, .h = h, .w = width, .kh = kh, .kw = kw, .sy = sy, .sx = sx, .py = py, .px = px, .dy = dy, .dx = dx, .oh = oh, .ow = ow };
-        const BiasJob = struct { image: []f32, bias: []const f32, positions: usize };
         for (0..n) |b| {
             kernels.parallelFor(par, c, @max(1, 4096 / (kh * kw * positions)), ColumnJob{ .x = x.data[b * c * h * width ..], .col = col, .v = view }, planarColumns);
             const image = out.data[b * m * positions ..][0 .. m * positions];
             kernels.matmulTiled(f32, .{}, par, .{ .m = m, .k = taps, .n = positions, .a = w.data, .b = col, .out = image }, work);
             const extra = bias orelse continue;
-            kernels.parallelFor(par, m, @max(1, 8192 / positions), BiasJob{ .image = image, .bias = extra.data, .positions = positions }, struct {
-                fn run(job: BiasJob, lo: usize, hi: usize) void {
-                    for (lo..hi) |oc| {
-                        for (job.image[oc * job.positions ..][0..job.positions]) |*v| v.* += job.bias[oc];
-                    }
-                }
-            }.run);
+            addBias(par, image, extra.data, m, .nchw);
         }
         return out;
     }
@@ -626,6 +743,59 @@ pub fn convolve(a: Allocator, par: kernels.Parallel, node: Node, x: Array, w: Ar
         }
     }.run;
     kernels.parallelFor(par, n * m * oh, 8, job, body);
+    return out;
+}
+
+// Rearranges OIHW filters to (kh * kw * c) x m, the (ky, kx, ic) tap order the chunked convolution multiplies.
+pub fn reorderOihw(a: Allocator, par: kernels.Parallel, w: Array) Error![]f32 {
+    const m = w.dims[0];
+    const c = w.dims[1];
+    const khkw = w.dims[2] * w.dims[3];
+    const wt = try a.alloc(f32, w.len());
+    const Job = struct { w: []const f32, wt: []f32, c: usize, khkw: usize, m: usize };
+    kernels.parallelFor(par, c * khkw, 1, Job{ .w = w.data, .wt = wt, .c = c, .khkw = khkw, .m = m }, struct {
+        fn run(job: Job, lo: usize, hi: usize) void {
+            for (lo..hi) |item| {
+                const tap = item / job.c;
+                const ic = item % job.c;
+                const dst = job.wt[item * job.m ..][0..job.m];
+                for (dst, 0..) |*v, oc| v.* = job.w[(oc * job.c + ic) * job.khkw + tap];
+            }
+        }
+    }.run);
+    return wt;
+}
+
+/// Runs one group-free convolution directly on NHWC activations, the layout the exported graph keeps between the
+/// layout transposes; the chunked convolution builds im2col a cache-sized piece at a time and the output is already
+/// NHWC, so no transpose ever runs. Square kernels, strides, pads and dilations only, and grouped convolutions
+/// take the NCHW path instead.
+pub fn convolveNhwc(a: Allocator, par: kernels.Parallel, node: Node, x: Array, w: Array, bias: ?Array) Error!Array {
+    if (x.dims.len != 4 or w.dims.len != 4) return error.UnsupportedOp;
+    if (node.int("group", 1) != 1) return error.UnsupportedOp;
+    const n = x.dims[0];
+    const h = x.dims[1];
+    const width = x.dims[2];
+    const c = x.dims[3];
+    const m = w.dims[0];
+    const k = w.dims[2];
+    if (w.dims[3] != k or w.dims[1] != c) return error.ShapeMismatch;
+    const sy = pair(node.ints("strides"), 0, 1);
+    const sx = pair(node.ints("strides"), 1, 1);
+    const py = pair(node.ints("pads"), 0, 0);
+    const px = pair(node.ints("pads"), 1, 0);
+    const dy = pair(node.ints("dilations"), 0, 1);
+    const dx = pair(node.ints("dilations"), 1, 1);
+    if (sx != sy or px != py or dx != dy) return error.UnsupportedOp;
+    // The dilated window must fit the padded input, otherwise the unsigned output size below would underflow.
+    if (dy * (k - 1) + 1 > h + 2 * py or dx * (k - 1) + 1 > width + 2 * px) return error.ShapeMismatch;
+    const oh = (h + 2 * py - dy * (k - 1) - 1) / sy + 1;
+    const ow = (width + 2 * px - dx * (k - 1) - 1) / sx + 1;
+    const out = try make(a, &.{ n, oh, ow, m });
+    const wt = try reorderOihw(a, par, w);
+    const d: cv.Dims = .{ .n = @intCast(n), .h = @intCast(h), .w = @intCast(width), .c = @intCast(c), .k = @intCast(k), .stride = @intCast(sy), .pad = @intCast(py), .dilation = @intCast(dy), .c_out = @intCast(m) };
+    try cpu_ops.convForward(a, par, x.data, wt, out.data, d);
+    if (bias) |extra| addBias(par, out.data, extra.data, m, .nhwc);
     return out;
 }
 
@@ -710,7 +880,7 @@ fn batchNorm(a: Allocator, node: Node, x: Array, scale: Array, shift: Array, mea
     return out;
 }
 
-fn reshape(a: Allocator, x: Array, shape: Array) Error!Array {
+pub fn reshape(a: Allocator, x: Array, shape: Array) Error!Array {
     if (shape.ints.len == 0) return error.UnsupportedOp;
     const dims = try a.alloc(usize, shape.ints.len);
     var known: usize = 1;

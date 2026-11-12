@@ -222,6 +222,9 @@ comptime {
     exportGemm("sgemmSmallNN", 32, 32, false, false);
     exportGemm("sgemmSmallNT", 32, 32, false, true);
     exportGemm("sgemmSmallTN", 32, 32, true, false);
+    exportGemm("sgemmMidNN", 128, 64, false, false);
+    exportGemm("sgemmMidNT", 128, 64, false, true);
+    exportGemm("sgemmMidTN", 128, 64, true, false);
 }
 // ***** elementwise and reductions *****
 
@@ -863,7 +866,16 @@ export fn gather(images: [*]const f32, labels_src: [*]const u8, order: [*]const 
     const side = aug.side(args.pixels, args.channels);
     const from = if (box.contains(p, side, args.channels)) partner else r;
     const idx: usize = order[args.start + from];
-    const config: aug.Config = .{ .max_shift = args.max_shift, .max_angle = args.max_angle, .max_scale = args.max_scale, .flip = args.flip != 0, .mirror = args.mirror != 0, .cutout = args.cutout, .channels = args.channels, .seed = args.seed };
+    const config: aug.Config = .{
+        .max_shift = args.max_shift,
+        .max_angle = args.max_angle,
+        .max_scale = args.max_scale,
+        .flip = args.flip != 0,
+        .mirror = args.mirror != 0,
+        .cutout = args.cutout,
+        .channels = args.channels,
+        .seed = args.seed,
+    };
     const source = images + idx * args.pixels;
     batch[t] = if (config.active()) aug.pixel(source, p, side, args.channels, aug.transformOf(args.start + from, config)) else source[p];
     if (p == 0) {
@@ -1068,6 +1080,9 @@ const Block = struct { tid: usize, row0: usize, col0: usize, k_begin: usize };
 // Chooses a tensor core GEMM at compile time: bf16 or TF32 inputs, the block tile size and the operand mode.
 const GemmKind = struct {
     tf32: bool = false,
+    // With tf32 set: multiply in full f32 on the CUDA cores instead of rounding to TF32 for the tensor cores. The tile, the
+    // gathers and the pipeline are the same, so a strict f32 convolution needs no im2col matrix either.
+    exact: bool = false,
     rows: usize = 128,
     cols: usize = 64,
     mode: GemmMode,
@@ -1199,12 +1214,20 @@ fn GemmLoader(comptime kind: GemmKind) type {
         inline fn issue(self: *@This(), stage: usize, kk: usize) void {
             const base = stage * tc.stage_elems;
             const geometry = self.geo;
+            // NOTE: the taps of a dilated convolution sit dilation apart, and a grouped launch reads its channels out of a
+            // tensor whose rows hold all the groups, so the memory stride differs from the logical channel count.
+            const dil: i32 = @intCast(geometry.dilation);
+            const channel_step = if (geometry.c_step != 0) geometry.c_step else geometry.c;
             if (mode == .gather_a) {
                 inline for (0..a_per) |i| {
-                    const y = self.origin_y[i] + self.cursor_ky;
-                    const x = self.origin_x[i] + self.cursor_kx;
+                    const y = self.origin_y[i] + self.cursor_ky * dil;
+                    const x = self.origin_x[i] + self.cursor_kx * dil;
                     const valid = self.origin_valid[i] and y >= 0 and y < @as(i32, @intCast(geometry.h)) and x >= 0 and x < @as(i32, @intCast(geometry.w));
-                    const at = if (valid) ((@as(usize, self.origin_n[i]) * geometry.h + @as(usize, @intCast(y))) * geometry.w + @as(usize, @intCast(x))) * geometry.c + self.cursor_channel + self.chunk_a * lane_elems else 0;
+                    const at = if (valid)
+                        ((@as(usize, self.origin_n[i]) * geometry.h + @as(usize, @intCast(y))) * geometry.w +
+                            @as(usize, @intCast(x))) * channel_step + self.cursor_channel + self.chunk_a * lane_elems
+                    else
+                        0;
                     copyAsyncZfill(tc.sharedAddress(base + self.dst_a[i]), self.a + at, valid);
                 }
                 self.cursor_channel += tc.depth;
@@ -1233,10 +1256,10 @@ fn GemmLoader(comptime kind: GemmKind) type {
             inline for (0..b_per) |j| {
                 const col = self.first_col + self.chunk_b[j] * lane_elems;
                 if (mode == .gather_b) {
-                    const y = @as(i32, @intCast(self.p_y[j] * geometry.stride)) + self.tap_ky[j] - @as(i32, @intCast(geometry.pad));
-                    const x = @as(i32, @intCast(self.p_x[j] * geometry.stride)) + self.tap_kx[j] - @as(i32, @intCast(geometry.pad));
+                    const y = @as(i32, @intCast(self.p_y[j] * geometry.stride)) + self.tap_ky[j] * dil - @as(i32, @intCast(geometry.pad));
+                    const x = @as(i32, @intCast(self.p_x[j] * geometry.stride)) + self.tap_kx[j] * dil - @as(i32, @intCast(geometry.pad));
                     const valid = self.p[j] < geometry.positions and y >= 0 and y < @as(i32, @intCast(geometry.h)) and x >= 0 and x < @as(i32, @intCast(geometry.w));
-                    const at = if (valid) ((@as(usize, self.p_n[j]) * geometry.h + @as(usize, @intCast(y))) * geometry.w + @as(usize, @intCast(x))) * geometry.c + self.tap_channel[j] else 0;
+                    const at = if (valid) ((@as(usize, self.p_n[j]) * geometry.h + @as(usize, @intCast(y))) * geometry.w + @as(usize, @intCast(x))) * channel_step + self.tap_channel[j] else 0;
                     copyAsyncZfill(tc.sharedAddress(base + self.dst_b[j]), self.b + at, valid);
                     // NOTE: issue is called for consecutive tiles of K, so the position moves by exactly depth each time.
                     self.p[j] += tc.depth;
@@ -1275,7 +1298,7 @@ inline fn pipeline(comptime kind: GemmKind, loader: anytype, block: Block, tiles
         if (ahead < tiles) loader.issue(ahead % tc.stages, block.k_begin + ahead * tc.depth);
         commitCopies();
         const base = (tile % tc.stages) * tc.stage_elems;
-        if (kind.tf32) tf32Compute(tc, warp, base, acc) else bf16Compute(tc, kind.transposedA(), warp, base, acc);
+        if (kind.exact) f32Compute(tc, warp, base, acc) else if (kind.tf32) tf32Compute(tc, warp, base, acc) else bf16Compute(tc, kind.transposedA(), warp, base, acc);
     }
 }
 
@@ -1290,7 +1313,10 @@ inline fn storeTile(comptime kind: GemmKind, c: [*]f32, acc: *const Acc, shape: 
                 const r = block.row0 + warp.row * tc.warp_m + mi * 16 + warp.lane / 4 + (q / 2) * 8;
                 const col = block.col0 + warp.col * 32 + ni * 8 + (warp.lane % 4) * 2 + q % 2;
                 if (r < shape.m and col < shape.n) {
-                    const at = if (shape.transpose_out != 0) col * shape.m + r else r * shape.n + col;
+                    // NOTE: a grouped launch stores its slice of C with c_pitch as the row stride and c_offset as the column
+                    // base; both are zero for a dense product.
+                    const pitch = if (shape.c_pitch != 0) shape.c_pitch else if (shape.transpose_out != 0) shape.m else shape.n;
+                    const at = (if (shape.transpose_out != 0) col * pitch + r else r * pitch + col) + shape.c_offset;
                     if (half_output and shape.output_half != 0) {
                         const half_out: [*]u16 = @ptrCast(@alignCast(c));
                         half_out[at] = bf16.encode((if (shape.accumulate != 0) bf16.decode(half_out[at]) else 0) + acc[mi][ni][q]);
@@ -1341,6 +1367,29 @@ inline fn bf16Compute(comptime tc: type, comptime a_transposed: bool, warp: Warp
             inline for (0..tc.warp_m / 16) |mi| {
                 tc.mma(&acc[mi][pair * 2], a_frag[mi], .{ frag[0], frag[1] });
                 tc.mma(&acc[mi][pair * 2 + 1], a_frag[mi], .{ frag[2], frag[3] });
+            }
+        }
+    }
+}
+
+// Strict f32 on the CUDA cores, for the elements that the mma fragments of tf32Compute would hold: a thread owns rows r and r + 8 of
+// every 16-row group and two neighbouring columns of every group of eight, so storeTile needs no second layout.
+inline fn f32Compute(comptime tc: type, warp: Warp, base: usize, acc: *Acc) void {
+    inline for (0..tc.depth) |k| {
+        var a: [tc.warp_m / 16][2]f32 = undefined;
+        inline for (0..tc.warp_m / 16) |mi| {
+            const r = warp.row * tc.warp_m + mi * 16 + warp.lane / 4;
+            a[mi] = .{ tc.smem[base + r * tc.a_pitch + k], tc.smem[base + (r + 8) * tc.a_pitch + k] };
+        }
+        inline for (0..4) |ni| {
+            const n = warp.col * 32 + ni * 8 + (warp.lane % 4) * 2;
+            const b0 = tc.smem[base + tc.a_elems + k * tc.b_pitch + n];
+            const b1 = tc.smem[base + tc.a_elems + k * tc.b_pitch + n + 1];
+            inline for (0..tc.warp_m / 16) |mi| {
+                acc[mi][ni][0] = @mulAdd(f32, a[mi][0], b0, acc[mi][ni][0]);
+                acc[mi][ni][1] = @mulAdd(f32, a[mi][0], b1, acc[mi][ni][1]);
+                acc[mi][ni][2] = @mulAdd(f32, a[mi][1], b0, acc[mi][ni][2]);
+                acc[mi][ni][3] = @mulAdd(f32, a[mi][1], b1, acc[mi][ni][3]);
             }
         }
     }
@@ -1433,7 +1482,9 @@ fn Tf32Tile(comptime tile_rows: usize, comptime tile_cols: usize) type {
         const cols = tile_cols;
         const warp_m = rows * cols / 256;
         const depth = 16;
-        const stages = 3;
+        // NOTE: an f32 tile is twice the bytes of its bf16 twin, so the 128 x 128 tile drops to two stages to stay under the
+        // 48 KiB of static shared memory; the smaller tiles keep the three-stage pipeline.
+        const stages = if (tile_rows * tile_cols > 128 * 64) 2 else 3;
         const a_pitch = depth + 4;
         const b_pitch = cols + 8;
         const a_elems = rows * a_pitch;
@@ -1495,6 +1546,26 @@ export fn convTf32WeightGradShort(dy_t: [*]const f32, x: [*]const f32, c: [*]f32
     tileGemm(.{ .tf32 = true, .rows = 64, .cols = 128, .mode = .gather_b }, dy_t, x, c, shape, geo);
 }
 
+export fn convExactForward(x: [*]const f32, w: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
+    tileGemm(.{ .tf32 = true, .exact = true, .mode = .gather_a }, x, w, c, shape, geo);
+}
+
+export fn convExactForwardWide(x: [*]const f32, w: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
+    tileGemm(.{ .tf32 = true, .exact = true, .rows = 128, .cols = 128, .mode = .gather_a }, x, w, c, shape, geo);
+}
+
+export fn convExactWeightGradWide(dy_t: [*]const f32, x: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
+    tileGemm(.{ .tf32 = true, .exact = true, .rows = 128, .cols = 128, .mode = .gather_b }, dy_t, x, c, shape, geo);
+}
+
+export fn convExactWeightGrad(dy_t: [*]const f32, x: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
+    tileGemm(.{ .tf32 = true, .exact = true, .mode = .gather_b }, dy_t, x, c, shape, geo);
+}
+
+export fn convExactWeightGradShort(dy_t: [*]const f32, x: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
+    tileGemm(.{ .tf32 = true, .exact = true, .rows = 64, .cols = 128, .mode = .gather_b }, dy_t, x, c, shape, geo);
+}
+
 export fn rotateWeightsF32(src: [*]const f32, dst: [*]f32, args: ga.RotateArgs) callconv(.nvptx_kernel) void {
     const t = globalIndex();
     if (t >= @as(usize, args.rows_padded) * args.cols_padded) return;
@@ -1503,7 +1574,8 @@ export fn rotateWeightsF32(src: [*]const f32, dst: [*]f32, args: ga.RotateArgs) 
     const tap = i / args.c_out;
     const co = i % args.c_out;
     const source_tap = (args.k - 1 - tap / args.k) * args.k + (args.k - 1 - tap % args.k);
-    dst[t] = if (j < args.c_in) src[(source_tap * args.c_in + j) * args.c_out + co] else 0;
+    const pitch = if (args.src_pitch != 0) args.src_pitch else args.c_out;
+    dst[t] = if (j < args.c_in) src[args.src_offset + (source_tap * args.c_in + j) * pitch + co] else 0;
 }
 
 export fn transposeF32(src: [*]const f32, dst: [*]f32, args: ga.PackArgs) callconv(.nvptx_kernel) void {

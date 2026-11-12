@@ -95,6 +95,8 @@ const Builder = struct {
     values: std.AutoHashMap(usize, Known),
     emitted: std.AutoHashMap(usize, []const u8),
     outputs: []const View,
+    // The batch size the graph was traced with when the leading axis is exported as dynamic, else zero.
+    batch: usize = 0,
     // The output id of a batch norm whose scale and shift went into the convolution before it (zero for none).
     folded_norm: usize = 0,
     counter: usize = 0,
@@ -127,10 +129,12 @@ const Builder = struct {
         return name;
     }
 
-    fn shapeConstant(self: *Builder, dims: []const usize) ![]const u8 {
+    // leading_dynamic writes -1 for the first axis, which Reshape then infers from the input.
+    fn shapeConstant(self: *Builder, dims: []const usize, leading_dynamic: bool) ![]const u8 {
         const name = try self.fresh("shape");
         var values: [trace_mod.max_rank]i64 = undefined;
         for (dims, 0..) |d, i| values[i] = @intCast(d);
+        if (leading_dynamic) values[0] = -1;
         try self.tensor(name, &.{dims.len}, int64_type, std.mem.sliceAsBytes(values[0..dims.len]));
         return name;
     }
@@ -177,7 +181,12 @@ const Builder = struct {
         if (self.values.get(view.id)) |known| {
             if (std.mem.eql(usize, known.view.shape(), view.shape())) return known.name;
             const name = try self.fresh("reshaped");
-            try self.node("Reshape", &.{ known.name, try self.shapeConstant(view.shape()) }, name, &.{});
+            // NOTE: a reshape whose first axis is the batch or a multiple of it (batch * height * width after a flatten) on both
+            // sides stays valid for any batch size with -1 there. A tensor that does not scale with the batch gets the same
+            // value back from the inference, so a coincidental multiple is harmless.
+            const dims = view.shape();
+            const keeps_batch = self.batch != 0 and dims.len > 0 and known.view.shape().len > 0 and dims[0] % self.batch == 0 and known.view.shape()[0] % self.batch == 0;
+            try self.node("Reshape", &.{ known.name, try self.shapeConstant(dims, keeps_batch) }, name, &.{});
             try self.values.put(view.id, .{ .name = name, .view = view });
             return name;
         }
@@ -267,142 +276,140 @@ const Builder = struct {
         return next;
     }
 
+    fn useInput(self: *Builder, e: Entry, index: usize) Error![]const u8 {
+        return self.use(e.inputs[index]);
+    }
+
+    fn intermediate(self: *Builder, op: []const u8, inputs: []const []const u8, stem: []const u8) Error![]const u8 {
+        const out = try self.fresh(stem);
+        try self.node(op, inputs, out, &.{});
+        return out;
+    }
+
+    fn convertGruGate(self: *Builder, e: Entry, out: []const u8) Error!void {
+        // NOTE: the fused kernel is written out as the gate arithmetic it replaces, so any ONNX runtime can read it.
+        const hidden = e.output.dims[1];
+        const first: usize = if (e.op == .gru_update) 0 else hidden;
+        const pre = try self.intermediate("Add", &.{ try self.columns(try self.useInput(e, 0), first, first + hidden), try self.columns(try self.useInput(e, 1), first, first + hidden) }, "pre");
+        if (e.op == .gru_update) return self.node("Sigmoid", &.{pre}, out, &.{});
+        const gate = try self.intermediate("Sigmoid", &.{pre}, "gate");
+        try self.node("Mul", &.{ gate, try self.useInput(e, 2) }, out, &.{});
+    }
+
+    fn convertGruNext(self: *Builder, e: Entry, out: []const u8) Error!void {
+        const hidden = e.output.dims[1];
+        const state = try self.useInput(e, 3);
+        const pre = try self.intermediate("Add", &.{ try self.columns(try self.useInput(e, 0), 2 * hidden, 3 * hidden), try self.useInput(e, 1) }, "pre");
+        const candidate = try self.intermediate("Tanh", &.{pre}, "candidate");
+        const difference = try self.intermediate("Sub", &.{ state, candidate }, "difference");
+        const kept = try self.intermediate("Mul", &.{ try self.useInput(e, 2), difference }, "kept");
+        try self.node("Add", &.{ candidate, kept }, out, &.{});
+    }
+
+    fn convertSoftmax(self: *Builder, e: Entry, out: []const u8) Error!void {
+        var x = try self.useInput(e, 0);
+        if (e.scale != 1) x = try self.intermediate("Mul", &.{ x, try self.floats("scale", &.{1}, &.{e.scale}) }, "scaled");
+        if (e.period == 0) return self.node("Softmax", &.{x}, out, &.{.{ .int = .{ "axis", -1 } }});
+        // NOTE: the engine lets row r see the first r % period + 1 columns, which is a causal mask once rows are grouped by sequence.
+        const rows = e.output.dims[0];
+        const cols = e.output.dims[1];
+        const mask = try self.gpa.alloc(f32, e.period * cols);
+        defer self.gpa.free(mask);
+        for (0..e.period) |i| {
+            for (0..cols) |j| mask[i * cols + j] = if (j <= i) 0 else -1e9;
+        }
+        const grouped = try self.intermediate("Reshape", &.{ x, try self.shapeConstant(&.{ rows / e.period, e.period, cols }, false) }, "grouped");
+        const masked = try self.intermediate("Add", &.{ grouped, try self.floats("mask", &.{ e.period, cols }, mask) }, "masked");
+        const weights = try self.fresh("weights");
+        try self.node("Softmax", &.{masked}, weights, &.{.{ .int = .{ "axis", -1 } }});
+        try self.node("Reshape", &.{ weights, try self.shapeConstant(&.{ rows, cols }, false) }, out, &.{});
+    }
+
+    fn convertConv(self: *Builder, e: Entry, rest: []const Entry, out: []const u8) Error!void {
+        const k = e.kernel;
+        const c_out = e.inputs[1].dims[1];
+        const c_in = e.inputs[1].dims[0] / (k * k);
+        const w = self.weightOf(e.inputs[1].id) orelse return error.UnknownTensor;
+        const oihw = try self.gpa.alloc(f32, w.len);
+        defer self.gpa.free(oihw);
+        for (0..c_out) |co| {
+            for (0..c_in) |ci| {
+                for (0..k) |ky| {
+                    for (0..k) |kx| oihw[((co * c_in + ci) * k + ky) * k + kx] = w[((ky * k + kx) * c_in + ci) * c_out + co];
+                }
+            }
+        }
+        var operands: [3][]const u8 = .{ try self.channelsFirst(try self.useInput(e, 0)), "", "" };
+        var count: usize = 2;
+        if (self.foldableNorm(e, rest)) |next| {
+            const affine = try self.normAffine(next);
+            const per_filter = oihw.len / c_out;
+            for (0..c_out) |co| {
+                for (oihw[co * per_filter ..][0..per_filter]) |*v| v.* *= affine.scale[co];
+            }
+            operands[2] = try self.floats("bias", &.{c_out}, affine.shift);
+            count = 3;
+            self.folded_norm = next.output.id;
+        }
+        operands[1] = try self.floats("filters", &.{ c_out, c_in, k, k }, oihw);
+        const convolved = try self.fresh("convolved");
+        const kernel: i64 = @intCast(k);
+        const stride: i64 = @intCast(e.stride);
+        const pad: i64 = @intCast(e.pad);
+        const dilation: i64 = @intCast(e.dilation);
+        const groups: i64 = @intCast(e.groups);
+        try self.node("Conv", operands[0..count], convolved, &.{
+            .{ .ints = .{ "kernel_shape", &.{ kernel, kernel } } },
+            .{ .ints = .{ "strides", &.{ stride, stride } } },
+            .{ .ints = .{ "pads", &.{ pad, pad, pad, pad } } },
+            .{ .ints = .{ "dilations", &.{ dilation, dilation } } },
+            .{ .int = .{ "group", groups } },
+        });
+        try self.channelsLast(convolved, out);
+    }
+
     // Writes the nodes of one traced op; rest holds the entries after it, which a convolution looks at to fold a batch norm.
     fn convert(self: *Builder, e: Entry, rest: []const Entry) Error!void {
         // NOTE: a cast only changes how an activation is stored, so the exported graph stays in f32 and the output aliases the input.
-        if (e.op == .cast) return self.produce(e.output, try self.use(e.inputs[0]));
+        if (e.op == .cast) return self.produce(e.output, try self.useInput(e, 0));
         const out = try self.fresh("value");
         switch (e.op) {
             .cast => unreachable,
-            .add => try self.node("Add", &.{ try self.use(e.inputs[0]), try self.use(e.inputs[1]) }, out, &.{}),
-            .mul => try self.node("Mul", &.{ try self.use(e.inputs[0]), try self.use(e.inputs[1]) }, out, &.{}),
-            .matmul => try self.node("MatMul", &.{ try self.use(e.inputs[0]), try self.use(e.inputs[1]) }, out, &.{}),
+            .add => try self.node("Add", &.{ try self.useInput(e, 0), try self.useInput(e, 1) }, out, &.{}),
+            .mul => try self.node("Mul", &.{ try self.useInput(e, 0), try self.useInput(e, 1) }, out, &.{}),
+            .matmul => try self.node("MatMul", &.{ try self.useInput(e, 0), try self.useInput(e, 1) }, out, &.{}),
             .linear => {
-                const product = try self.fresh("product");
-                try self.node("MatMul", &.{ try self.use(e.inputs[0]), try self.use(e.inputs[1]) }, product, &.{});
-                try self.node("Add", &.{ product, try self.use(e.inputs[2]) }, out, &.{});
+                const product = try self.intermediate("MatMul", &.{ try self.useInput(e, 0), try self.useInput(e, 1) }, "product");
+                try self.node("Add", &.{ product, try self.useInput(e, 2) }, out, &.{});
             },
-            .gru_update, .gru_reset_h => {
-                // NOTE: the fused kernel is written out as the gate arithmetic it replaces, so any ONNX runtime can read it.
-                const hidden = e.output.dims[1];
-                const first: usize = if (e.op == .gru_update) 0 else hidden;
-                const pre = try self.fresh("pre");
-                try self.node("Add", &.{ try self.columns(try self.use(e.inputs[0]), first, first + hidden), try self.columns(try self.use(e.inputs[1]), first, first + hidden) }, pre, &.{});
-                if (e.op == .gru_update) {
-                    try self.node("Sigmoid", &.{pre}, out, &.{});
-                } else {
-                    const gate = try self.fresh("gate");
-                    try self.node("Sigmoid", &.{pre}, gate, &.{});
-                    try self.node("Mul", &.{ gate, try self.use(e.inputs[2]) }, out, &.{});
-                }
-            },
-            .gru_next => {
-                const hidden = e.output.dims[1];
-                const state = try self.use(e.inputs[3]);
-                const pre = try self.fresh("pre");
-                try self.node("Add", &.{ try self.columns(try self.use(e.inputs[0]), 2 * hidden, 3 * hidden), try self.use(e.inputs[1]) }, pre, &.{});
-                const candidate = try self.fresh("candidate");
-                try self.node("Tanh", &.{pre}, candidate, &.{});
-                const difference = try self.fresh("difference");
-                try self.node("Sub", &.{ state, candidate }, difference, &.{});
-                const kept = try self.fresh("kept");
-                try self.node("Mul", &.{ try self.use(e.inputs[2]), difference }, kept, &.{});
-                try self.node("Add", &.{ candidate, kept }, out, &.{});
-            },
+            .gru_update, .gru_reset_h => try self.convertGruGate(e, out),
+            .gru_next => try self.convertGruNext(e, out),
             .batched_matmul => {
-                var right = try self.use(e.inputs[1]);
+                var right = try self.useInput(e, 1);
                 if (e.trans_b) {
                     const flipped = try self.fresh("flipped");
                     try self.node("Transpose", &.{right}, flipped, &.{.{ .ints = .{ "perm", &.{ 0, 2, 1 } } }});
                     right = flipped;
                 }
-                try self.node("MatMul", &.{ try self.use(e.inputs[0]), right }, out, &.{});
+                try self.node("MatMul", &.{ try self.useInput(e, 0), right }, out, &.{});
             },
-            .embedding => try self.node("Gather", &.{ try self.use(e.inputs[0]), try self.use(e.inputs[1]) }, out, &.{.{ .int = .{ "axis", 0 } }}),
-            .layer_norm => try self.node("LayerNormalization", &.{ try self.use(e.inputs[0]), try self.use(e.inputs[1]), try self.use(e.inputs[2]) }, out, &.{
+            .embedding => try self.node("Gather", &.{ try self.useInput(e, 0), try self.useInput(e, 1) }, out, &.{.{ .int = .{ "axis", 0 } }}),
+            .layer_norm => try self.node("LayerNormalization", &.{ try self.useInput(e, 0), try self.useInput(e, 1), try self.useInput(e, 2) }, out, &.{
                 .{ .int = .{ "axis", -1 } },
                 .{ .float = .{ "epsilon", layernorm.eps } },
             }),
-            .softmax => {
-                var x = try self.use(e.inputs[0]);
-                if (e.scale != 1) {
-                    const scaled = try self.fresh("scaled");
-                    try self.node("Mul", &.{ x, try self.floats("scale", &.{1}, &.{e.scale}) }, scaled, &.{});
-                    x = scaled;
-                }
-                if (e.period == 0) {
-                    try self.node("Softmax", &.{x}, out, &.{.{ .int = .{ "axis", -1 } }});
-                } else {
-                    // NOTE: the engine lets row r see the first r % period + 1 columns, which is a causal mask once rows are grouped by sequence.
-                    const rows = e.output.dims[0];
-                    const cols = e.output.dims[1];
-                    const mask = try self.gpa.alloc(f32, e.period * cols);
-                    defer self.gpa.free(mask);
-                    for (0..e.period) |i| {
-                        for (0..cols) |j| mask[i * cols + j] = if (j <= i) 0 else -1e9;
-                    }
-                    const grouped = try self.fresh("grouped");
-                    try self.node("Reshape", &.{ x, try self.shapeConstant(&.{ rows / e.period, e.period, cols }) }, grouped, &.{});
-                    const masked = try self.fresh("masked");
-                    try self.node("Add", &.{ grouped, try self.floats("mask", &.{ e.period, cols }, mask) }, masked, &.{});
-                    const weights = try self.fresh("weights");
-                    try self.node("Softmax", &.{masked}, weights, &.{.{ .int = .{ "axis", -1 } }});
-                    try self.node("Reshape", &.{ weights, try self.shapeConstant(&.{ rows, cols }) }, out, &.{});
-                }
-            },
-            .relu => try self.node("Relu", &.{try self.use(e.inputs[0])}, out, &.{}),
-            .sigmoid => try self.node("Sigmoid", &.{try self.use(e.inputs[0])}, out, &.{}),
-            .tanh => try self.node("Tanh", &.{try self.use(e.inputs[0])}, out, &.{}),
-            .gelu => try self.node("Gelu", &.{try self.use(e.inputs[0])}, out, &.{.{ .text = .{ "approximate", "tanh" } }}),
+            .softmax => try self.convertSoftmax(e, out),
+            .relu => try self.node("Relu", &.{try self.useInput(e, 0)}, out, &.{}),
+            .sigmoid => try self.node("Sigmoid", &.{try self.useInput(e, 0)}, out, &.{}),
+            .tanh => try self.node("Tanh", &.{try self.useInput(e, 0)}, out, &.{}),
+            .gelu => try self.node("Gelu", &.{try self.useInput(e, 0)}, out, &.{.{ .text = .{ "approximate", "tanh" } }}),
             .add_relu => {
-                const sum = try self.fresh("sum");
-                try self.node("Add", &.{ try self.use(e.inputs[0]), try self.use(e.inputs[1]) }, sum, &.{});
+                const sum = try self.intermediate("Add", &.{ try self.useInput(e, 0), try self.useInput(e, 1) }, "sum");
                 try self.node("Relu", &.{sum}, out, &.{});
             },
-            .conv => {
-                const k = e.kernel;
-                const c_out = e.inputs[1].dims[1];
-                const c_in = e.inputs[1].dims[0] / (k * k);
-                const w = self.weightOf(e.inputs[1].id) orelse return error.UnknownTensor;
-                const oihw = try self.gpa.alloc(f32, w.len);
-                defer self.gpa.free(oihw);
-                for (0..c_out) |co| {
-                    for (0..c_in) |ci| {
-                        for (0..k) |ky| {
-                            for (0..k) |kx| oihw[((co * c_in + ci) * k + ky) * k + kx] = w[((ky * k + kx) * c_in + ci) * c_out + co];
-                        }
-                    }
-                }
-                var operands: [3][]const u8 = .{ try self.channelsFirst(try self.use(e.inputs[0])), "", "" };
-                var count: usize = 2;
-                if (self.foldableNorm(e, rest)) |next| {
-                    const affine = try self.normAffine(next);
-                    const per_filter = oihw.len / c_out;
-                    for (0..c_out) |co| {
-                        for (oihw[co * per_filter ..][0..per_filter]) |*v| v.* *= affine.scale[co];
-                    }
-                    operands[2] = try self.floats("bias", &.{c_out}, affine.shift);
-                    count = 3;
-                    self.folded_norm = next.output.id;
-                }
-                operands[1] = try self.floats("filters", &.{ c_out, c_in, k, k }, oihw);
-                const convolved = try self.fresh("convolved");
-                const kernel: i64 = @intCast(k);
-                const stride: i64 = @intCast(e.stride);
-                const pad: i64 = @intCast(e.pad);
-                const dilation: i64 = @intCast(e.dilation);
-                const groups: i64 = @intCast(e.groups);
-                try self.node("Conv", operands[0..count], convolved, &.{
-                    .{ .ints = .{ "kernel_shape", &.{ kernel, kernel } } },
-                    .{ .ints = .{ "strides", &.{ stride, stride } } },
-                    .{ .ints = .{ "pads", &.{ pad, pad, pad, pad } } },
-                    .{ .ints = .{ "dilations", &.{ dilation, dilation } } },
-                    .{ .int = .{ "group", groups } },
-                });
-                try self.channelsLast(convolved, out);
-            },
+            .conv => try self.convertConv(e, rest, out),
             .max_pool, .avg_pool => {
-                const planar = try self.channelsFirst(try self.use(e.inputs[0]));
+                const planar = try self.channelsFirst(try self.useInput(e, 0));
                 const pooled = try self.fresh("pooled");
                 const kernel: i64 = @intCast(e.kernel);
                 const stride: i64 = @intCast(e.stride);
@@ -415,22 +422,18 @@ const Builder = struct {
                 try self.channelsLast(pooled, out);
             },
             .batch_norm, .batch_norm_relu, .batch_norm_add_relu => {
-                var shifted = try self.use(e.inputs[0]);
+                var shifted = try self.useInput(e, 0);
                 // NOTE: a folded batch norm is already in the filters and the bias of the convolution before it.
                 if (self.folded_norm != e.output.id) {
                     const c = e.inputs[1].dims[0];
                     const affine = try self.normAffine(e);
-                    const scaled = try self.fresh("scaled");
-                    try self.node("Mul", &.{ shifted, try self.floats("scale", &.{c}, affine.scale) }, scaled, &.{});
+                    const scaled = try self.intermediate("Mul", &.{ shifted, try self.floats("scale", &.{c}, affine.scale) }, "scaled");
                     shifted = if (e.op == .batch_norm) out else try self.fresh("shifted");
                     try self.node("Add", &.{ scaled, try self.floats("shift", &.{c}, affine.shift) }, shifted, &.{});
                 }
                 if (e.op == .batch_norm) return self.produce(e.output, shifted);
                 var activated = shifted;
-                if (e.op == .batch_norm_add_relu) {
-                    activated = try self.fresh("summed");
-                    try self.node("Add", &.{ shifted, try self.use(e.inputs[5]) }, activated, &.{});
-                }
+                if (e.op == .batch_norm_add_relu) activated = try self.intermediate("Add", &.{ shifted, try self.useInput(e, 5) }, "summed");
                 try self.node("Relu", &.{activated}, out, &.{});
             },
         }
@@ -440,10 +443,12 @@ const Builder = struct {
     fn valueInfo(self: *Builder, field: u32, name: []const u8, view: View) !void {
         var shape: Proto = .{};
         defer shape.bytes.deinit(self.gpa);
-        for (view.shape()) |d| {
+        // The first axis is the batch when the graph is dynamic and the tensor leads with it; ids (integer inputs) never do.
+        const dynamic = self.batch != 0 and !view.integer and view.shape().len > 0 and view.shape()[0] == self.batch;
+        for (view.shape(), 0..) |d, i| {
             var dim: Proto = .{};
             defer dim.bytes.deinit(self.gpa);
-            try dim.int(self.gpa, 1, @intCast(d));
+            if (dynamic and i == 0) try dim.bytesField(self.gpa, 2, "batch") else try dim.int(self.gpa, 1, @intCast(d));
             try shape.message(self.gpa, 1, &dim);
         }
         var tensor_type: Proto = .{};
@@ -461,7 +466,10 @@ const Builder = struct {
     }
 };
 
-pub const Graph = struct { trace: *const Trace, weights: []const Weight, inputs: []const View, outputs: []const View };
+/// What build turns into a model: the recorded trace, the weight slices, and the views that are graph inputs and outputs.
+/// With dynamic_batch the leading axis of the first input (the batch it was traced with) is exported as a symbolic dimension,
+/// and reshapes that keep it use -1, so the file runs for any batch size; this suits image models whose tensors lead with the batch.
+pub const Graph = struct { trace: *const Trace, weights: []const Weight, inputs: []const View, outputs: []const View, dynamic_batch: bool = false };
 
 pub fn build(gpa: Allocator, graph: Graph) Error![]u8 {
     const trace, const weights, const inputs, const outputs = .{ graph.trace, graph.weights, graph.inputs, graph.outputs };
@@ -473,6 +481,7 @@ pub fn build(gpa: Allocator, graph: Graph) Error![]u8 {
         .values = .init(gpa),
         .emitted = .init(gpa),
         .outputs = outputs,
+        .batch = if (graph.dynamic_batch and inputs.len > 0 and inputs[0].shape().len > 0) inputs[0].shape()[0] else 0,
     };
     defer {
         b.names.deinit();

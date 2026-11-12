@@ -150,3 +150,71 @@ test "a recorded graph runs only when replayed, zeroes its gradient arena each t
     gpu.startProfile(testing.io);
     try testing.expectError(error.ProfilingWhileCapturing, gpu.beginCapture());
 }
+
+test "a recording is not invalidated by default-stream work of another Gpu on the same device" {
+    // NOTE: two Gpu values on one device share the primary context and its legacy default stream, as two training replicas do.
+    // A blocking capture stream is implicitly ordered against that stream, so the memset below used to invalidate the recording.
+    const gpu = try Gpu.forTest(16 << 20);
+    defer gpu.deinit();
+    const other = try Gpu.forTest(1 << 20);
+    defer other.deinit();
+    const y = try gpu.alloc(f32, 64);
+    const z = try other.alloc(f32, 64);
+    try gpu.fill(y, -1);
+
+    gpu.beginCapture() catch |err| switch (err) {
+        error.NoGraphSupport => return error.SkipZigTest,
+        else => return err,
+    };
+    try gpu.fill(y, 3);
+    try other.fill(z, 1);
+    const graph = try gpu.endCapture();
+
+    try gpu.replay(graph);
+    var back: [64]f32 = undefined;
+    try gpu.download(&back, y);
+    for (back) |v| try testing.expectEqual(@as(f32, 3), v);
+}
+
+test "a cuDNN convolution can be recorded once its plan exists, and a new shape cannot be planned during a recording" {
+    const gpu = try Gpu.forTest(16 << 20);
+    defer gpu.deinit();
+    gpu.enableCudnn("data/cudnn") catch |err| switch (err) {
+        error.CudnnNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    const geometry: lib.gpu.cudnn.Geometry = .{ .n = 2, .h = 8, .w = 8, .c = 16, .k = 16, .r = 3, .pad = 1, .stride = 1 };
+    const x = try gpu.alloc(f32, 2 * 8 * 8 * 16);
+    const w = try gpu.alloc(f32, 16 * 3 * 3 * 16);
+    const y = try gpu.alloc(f32, 2 * 8 * 8 * 16);
+    var prng = std.Random.DefaultPrng.init(3);
+    const host = try testing.allocator.alloc(f32, @max(x.len, w.len));
+    defer testing.allocator.free(host);
+    for (host[0..x.len]) |*v| v.* = prng.random().floatNorm(f32);
+    try gpu.upload(x, host[0..x.len]);
+    for (host[0..w.len]) |*v| v.* = prng.random().floatNorm(f32) * 0.1;
+    try gpu.upload(w, host[0..w.len]);
+
+    // The first call plans the shape (it times real convolutions), so it has to run normally.
+    try gpu.cudnnForward(geometry, x, w, y);
+    const live = try testing.allocator.alloc(f32, y.len);
+    defer testing.allocator.free(live);
+    try gpu.download(live, y);
+
+    try gpu.fill(y, 0);
+    gpu.beginCapture() catch |err| switch (err) {
+        error.NoGraphSupport => return error.SkipZigTest,
+        else => return err,
+    };
+    try gpu.cudnnForward(geometry, x, w, y);
+    var unplanned = geometry;
+    unplanned.n = 3;
+    try testing.expectError(error.CudnnPlanWhileCapturing, gpu.cudnnForward(unplanned, x, w, y));
+    const graph = try gpu.endCapture();
+
+    try gpu.replay(graph);
+    const replayed = try testing.allocator.alloc(f32, y.len);
+    defer testing.allocator.free(replayed);
+    try gpu.download(replayed, y);
+    try testing.expectEqualSlices(f32, live, replayed);
+}

@@ -134,7 +134,9 @@ pub const Cuda = struct {
     /// Starts recording every launch and memset into a graph instead of running them. Fails when the driver has no graph support.
     pub fn beginCapture(self: *Cuda) !void {
         const g = self.graph_api orelse return error.NoGraphSupport;
-        if (self.capture_stream == null) try self.check(g.cuStreamCreate(&self.capture_stream, 0));
+        // NOTE: non-blocking (flag 1). Replicas on one device share the primary context and with it the legacy default stream; a
+        // blocking stream is implicitly ordered against that stream, so work another thread puts on it would invalidate the recording.
+        if (self.capture_stream == null) try self.check(g.cuStreamCreate(&self.capture_stream, 1));
         // Relaxed mode: other threads and the ordinary memory calls of the host are not policed.
         try self.check(g.cuStreamBeginCapture_v2(self.capture_stream, 2));
         self.stream = self.capture_stream;

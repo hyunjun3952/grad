@@ -6,6 +6,7 @@ const input = lib.onnx_runtime.input;
 const broadcast = lib.onnx_runtime.broadcast;
 const pool = lib.onnx_runtime.pool;
 const convolve = lib.onnx_runtime.convolve;
+const convolveNhwc = lib.onnx_runtime.convolveNhwc;
 const transpose = lib.onnx_runtime.transpose;
 const Model = lib.onnx_runtime.Model;
 const Array = lib.onnx_runtime.Array;
@@ -68,7 +69,17 @@ test "grouped and dilated convolutions, pooling, softmax and broadcasting follow
     try testing.expectEqualSlices(usize, &.{ 1, 2, 2, 2 }, grouped.dims);
     try testing.expectEqualSlices(f32, &.{ 6, 8, 12, 14, 2, 2, 2, 2 }, grouped.data);
 
-    const dilated = try convolve(a, .{}, .{ .attributes = &.{ .{ .name = "dilations", .ints = &.{ 2, 2 } }, .{ .name = "pads", .ints = &.{ 1, 1, 1, 1 } } } }, .{ .dims = &.{ 1, 1, 3, 3 }, .data = x.data[0..9] }, .{ .dims = &.{ 1, 1, 2, 2 }, .data = @constCast(&[_]f32{ 1, 1, 1, 1 }) }, null);
+    const dilated = try convolve(
+        a,
+        .{},
+        .{ .attributes = &.{
+            .{ .name = "dilations", .ints = &.{ 2, 2 } },
+            .{ .name = "pads", .ints = &.{ 1, 1, 1, 1 } },
+        } },
+        .{ .dims = &.{ 1, 1, 3, 3 }, .data = x.data[0..9] },
+        .{ .dims = &.{ 1, 1, 2, 2 }, .data = @constCast(&[_]f32{ 1, 1, 1, 1 }) },
+        null,
+    );
     try testing.expectEqualSlices(usize, &.{ 1, 1, 3, 3 }, dilated.dims);
     try testing.expectEqualSlices(f32, &.{ 5, 10, 5, 10, 20, 10, 5, 10, 5 }, dilated.data[0..9]);
 
@@ -123,6 +134,99 @@ test "transposes and broadcasts on their fast paths give the same values as an i
     }
 }
 
+fn imageNet(layers: anytype, tape: *autograd.Tape, comptime n: usize, image: anytype) !autograd.Var(Tensor(f32, &.{ n, 3 })) {
+    const conv, const fc = layers;
+    const pooled = try tape.maxPool(try conv.forwardRelu(tape, autograd.reshape(image, &.{ n, 8, 8, 1 })), .{});
+    return fc.forward(tape, autograd.reshape(pooled, &.{ n, 64 }));
+}
+
+fn flatNet(layers: anytype, tape: *autograd.Tape, comptime n: usize, image: anytype) !autograd.Var(Tensor(f32, &.{ n, 3 })) {
+    const conv, const fc = layers;
+    const pooled = try tape.maxPool(try conv.forwardRelu(tape, autograd.reshape(image, &.{ n, 8, 8, 1 })), .{});
+    // The activation sits on a matrix whose leading axis is batch * height * width, as after a flatten of the pixels.
+    const rows = try tape.relu(autograd.reshape(pooled, &.{ n * 16, 4 }));
+    return fc.forward(tape, autograd.reshape(rows, &.{ n, 64 }));
+}
+
+test "a dynamic batch export survives reshapes whose leading axis is a multiple of the batch" {
+    const gpa = testing.allocator;
+    const Layers = struct { nn.ConvBn(1, 4, 3, .{ .pad = 1 }), nn.Linear(64, 3) };
+    var prng = std.Random.DefaultPrng.init(23);
+    const rng = prng.random();
+    const layers = try nn.initAll(Layers, gpa, rng);
+    defer nn.deinitAll(layers, gpa);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var trace: onnx.Trace = .{ .gpa = gpa };
+    defer trace.deinit();
+    var traced: autograd.Tape = .{ .gpa = arena.allocator(), .trace = &trace };
+    const image = try traced.constant(try Tensor(f32, &.{ 2, 64 }).empty(arena.allocator()));
+    for (image.value.data) |*v| v.* = rng.floatNorm(f32);
+    const logits = try flatNet(layers, &traced, 2, image);
+
+    const state = nn.state(layers);
+    var weights: [state.len]onnx.Weight = undefined;
+    inline for (state, 0..) |slice, i| weights[i] = .{ .id = @intFromPtr(slice.ptr), .data = slice };
+    const bytes = try onnx.build(gpa, .{ .trace = &trace, .weights = &weights, .inputs = &.{onnx.View.of(image)}, .outputs = &.{onnx.View.of(logits)}, .dynamic_batch = true });
+    defer gpa.free(bytes);
+
+    var model = try Model.parse(gpa, bytes);
+    defer model.deinit();
+    inline for (.{ 1, 2, 5 }) |n| {
+        var tape: autograd.Tape = .{ .gpa = arena.allocator() };
+        const sample = try tape.constant(try Tensor(f32, &.{ n, 64 }).empty(arena.allocator()));
+        for (sample.value.data) |*v| v.* = rng.floatNorm(f32);
+        const want = try flatNet(layers, &tape, n, sample);
+        var result = try model.run(gpa, .{ .threads = 1 }, &.{.{ .name = "input", .dims = &.{ n, 64 }, .data = sample.value.data }});
+        defer result.deinit();
+        try testing.expectEqualSlices(usize, &.{ n, 3 }, result.outputs[0].dims);
+        for (want.value.data, result.outputs[0].data) |w, got| try testing.expectApproxEqAbs(w, got, 1e-4);
+    }
+}
+
+test "a network exported with a dynamic batch axis runs for batch sizes other than the traced one" {
+    const gpa = testing.allocator;
+    const Layers = struct { nn.ConvBn(1, 4, 3, .{ .pad = 1 }), nn.Linear(64, 3) };
+    var prng = std.Random.DefaultPrng.init(17);
+    const rng = prng.random();
+    const layers = try nn.initAll(Layers, gpa, rng);
+    defer nn.deinitAll(layers, gpa);
+    inline for (nn.state(layers)) |slice| {
+        for (slice) |*v| v.* += rng.float(f32) * 0.5;
+    }
+    layers[0].norm.variance.data[0] = 2;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var trace: onnx.Trace = .{ .gpa = gpa };
+    defer trace.deinit();
+    var traced: autograd.Tape = .{ .gpa = arena.allocator(), .trace = &trace };
+    const image = try traced.constant(try Tensor(f32, &.{ 2, 64 }).empty(arena.allocator()));
+    for (image.value.data) |*v| v.* = rng.floatNorm(f32);
+    const logits = try imageNet(layers, &traced, 2, image);
+
+    const state = nn.state(layers);
+    var weights: [state.len]onnx.Weight = undefined;
+    inline for (state, 0..) |slice, i| weights[i] = .{ .id = @intFromPtr(slice.ptr), .data = slice };
+    const bytes = try onnx.build(gpa, .{ .trace = &trace, .weights = &weights, .inputs = &.{onnx.View.of(image)}, .outputs = &.{onnx.View.of(logits)}, .dynamic_batch = true });
+    defer gpa.free(bytes);
+    // The leading axis is symbolic, so the file must not contain the traced batch size as a fixed dimension of the input.
+    try testing.expect(std.mem.indexOf(u8, bytes, "batch") != null);
+
+    var model = try Model.parse(gpa, bytes);
+    defer model.deinit();
+    inline for (.{ 1, 2, 5 }) |n| {
+        var tape: autograd.Tape = .{ .gpa = arena.allocator() };
+        const sample = try tape.constant(try Tensor(f32, &.{ n, 64 }).empty(arena.allocator()));
+        for (sample.value.data) |*v| v.* = rng.floatNorm(f32);
+        const want = try imageNet(layers, &tape, n, sample);
+        var result = try model.run(gpa, .{ .threads = 1 }, &.{.{ .name = "input", .dims = &.{ n, 64 }, .data = sample.value.data }});
+        defer result.deinit();
+        try testing.expectEqualSlices(usize, &.{ n, 3 }, result.outputs[0].dims);
+        for (want.value.data, result.outputs[0].data) |w, got| try testing.expectApproxEqAbs(w, got, 1e-4);
+    }
+}
 test "a gru step with two inputs and two outputs survives export and import" {
     const gpa = testing.allocator;
     const Layers = struct { nn.Gru(3, 4), nn.Linear(4, 2) };
@@ -261,4 +365,67 @@ test "a causal transformer with token and position inputs survives export and im
     defer result.deinit();
     try testing.expectEqualSlices(usize, &.{ rows, vocab }, result.outputs[0].dims);
     for (logits.value.data, result.outputs[0].data) |want, got| try testing.expectApproxEqAbs(want, got, 1e-4);
+}
+
+test "an nhwc convolution matches the transpose conv transpose reference" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const par: lib.kernels.Parallel = .{ .io = testing.io, .threads = 3 };
+    var prng = std.Random.DefaultPrng.init(7);
+    const rng = prng.random();
+    const x: Array = .{ .dims = &.{ 2, 5, 6, 3 }, .data = try a.alloc(f32, 2 * 5 * 6 * 3) };
+    for (x.data) |*v| v.* = rng.floatNorm(f32);
+    const w: Array = .{ .dims = &.{ 4, 3, 3, 3 }, .data = try a.alloc(f32, 4 * 3 * 3 * 3) };
+    for (w.data) |*v| v.* = rng.floatNorm(f32);
+    const bias: Array = .{ .dims = &.{4}, .data = try a.alloc(f32, 4) };
+    for (bias.data) |*v| v.* = rng.floatNorm(f32);
+
+    const plain_nchw = try transpose(a, par, .{ .attributes = &.{.{ .name = "perm", .ints = &.{ @as(i64, 0), 3, 1, 2 } }} }, x);
+    const plain = try convolve(a, par, .{ .attributes = &.{.{ .name = "pads", .ints = &.{ 1, 1, 1, 1 } }} }, plain_nchw, w, null);
+    const plain_want = try transpose(a, par, .{ .attributes = &.{.{ .name = "perm", .ints = &.{ @as(i64, 0), 2, 3, 1 } }} }, plain);
+    const plain_got = try convolveNhwc(a, par, .{ .attributes = &.{.{ .name = "pads", .ints = &.{ 1, 1, 1, 1 } }} }, x, w, null);
+    try testing.expectEqualSlices(usize, plain_want.dims, plain_got.dims);
+    for (plain_want.data, plain_got.data) |want, got| try testing.expectApproxEqAbs(want, got, 1e-4);
+
+    const strides_nchw = try transpose(a, par, .{ .attributes = &.{.{ .name = "perm", .ints = &.{ @as(i64, 0), 3, 1, 2 } }} }, x);
+    const strides = try convolve(a, par, .{
+        .attributes = &.{
+            .{ .name = "strides", .ints = &.{ 2, 2 } },
+            .{ .name = "pads", .ints = &.{ 1, 1, 1, 1 } },
+            .{ .name = "dilations", .ints = &.{ 2, 2 } },
+        },
+    }, strides_nchw, w, bias);
+    const strides_want = try transpose(a, par, .{ .attributes = &.{.{ .name = "perm", .ints = &.{ @as(i64, 0), 2, 3, 1 } }} }, strides);
+    const strides_got = try convolveNhwc(a, par, .{
+        .attributes = &.{
+            .{ .name = "strides", .ints = &.{ 2, 2 } },
+            .{ .name = "pads", .ints = &.{ 1, 1, 1, 1 } },
+            .{ .name = "dilations", .ints = &.{ 2, 2 } },
+        },
+    }, x, w, bias);
+    try testing.expectEqualSlices(usize, strides_want.dims, strides_got.dims);
+    for (strides_want.data, strides_got.data) |want, got| try testing.expectApproxEqAbs(want, got, 1e-4);
+
+    try testing.expectError(error.UnsupportedOp, convolveNhwc(a, par, .{
+        .attributes = &.{.{ .name = "strides", .ints = &.{ 2, 1 } }},
+    }, x, w, null));
+
+    // A dilated window of 7 does not fit the 5 x 6 input, which used to underflow the output size.
+    try testing.expectError(error.ShapeMismatch, convolveNhwc(a, par, .{
+        .attributes = &.{.{ .name = "dilations", .ints = &.{ 3, 3 } }},
+    }, x, w, null));
+}
+
+test "the nhwc fusion only accepts uniform pads without an auto_pad rule" {
+    const Node = lib.onnx_runtime.Node;
+    const uniform: Node = .{ .attributes = &.{.{ .name = "pads", .ints = &.{ 1, 1, 1, 1 } }} };
+    const asymmetric: Node = .{ .attributes = &.{.{ .name = "pads", .ints = &.{ 1, 1, 0, 0 } }} };
+    const same: Node = .{ .attributes = &.{.{ .name = "auto_pad", .text = "SAME_UPPER" }} };
+    const explicit: Node = .{ .attributes = &.{.{ .name = "auto_pad", .text = "NOTSET" }} };
+    try testing.expect(lib.onnx_runtime.padsAreUniform(.{}));
+    try testing.expect(lib.onnx_runtime.padsAreUniform(uniform));
+    try testing.expect(lib.onnx_runtime.padsAreUniform(explicit));
+    try testing.expect(!lib.onnx_runtime.padsAreUniform(asymmetric));
+    try testing.expect(!lib.onnx_runtime.padsAreUniform(same));
 }

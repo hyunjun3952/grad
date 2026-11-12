@@ -4,7 +4,31 @@ const Allocator = std.mem.Allocator;
 pub const max_inputs = 6;
 pub const max_rank = 6;
 
-pub const Op = enum { gru_update, gru_reset_h, gru_next, linear, add, mul, matmul, batched_matmul, embedding, layer_norm, softmax, relu, sigmoid, tanh, gelu, conv, max_pool, avg_pool, batch_norm, batch_norm_relu, batch_norm_add_relu, add_relu, cast };
+pub const Op = enum {
+    gru_update,
+    gru_reset_h,
+    gru_next,
+    linear,
+    add,
+    mul,
+    matmul,
+    batched_matmul,
+    embedding,
+    layer_norm,
+    softmax,
+    relu,
+    sigmoid,
+    tanh,
+    gelu,
+    conv,
+    max_pool,
+    avg_pool,
+    batch_norm,
+    batch_norm_relu,
+    batch_norm_add_relu,
+    add_relu,
+    cast,
+};
 
 pub const View = struct {
     id: usize,
@@ -74,7 +98,20 @@ pub const Trace = struct {
     }
 
     pub fn add(self: *Trace, op: Op, inputs: anytype, output: anytype, attrs: Attrs) Allocator.Error!void {
-        var entry: Entry = .{ .op = op, .inputs = undefined, .count = inputs.len, .output = View.of(output), .kernel = attrs.kernel, .stride = attrs.stride, .pad = attrs.pad, .dilation = attrs.dilation, .groups = attrs.groups, .period = attrs.period, .scale = attrs.scale, .trans_b = attrs.trans_b };
+        var entry: Entry = .{
+            .op = op,
+            .inputs = undefined,
+            .count = inputs.len,
+            .output = View.of(output),
+            .kernel = attrs.kernel,
+            .stride = attrs.stride,
+            .pad = attrs.pad,
+            .dilation = attrs.dilation,
+            .groups = attrs.groups,
+            .period = attrs.period,
+            .scale = attrs.scale,
+            .trans_b = attrs.trans_b,
+        };
         inline for (inputs, 0..) |input, i| entry.inputs[i] = if (@TypeOf(input) == View) input else View.of(input);
         try self.entries.append(self.gpa, entry);
     }

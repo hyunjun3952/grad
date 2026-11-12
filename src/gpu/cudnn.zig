@@ -22,6 +22,7 @@ const Perf = extern struct {
 const Api = struct {
     cudnnCreate: *const fn (handle: *Handle) callconv(.c) Status,
     cudnnDestroy: *const fn (handle: Handle) callconv(.c) Status,
+    cudnnSetStream: *const fn (handle: Handle, stream: Handle) callconv(.c) Status,
     cudnnGetVersion: *const fn () callconv(.c) usize,
     cudnnGetErrorString: *const fn (status: Status) callconv(.c) [*:0]const u8,
     cudnnCreateTensorDescriptor: *const fn (desc: *Handle) callconv(.c) Status,
@@ -37,9 +38,51 @@ const Api = struct {
     cudnnFindConvolutionForwardAlgorithm: *const fn (handle: Handle, x: Handle, w: Handle, conv: Handle, y: Handle, requested: c_int, returned: *c_int, results: [*]Perf) callconv(.c) Status,
     cudnnFindConvolutionBackwardDataAlgorithm: *const fn (handle: Handle, w: Handle, dy: Handle, conv: Handle, dx: Handle, requested: c_int, returned: *c_int, results: [*]Perf) callconv(.c) Status,
     cudnnFindConvolutionBackwardFilterAlgorithm: *const fn (handle: Handle, x: Handle, dy: Handle, conv: Handle, dw: Handle, requested: c_int, returned: *c_int, results: [*]Perf) callconv(.c) Status,
-    cudnnConvolutionForward: *const fn (handle: Handle, alpha: *const f32, x_desc: Handle, x: ?*const anyopaque, w_desc: Handle, w: ?*const anyopaque, conv: Handle, algo: c_int, workspace: ?*anyopaque, workspace_bytes: usize, beta: *const f32, y_desc: Handle, y: ?*anyopaque) callconv(.c) Status,
-    cudnnConvolutionBackwardData: *const fn (handle: Handle, alpha: *const f32, w_desc: Handle, w: ?*const anyopaque, dy_desc: Handle, dy: ?*const anyopaque, conv: Handle, algo: c_int, workspace: ?*anyopaque, workspace_bytes: usize, beta: *const f32, dx_desc: Handle, dx: ?*anyopaque) callconv(.c) Status,
-    cudnnConvolutionBackwardFilter: *const fn (handle: Handle, alpha: *const f32, x_desc: Handle, x: ?*const anyopaque, dy_desc: Handle, dy: ?*const anyopaque, conv: Handle, algo: c_int, workspace: ?*anyopaque, workspace_bytes: usize, beta: *const f32, dw_desc: Handle, dw: ?*anyopaque) callconv(.c) Status,
+    cudnnConvolutionForward: *const fn (
+        handle: Handle,
+        alpha: *const f32,
+        x_desc: Handle,
+        x: ?*const anyopaque,
+        w_desc: Handle,
+        w: ?*const anyopaque,
+        conv: Handle,
+        algo: c_int,
+        workspace: ?*anyopaque,
+        workspace_bytes: usize,
+        beta: *const f32,
+        y_desc: Handle,
+        y: ?*anyopaque,
+    ) callconv(.c) Status,
+    cudnnConvolutionBackwardData: *const fn (
+        handle: Handle,
+        alpha: *const f32,
+        w_desc: Handle,
+        w: ?*const anyopaque,
+        dy_desc: Handle,
+        dy: ?*const anyopaque,
+        conv: Handle,
+        algo: c_int,
+        workspace: ?*anyopaque,
+        workspace_bytes: usize,
+        beta: *const f32,
+        dx_desc: Handle,
+        dx: ?*anyopaque,
+    ) callconv(.c) Status,
+    cudnnConvolutionBackwardFilter: *const fn (
+        handle: Handle,
+        alpha: *const f32,
+        x_desc: Handle,
+        x: ?*const anyopaque,
+        dy_desc: Handle,
+        dy: ?*const anyopaque,
+        conv: Handle,
+        algo: c_int,
+        workspace: ?*anyopaque,
+        workspace_bytes: usize,
+        beta: *const f32,
+        dw_desc: Handle,
+        dw: ?*anyopaque,
+    ) callconv(.c) Status,
 };
 
 pub const Geometry = struct {
@@ -86,6 +129,11 @@ pub const Cudnn = struct {
     pub fn close(self: *Cudnn) void {
         _ = self.api.cudnnDestroy(self.handle);
         self.lib.close();
+    }
+
+    /// Makes the calls of this handle go to stream (null: the default stream), which a graph recording needs.
+    pub fn setStream(self: *const Cudnn, stream: Handle) Error!void {
+        try self.check(self.api.cudnnSetStream(self.handle, stream));
     }
 
     pub fn version(self: *const Cudnn) usize {
@@ -146,18 +194,60 @@ pub const Cudnn = struct {
     pub fn forward(self: *Cudnn, p: Plan, x: u64, w: u64, y: u64, workspace: u64, accumulate: bool) Error!void {
         const alpha: f32 = 1;
         const beta: f32 = if (accumulate) 1 else 0;
-        try self.check(self.api.cudnnConvolutionForward(self.handle, &alpha, p.x, @ptrFromInt(x), p.filter, @ptrFromInt(w), p.conv, p.forward.algo, @ptrFromInt(workspace), p.forward.workspace, &beta, p.y, @ptrFromInt(y)));
+        try self.check(self.api.cudnnConvolutionForward(
+            self.handle,
+            &alpha,
+            p.x,
+            @ptrFromInt(x),
+            p.filter,
+            @ptrFromInt(w),
+            p.conv,
+            p.forward.algo,
+            @ptrFromInt(workspace),
+            p.forward.workspace,
+            &beta,
+            p.y,
+            @ptrFromInt(y),
+        ));
     }
 
     pub fn backwardData(self: *Cudnn, p: Plan, w: u64, dy: u64, dx: u64, workspace: u64, accumulate: bool) Error!void {
         const alpha: f32 = 1;
         const beta: f32 = if (accumulate) 1 else 0;
-        try self.check(self.api.cudnnConvolutionBackwardData(self.handle, &alpha, p.filter, @ptrFromInt(w), p.y, @ptrFromInt(dy), p.conv, p.backward_data.algo, @ptrFromInt(workspace), p.backward_data.workspace, &beta, p.x, @ptrFromInt(dx)));
+        try self.check(self.api.cudnnConvolutionBackwardData(
+            self.handle,
+            &alpha,
+            p.filter,
+            @ptrFromInt(w),
+            p.y,
+            @ptrFromInt(dy),
+            p.conv,
+            p.backward_data.algo,
+            @ptrFromInt(workspace),
+            p.backward_data.workspace,
+            &beta,
+            p.x,
+            @ptrFromInt(dx),
+        ));
     }
 
     pub fn backwardFilter(self: *Cudnn, p: Plan, x: u64, dy: u64, dw: u64, workspace: u64, accumulate: bool) Error!void {
         const alpha: f32 = 1;
         const beta: f32 = if (accumulate) 1 else 0;
-        try self.check(self.api.cudnnConvolutionBackwardFilter(self.handle, &alpha, p.x, @ptrFromInt(x), p.y, @ptrFromInt(dy), p.conv, p.backward_filter.algo, @ptrFromInt(workspace), p.backward_filter.workspace, &beta, p.filter, @ptrFromInt(dw)));
+        try self.check(self.api.cudnnConvolutionBackwardFilter(
+            self.handle,
+            &alpha,
+            p.x,
+            @ptrFromInt(x),
+            p.y,
+            @ptrFromInt(dy),
+            p.conv,
+            p.backward_filter.algo,
+            @ptrFromInt(workspace),
+            p.backward_filter.workspace,
+            &beta,
+            p.filter,
+            @ptrFromInt(dw),
+        ));
     }
 };

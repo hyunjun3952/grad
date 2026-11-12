@@ -16,6 +16,7 @@ test {
     _ = @import("mnist.zig");
     _ = @import("nn.zig");
     _ = @import("onnx.zig");
+    _ = @import("onnx_gpu.zig");
     _ = @import("ops.zig");
     _ = @import("optim.zig");
     _ = @import("parity.zig");

@@ -11,7 +11,7 @@ const ptx = @embedFile("kernels_ptx");
 
 /// Everything that can fail on the device path. The CUDA driver and cuDNN are loaded at run time,
 /// so a missing library is an error value rather than a link failure.
-pub const Error = Allocator.Error || error{ NoDevice, NoGraphSupport, ProfilingWhileCapturing, NoSuchDevice, DriverNotFound, MissingSymbol, CudaFailed, CudnnNotFound, CudnnFailed, NoAlgorithm };
+pub const Error = Allocator.Error || error{ NoDevice, NoGraphSupport, ProfilingWhileCapturing, CudnnPlanWhileCapturing, NoSuchDevice, DriverNotFound, MissingSymbol, CudaFailed, CudnnNotFound, CudnnFailed, NoAlgorithm };
 
 pub const BinaryOp = enum { add, mul };
 
@@ -27,6 +27,14 @@ pub const cudnn = @import("cudnn.zig");
 /// The size of a product; batch above one means that many consecutive matrices of this size in each operand.
 pub const MatmulShape = struct { m: usize, n: usize, k: usize, batch: usize = 1 };
 
+/// Matrix dimensions padded by the tensor-core GEMM kernels.
+pub const GemmTile = enum(usize) { depth = 32, columns = 64, rows = 128 };
+
+/// Rounds value up to a whole GEMM tile in the selected dimension.
+pub fn padTo(value: usize, tile: GemmTile) usize {
+    return std.mem.alignForward(usize, value, @backingInt(tile));
+}
+
 pub const BroadcastPlan = struct { dims: [ga.max_rank]u32, a_strides: [ga.max_rank]u32, b_strides: [ga.max_rank]u32 };
 
 pub const ReducePlan = struct { dims: [ga.max_rank]u32, strides: [ga.max_rank]u32, mask: u32 };
@@ -41,6 +49,9 @@ const Kernel = enum {
     sgemmSmallNN,
     sgemmSmallNT,
     sgemmSmallTN,
+    sgemmMidNN,
+    sgemmMidNT,
+    sgemmMidTN,
     packHalf,
     packHalfCopy,
     packHalfTransposed,
@@ -50,6 +61,11 @@ const Kernel = enum {
     convTf32Forward,
     convTf32WeightGrad,
     convTf32WeightGradShort,
+    convExactForward,
+    convExactForwardWide,
+    convExactWeightGrad,
+    convExactWeightGradShort,
+    convExactWeightGradWide,
     rotateWeightsF32,
     transposeF32,
     addKrscGradient,
@@ -218,8 +234,6 @@ pub const Gpu = struct {
     tf32: bool = false,
     tensor_core_min_work: usize = 1 << 22,
     deterministic: bool = false,
-    // Trades time for memory: im2col convolutions rebuild their column matrix in the backward pass instead of keeping it.
-    recompute_columns: bool = false,
     gpa: Allocator,
     cu: cuda.Cuda,
     fns: [kernel_count]cuda.Handle,
@@ -244,9 +258,28 @@ pub const Gpu = struct {
 
     const PlanEntry = struct { geometry: cudnn.Geometry, plan: cudnn.Plan };
 
+    /// Restores the per-step scratch cursor to where a temporary allocation scope started.
+    pub const ScratchScope = struct {
+        gpu: *Gpu,
+        mark: usize,
+
+        /// Releases temporary allocations made since this scope was created.
+        pub fn restore(self: ScratchScope) void {
+            self.gpu.step_used = self.mark;
+        }
+    };
+
     /// Where and how big a Gpu is: the CUDA device ordinal, the scratch bytes per step and the bytes of the zero arena
-    /// (gradient buffers), a quarter of step_bytes when not given. peakUsage tells how much of both a program needs.
-    pub const Config = struct { step_bytes: usize, zero_bytes: ?usize = null, device: usize = 0 };
+    /// (gradient buffers), a quarter of step_bytes when not given. The math flags select tensor cores, TF32 and deterministic
+    /// reductions at creation. peakUsage tells how much of both a program needs.
+    pub const Config = struct {
+        step_bytes: usize,
+        zero_bytes: ?usize = null,
+        device: usize = 0,
+        tensor_cores: bool = false,
+        tf32: bool = false,
+        deterministic: bool = false,
+    };
 
     /// Opens the driver, loads the kernels and reserves the scratch and zero arenas of config.
     /// The device context becomes current on the calling thread; use makeCurrent when another thread takes over.
@@ -256,11 +289,10 @@ pub const Gpu = struct {
         errdefer gpa.destroy(self);
         self.gpa = gpa;
         self.profile = null;
-        self.tensor_cores = false;
-        self.tf32 = false;
+        self.tensor_cores = config.tensor_cores;
+        self.tf32 = config.tf32;
         self.tensor_core_min_work = 1 << 22;
-        self.deterministic = false;
-        self.recompute_columns = false;
+        self.deterministic = config.deterministic;
         self.owned = .empty;
         self.cudnn_lib = null;
         self.cudnn_plans = .empty;
@@ -349,6 +381,11 @@ pub const Gpu = struct {
         return @as([*]T, @ptrFromInt(self.step_base + at))[0..n];
     }
 
+    /// Marks the scratch cursor so temporary allocations can be released together with ScratchScope.restore.
+    pub fn scratchScope(self: *Gpu) ScratchScope {
+        return .{ .gpu = self, .mark = self.step_used };
+    }
+
     /// The most scratch and zero-arena bytes in use at any point so far, to size Config for a program.
     pub fn peakUsage(self: *const Gpu) struct { step: usize, zero: usize } {
         return .{ .step = self.step_peak, .zero = self.zero_peak };
@@ -385,12 +422,21 @@ pub const Gpu = struct {
         if (self.profile != null) return error.ProfilingWhileCapturing;
         try self.cu.beginCapture();
         self.capturing = true;
+        // NOTE: a capture that stays open would make every later launch on the stream fail, so a failed setStream ends it.
+        errdefer {
+            self.capturing = false;
+            if (self.cu.endCapture()) |exec| self.cu.destroyGraph(exec) else |_| {}
+        }
+        if (self.cudnn_lib) |*lib| try lib.setStream(self.cu.stream);
     }
 
     /// Ends the recording. Nothing has run yet, so call replay to execute the recorded step the first time too.
     pub fn endCapture(self: *Gpu) Error!Graph {
         self.capturing = false;
-        const exec = try self.cu.endCapture();
+        // NOTE: cuDNN refuses to leave the capturing stream before the capture has ended.
+        const ended = self.cu.endCapture();
+        if (self.cudnn_lib) |*lib| try lib.setStream(null);
+        const exec = try ended;
         errdefer self.cu.destroyGraph(exec);
         try self.graphs.append(self.gpa, exec);
         return .{ .exec = exec, .zero_bytes = self.zero_used };
@@ -412,10 +458,15 @@ pub const Gpu = struct {
         for (self.cudnn_plans.items) |entry| {
             if (std.meta.eql(entry.geometry, geometry)) return entry.plan;
         }
+        // NOTE: choosing a plan times real convolutions and may allocate, neither of which a recording allows, so every geometry
+        // a recorded step uses must have been planned by a step that ran normally before.
+        if (self.capturing) return error.CudnnPlanWhileCapturing;
         const plan = try self.cudnn_lib.?.plan(geometry, .float, 512 << 20, self.deterministic);
         try self.cudnn_plans.append(self.gpa, .{ .geometry = geometry, .plan = plan });
         if (plan.workspaceBytes() > self.cudnn_workspace_bytes) {
-            if (self.cudnn_workspace != 0) self.cu.free(self.cudnn_workspace);
+            // NOTE: a recorded graph keeps the address of the workspace it was recorded with, so a bigger one (the evaluation batch
+            // may need it) must not free the old one; it stays allocated until deinit.
+            if (self.cudnn_workspace != 0) try self.owned.append(self.gpa, self.cudnn_workspace);
             self.cudnn_workspace_bytes = plan.workspaceBytes();
             self.cudnn_workspace = try self.cu.alloc(self.cudnn_workspace_bytes);
         }
@@ -487,7 +538,13 @@ pub const Gpu = struct {
         for (order) |slot| {
             if (p.calls[slot] == 0) continue;
             const ms = @as(f64, @floatFromInt(p.ns[slot])) / 1e6;
-            try out.print("{s:<22}{d:>8}{d:>12.1}{d:>10.1}{d:>7.1}%\n", .{ slotName(slot), p.calls[slot], ms, ms * 1000 / @as(f64, @floatFromInt(p.calls[slot])), 100 * @as(f64, @floatFromInt(p.ns[slot])) / @as(f64, @floatFromInt(total)) });
+            try out.print("{s:<22}{d:>8}{d:>12.1}{d:>10.1}{d:>7.1}%\n", .{
+                slotName(slot),
+                p.calls[slot],
+                ms,
+                ms * 1000 / @as(f64, @floatFromInt(p.calls[slot])),
+                100 * @as(f64, @floatFromInt(p.ns[slot])) / @as(f64, @floatFromInt(total)),
+            });
         }
     }
 
@@ -562,31 +619,53 @@ pub const Gpu = struct {
             if (!batched) return self.matmulTensor(a, b, out, shape, opts);
             // TODO: the tensor core path packs every matrix on its own, so a batch is still one product per matrix there.
             const each: MatmulShape = .{ .m = shape.m, .n = shape.n, .k = shape.k };
-            for (0..shape.batch) |i| try self.matmulTensor(a[i * shape.m * shape.k ..][0 .. shape.m * shape.k], b[i * shape.k * shape.n ..][0 .. shape.k * shape.n], out[i * shape.m * shape.n ..][0 .. shape.m * shape.n], each, opts);
+            for (0..shape.batch) |i| try self.matmulTensor(
+                a[i * shape.m * shape.k ..][0 .. shape.m * shape.k],
+                b[i * shape.k * shape.n ..][0 .. shape.k * shape.n],
+                out[i * shape.m * shape.n ..][0 .. shape.m * shape.n],
+                each,
+                opts,
+            );
             return;
         }
         const tile = self.gemmTile(shape);
         const transpose: usize = if (opts.trans_a) 2 else if (opts.trans_b) 1 else 0;
         const kernel: Kernel = @fromBackingInt(@backingInt(Kernel.sgemmNN) + @as(u5, @intCast(tile * 3 + transpose)));
-        const tile_m: usize = if (tile == 2) 32 else 128;
-        const tile_n: usize = if (tile == 0) 128 else 32;
+        const tile_m, const tile_n = f32_tiles[tile];
         const blocks = @as(usize, ceilDiv(shape.n, tile_n)) * ceilDiv(shape.m, tile_m);
         const splits = if (batched) 1 else self.splitCount(@max(1, @min(shape.k / 256, (128 + blocks - 1) / blocks)));
         const chunk = std.mem.alignForward(usize, (shape.k + splits - 1) / splits, 8);
         if (splits > 1 and !opts.accumulate) try self.fill(out, 0);
-        const kernel_shape = pack(ga.GemmShape, .{ .m = shape.m, .n = shape.n, .k = shape.k, .accumulate = opts.accumulate, .chunk = chunk, .batch = if (batched) shape.batch else 0, .stride_a = shape.m * shape.k, .stride_b = shape.k * shape.n, .stride_c = shape.m * shape.n });
+        const kernel_shape = pack(ga.GemmShape, .{
+            .m = shape.m,
+            .n = shape.n,
+            .k = shape.k,
+            .accumulate = opts.accumulate,
+            .chunk = chunk,
+            .batch = if (batched) shape.batch else 0,
+            .stride_a = shape.m * shape.k,
+            .stride_b = shape.k * shape.n,
+            .stride_c = shape.m * shape.n,
+        });
         try self.launch(kernel, .{ ceilDiv(shape.n, tile_n), ceilDiv(shape.m, tile_m), if (batched) toU32(shape.batch) else ceilDiv(shape.k, chunk) }, .{ a, b, out, kernel_shape });
     }
 
-    // Picks the f32 tile: 0 is 128 x 128, 1 is 128 x 32 (narrow products), 2 is 32 x 32 (small ones).
+    // Rows and columns of the f32 tiles, in the order of the kernels sgemmNN, sgemmTall*, sgemmSmall* and sgemmMid*.
+    const f32_tiles = [_][2]usize{ .{ 128, 128 }, .{ 128, 32 }, .{ 32, 32 }, .{ 128, 64 } };
+
+    // Picks the f32 tile: 0 is 128 x 128, 1 is 128 x 32 (narrow products), 2 is 32 x 32 (small ones), 3 is 128 x 64.
+    // NOTE: the kernel multiplies the padded columns of a tile too, so a product with 64 columns (the 64-channel convolutions of
+    // CIFAR) in a 128 x 128 tile wasted half of its multiply-adds; measured 2.5 against 4.9 TFLOPS for the same m and k.
     // NOTE: a small product (a GRU step has 32 rows, its weight gradients a K of 32) gets only a handful of 128 x 128
     // blocks, and splitting K cannot help when K is short. Such a product takes the 32 x 32 tile when even the largest
     // split leaves multiprocessors idle; otherwise the big tile with split K measured faster.
     fn gemmTile(self: *const Gpu, shape: MatmulShape) usize {
         if (shape.n <= 32) return if (shape.m <= 64) 2 else 1;
-        const big_blocks = shape.batch * ceilDiv(shape.m, 128) * ceilDiv(shape.n, 128);
+        const wide = shape.n > 64;
+        const big_blocks = shape.batch * ceilDiv(shape.m, 128) * ceilDiv(shape.n, if (wide) 128 else 64);
         const most_splits = if (shape.batch > 1) 1 else self.splitCount(@max(1, shape.k / 256));
-        return if (big_blocks * most_splits < self.multiprocessors) 2 else 0;
+        if (big_blocks * most_splits < self.multiprocessors) return 2;
+        return if (wide) 0 else 3;
     }
 
     /// A bf16 matrix padded to whole tiles, ready for the tensor core kernels.
@@ -597,10 +676,16 @@ pub const Gpu = struct {
         return self.tensor_cores and m * n * k >= self.tensor_core_min_work;
     }
 
-    pub fn packMatrix(self: *Gpu, src: anytype, rows: usize, cols: usize, rows_padded: usize, cols_padded: usize, transpose: bool) Error!Packed {
+    /// Optional output padding and transposition for packMatrix; padding defaults to the logical matrix shape.
+    pub const PackMatrixOpts = struct { rows_padded: ?usize = null, cols_padded: ?usize = null, transpose: bool = false };
+
+    /// Converts a matrix to bf16 and pads or transposes it for the tensor-core kernels.
+    pub fn packMatrix(self: *Gpu, src: anytype, rows: usize, cols: usize, opts: PackMatrixOpts) Error!Packed {
+        const rows_padded = opts.rows_padded orelse rows;
+        const cols_padded = opts.cols_padded orelse cols;
         const dst = try self.scratch(u16, rows_padded * cols_padded);
-        const args = pack(ga.PackArgs, .{ .rows = rows, .cols = cols, .rows_padded = rows_padded, .cols_padded = cols_padded, .src_stride = if (transpose) rows else cols, .transpose = transpose });
-        if (transpose) {
+        const args = pack(ga.PackArgs, .{ .rows = rows, .cols = cols, .rows_padded = rows_padded, .cols_padded = cols_padded, .src_stride = if (opts.transpose) rows else cols, .transpose = opts.transpose });
+        if (opts.transpose) {
             try self.launch(if (@typeInfo(@TypeOf(src)).pointer.child == u16) .transposeHalf else .packHalfTransposed, .{ toU32(cols_padded / 32), toU32(rows_padded / 32), 1 }, .{ src, dst, args });
         } else {
             try self.launchFlat(if (@typeInfo(@TypeOf(src)).pointer.child == u16) .packHalfCopy else .packHalf, rows_padded * cols_padded, .{ src, dst, args });
@@ -610,65 +695,135 @@ pub const Gpu = struct {
 
     pub fn im2colPacked(self: *Gpu, x: []const f32, d: conv.Dims) Error!Packed {
         const rows = conv.workItems(.im2col, d) / (d.k * d.k * d.c);
-        const rows_padded = std.mem.alignForward(usize, rows, 128);
-        const cols_padded = std.mem.alignForward(usize, d.k * d.k * d.c, 64);
+        const rows_padded = padTo(rows, .rows);
+        const cols_padded = padTo(d.k * d.k * d.c, .columns);
         const dst = try self.scratch(u16, rows_padded * cols_padded);
         try self.launch(.im2colHalf, .{ toU32(rows_padded), 1, 1 }, .{ x, dst, d, cols_padded });
         return .{ .data = dst, .rows_padded = rows_padded, .cols_padded = cols_padded };
     }
 
-    pub fn tf32Worthwhile(self: *Gpu, m: usize, n: usize, k: usize) bool {
-        return self.tf32 and m * n * k >= self.tensor_core_min_work;
+    /// Returns true when an f32 convolution of this size should run as an implicit GEMM (TF32 tensor cores when tf32 is set,
+    /// strict f32 otherwise) instead of building an im2col matrix.
+    pub fn f32ImplicitWorthwhile(self: *Gpu, m: usize, n: usize, k: usize) bool {
+        return m * n * k >= self.tensor_core_min_work;
     }
 
-    pub fn rotateWeightsF32(self: *Gpu, w: []const f32, k: usize, c_in: usize, c_out: usize) Error![]f32 {
+    /// A pitch and offset for reading or writing one group's slice out of a tensor whose rows hold all the groups.
+    /// APIs that accept ?Grouped use null for a dense operand.
+    pub const Grouped = struct { pitch: u32, offset: u32 };
+
+    // NOTE: CUDA-core measurements on CIFAR stage 2 selected the wide 128 x 128 tile from 128 output channels and 8192
+    // positions; the smaller stage 3 keeps the three-stage 128 x 64 tile. Weight gradients use the same channel threshold
+    // from 128 taps, while the tensor-core paths keep their existing tiles.
+    const wide_conv_min_c_out = 128;
+    const wide_conv_forward_min_positions = 8192;
+    const wide_conv_weight_min_taps = 128;
+    const dense_group: Grouped = .{ .pitch = 0, .offset = 0 };
+
+    /// Rotates (k, k, c_in, c_out) weights by 180 degrees and swaps their channel roles for the input gradient, padded to whole tiles.
+    /// The src argument selects one group's columns of the weights; null means dense weights.
+    pub fn rotateWeightsF32(self: *Gpu, w: []const f32, k: usize, c_in: usize, c_out: usize, src: ?Grouped) Error![]f32 {
+        const group = src orelse dense_group;
         const rows = k * k * c_out;
-        const cols_padded = std.mem.alignForward(usize, c_in, 64);
+        const cols_padded = padTo(c_in, .columns);
         const dst = try self.scratch(f32, rows * cols_padded);
-        try self.launchFlat(.rotateWeightsF32, dst.len, .{ w, dst, pack(ga.RotateArgs, .{ .k = k, .c_in = c_in, .c_out = c_out, .rows_padded = rows, .cols_padded = cols_padded }) });
+        const args = pack(ga.RotateArgs, .{
+            .k = k,
+            .c_in = c_in,
+            .c_out = c_out,
+            .rows_padded = rows,
+            .cols_padded = cols_padded,
+            .src_pitch = group.pitch,
+            .src_offset = 0,
+        });
+        try self.launchFlat(.rotateWeightsF32, dst.len, .{ w[group.offset..], dst, args });
         return dst;
     }
 
-    pub fn transposeF32(self: *Gpu, src: []const f32, rows: usize, cols: usize, rows_padded: usize, cols_padded: usize) Error![]f32 {
+    /// Transposes an f32 matrix into a zero-padded (cols_padded x rows_padded) copy. The read argument selects one group's
+    /// columns of a wider matrix; null means a dense source.
+    pub fn transposeF32(self: *Gpu, src: []const f32, rows: usize, cols: usize, rows_padded: usize, cols_padded: usize, read: ?Grouped) Error![]f32 {
+        const group = read orelse dense_group;
         const dst = try self.scratch(f32, rows_padded * cols_padded);
-        const args = pack(ga.PackArgs, .{ .rows = rows, .cols = cols, .rows_padded = rows_padded, .cols_padded = cols_padded, .src_stride = rows, .transpose = true });
-        try self.launch(.transposeF32, .{ toU32(cols_padded / 32), toU32(rows_padded / 32), 1 }, .{ src, dst, args });
+        const args = pack(ga.PackArgs, .{ .rows = rows, .cols = cols, .rows_padded = rows_padded, .cols_padded = cols_padded, .src_stride = if (group.pitch != 0) group.pitch else rows, .transpose = true });
+        try self.launch(.transposeF32, .{ toU32(cols_padded / 32), toU32(rows_padded / 32), 1 }, .{ src[group.offset..], dst, args });
         return dst;
     }
 
-    pub fn convTf32Forward(self: *Gpu, x: []const f32, w: []const f32, w_pitch: usize, out: []f32, geo: ga.ConvGeometry, accumulate: bool) Error!void {
+    /// Optional weight padding, accumulation and grouped output layout for convF32Forward; null c_layout means dense output.
+    pub const ConvF32ForwardOpts = struct { w_pitch: ?usize = null, accumulate: bool = false, c_layout: ?Grouped = null };
+
+    /// Forward (or, with reversed geometry and rotated weights, input-gradient) implicit GEMM over f32 activations: rounded to
+    /// TF32 on tensor cores when tf32 is set, strict f32 on the CUDA cores otherwise. With a non-null c_layout the result is
+    /// one group's slice of a grouped convolution's output, written with c_layout.pitch as the row stride.
+    pub fn convF32Forward(self: *Gpu, x: []const f32, w: []const f32, out: []f32, geo: ga.ConvGeometry, opts: ConvF32ForwardOpts) Error!void {
+        const c_layout = opts.c_layout orelse dense_group;
         const c_out: usize = geo.c_out;
         const m = @as(usize, geo.n) * geo.out_h * geo.out_w;
         const k_total = @as(usize, geo.k) * geo.k * geo.c;
-        const kernel_shape = pack(ga.TensorShape, .{ .m = m, .n = c_out, .k_padded = k_total, .n_padded = w_pitch, .accumulate = accumulate, .chunk = k_total, .transpose_out = false, .output_half = false, .split_stride = 0 });
-        try self.launch(.convTf32Forward, .{ ceilDiv(c_out, 64), ceilDiv(m, 128), 1 }, .{ x, w, out, kernel_shape, geo });
+        const kernel_shape = pack(ga.TensorShape, .{
+            .m = m,
+            .n = c_out,
+            .k_padded = k_total,
+            .n_padded = opts.w_pitch orelse c_out,
+            .accumulate = opts.accumulate,
+            .chunk = k_total,
+            .transpose_out = false,
+            .output_half = false,
+            .split_stride = 0,
+            .c_pitch = c_layout.pitch,
+            .c_offset = c_layout.offset,
+        });
+        const wide = !self.tf32 and c_out >= wide_conv_min_c_out and
+            m >= wide_conv_forward_min_positions and opts.c_layout == null;
+        try self.launch(if (self.tf32) .convTf32Forward else if (wide) .convExactForwardWide else .convExactForward, .{ ceilDiv(c_out, if (wide) 128 else 64), ceilDiv(m, 128), 1 }, .{ x, w, out, kernel_shape, geo });
     }
 
-    pub fn convTf32WeightGrad(self: *Gpu, dy_t: []const f32, x: []const f32, out: []f32, geo: ga.ConvGeometry) Error!void {
+    /// Weight gradient of the implicit GEMM over f32 activations; dy_t is the transposed output gradient (see transposeF32).
+    /// out is the full (taps, c_out) weight gradient, and with a non-null c_layout only the group's columns are accumulated into.
+    pub fn convF32WeightGrad(self: *Gpu, dy_t: []const f32, x: []const f32, out: []f32, geo: ga.ConvGeometry, c_layout: ?Grouped) Error!void {
+        const group = c_layout orelse dense_group;
         const c_out: usize = geo.c_out;
         const taps = @as(usize, geo.k) * geo.k * geo.c;
-        const positions_padded = std.mem.alignForward(usize, geo.positions, 32);
+        const positions_padded = padTo(geo.positions, .depth);
         const short = c_out <= 64;
-        const tile_rows: usize = if (short) 64 else 128;
-        const tile_cols: usize = if (short) 128 else 64;
+        const wide = !self.tf32 and c_out >= wide_conv_min_c_out and
+            taps >= wide_conv_weight_min_taps and c_layout == null;
+        const tile_rows: usize = if (wide) 128 else if (short) 64 else 128;
+        const tile_cols: usize = if (wide) 128 else if (short) 128 else 64;
         const blocks = @as(usize, ceilDiv(c_out, tile_rows)) * ceilDiv(taps, tile_cols);
         const splits = @max(1, @min(positions_padded / 256, (128 + blocks - 1) / blocks));
         const chunk = std.mem.alignForward(usize, (positions_padded + splits - 1) / splits, 16);
-        const kernel_shape = pack(ga.TensorShape, .{ .m = c_out, .n = taps, .k_padded = positions_padded, .n_padded = taps, .accumulate = true, .chunk = chunk, .transpose_out = true, .output_half = false, .split_stride = 0 });
-        const kernel: Kernel = if (short) .convTf32WeightGradShort else .convTf32WeightGrad;
-        const mark = self.step_used;
-        defer self.step_used = mark;
+        const kernel_shape = pack(ga.TensorShape, .{
+            .m = c_out,
+            .n = taps,
+            .k_padded = positions_padded,
+            .n_padded = taps,
+            .accumulate = true,
+            .chunk = chunk,
+            .transpose_out = true,
+            .output_half = false,
+            .split_stride = 0,
+            .c_pitch = group.pitch,
+            .c_offset = group.offset,
+        });
+        const kernel: Kernel = if (self.tf32) (if (short) .convTf32WeightGradShort else .convTf32WeightGrad) else if (wide) .convExactWeightGradWide else (if (short) .convExactWeightGradShort else .convExactWeightGrad);
+        const scope = self.scratchScope();
+        defer scope.restore();
         const parts = ceilDiv(positions_padded, chunk);
         const target, const shape = try self.orderedTarget(out, kernel_shape, parts);
+        // NOTE: a grouped launch writes only its slice of C, so the split-K workspaces of a deterministic run hold
+        // untouched memory outside it; zero them before the parts accumulate their slices.
+        if (target.ptr != out.ptr and c_layout != null) try self.fill(target, 0);
         try self.launch(kernel, .{ ceilDiv(taps, tile_cols), ceilDiv(c_out, tile_rows), parts }, .{ dy_t, x, target, shape, geo });
         try self.combineSplits(target, out, shape, parts, true);
     }
 
     pub fn packRotatedWeights(self: *Gpu, w: []const f32, k: usize, c_in: usize, c_out: usize) Error!Packed {
         const rows = k * k * c_out;
-        const cols_padded = std.mem.alignForward(usize, c_in, 64);
+        const cols_padded = padTo(c_in, .columns);
         const dst = try self.scratch(u16, rows * cols_padded);
-        try self.launchFlat(.packWeightsRotated, dst.len, .{ w, dst, pack(ga.RotateArgs, .{ .k = k, .c_in = c_in, .c_out = c_out, .rows_padded = rows, .cols_padded = cols_padded }) });
+        try self.launchFlat(.packWeightsRotated, dst.len, .{ w, dst, pack(ga.RotateArgs, .{ .k = k, .c_in = c_in, .c_out = c_out, .rows_padded = rows, .cols_padded = cols_padded, .src_pitch = 0, .src_offset = 0 }) });
         return .{ .data = dst, .rows_padded = rows, .cols_padded = cols_padded };
     }
 
@@ -676,7 +831,19 @@ pub const Gpu = struct {
         const half_out = @typeInfo(@TypeOf(out)).pointer.child == u16;
         const c_out: usize = geo.c_out;
         const m = @as(usize, geo.n) * geo.out_h * geo.out_w;
-        const kernel_shape = pack(ga.TensorShape, .{ .m = m, .n = c_out, .k_padded = w.rows_padded, .n_padded = w.cols_padded, .accumulate = accumulate, .chunk = w.rows_padded, .transpose_out = false, .output_half = half_out, .split_stride = 0 });
+        const kernel_shape = pack(ga.TensorShape, .{
+            .m = m,
+            .n = c_out,
+            .k_padded = w.rows_padded,
+            .n_padded = w.cols_padded,
+            .accumulate = accumulate,
+            .chunk = w.rows_padded,
+            .transpose_out = false,
+            .output_half = half_out,
+            .split_stride = 0,
+            .c_pitch = 0,
+            .c_offset = 0,
+        });
         const wide = c_out % 128 == 0 and ceilDiv(m, 128) * (c_out / 128) >= 96;
         try self.launch(if (wide) .convGemmForwardWide else .convGemmForward, .{ ceilDiv(c_out, if (wide) 128 else 64), ceilDiv(m, 128), 1 }, .{ x_half, w.data, out, kernel_shape, geo });
     }
@@ -687,7 +854,7 @@ pub const Gpu = struct {
         const c_out: usize = geo.c_out;
         std.debug.assert(c_out % 8 == 0 and dy.len == @as(usize, geo.positions) * c_out);
         const taps = @as(usize, geo.k) * geo.k * geo.c;
-        const k_padded = std.mem.alignForward(usize, geo.positions, 32);
+        const k_padded = padTo(geo.positions, .depth);
         const short = c_out <= 64;
         const wide = c_out % 128 == 0;
         const tile_rows: usize = if (short) 64 else 128;
@@ -695,11 +862,23 @@ pub const Gpu = struct {
         const n_padded = std.mem.alignForward(usize, taps, tile_cols);
         const blocks = ceilDiv(c_out, tile_rows) * (n_padded / tile_cols);
         const splits = @max(1, @min(k_padded / 256, (128 + blocks - 1) / blocks));
-        const chunk = std.mem.alignForward(usize, (k_padded + splits - 1) / splits, 32);
-        const kernel_shape = pack(ga.TensorShape, .{ .m = c_out, .n = taps, .k_padded = k_padded, .n_padded = n_padded, .accumulate = true, .chunk = chunk, .transpose_out = true, .output_half = false, .split_stride = 0 });
+        const chunk = padTo((k_padded + splits - 1) / splits, .depth);
+        const kernel_shape = pack(ga.TensorShape, .{
+            .m = c_out,
+            .n = taps,
+            .k_padded = k_padded,
+            .n_padded = n_padded,
+            .accumulate = true,
+            .chunk = chunk,
+            .transpose_out = true,
+            .output_half = false,
+            .split_stride = 0,
+            .c_pitch = 0,
+            .c_offset = 0,
+        });
         const kernel: Kernel = if (short) .convGemmWeightGradShort else if (wide) .convGemmWeightGradWide else .convGemmWeightGrad;
-        const mark = self.step_used;
-        defer self.step_used = mark;
+        const scope = self.scratchScope();
+        defer scope.restore();
         const parts = ceilDiv(k_padded, chunk);
         const target, const shape = try self.orderedTarget(out, kernel_shape, parts);
         try self.launch(kernel, .{ toU32(n_padded / tile_cols), ceilDiv(c_out, tile_rows), parts }, .{ dy, x_half, target, shape, geo });
@@ -724,12 +903,24 @@ pub const Gpu = struct {
         const blocks = (a.rows_padded / 128) * (b.cols_padded / 64);
         // NOTE: a bf16 result is rounded once per element, so K is never split across blocks for it.
         const splits = if (half_out) 1 else @max(1, @min(a.cols_padded / 256, (128 + blocks - 1) / blocks));
-        const chunk = std.mem.alignForward(usize, (a.cols_padded + splits - 1) / splits, 32);
+        const chunk = padTo((a.cols_padded + splits - 1) / splits, .depth);
         std.debug.assert(!half_out or (chunk >= a.cols_padded and !transpose_out));
         if (!half_out and chunk < a.cols_padded and !accumulate) try self.fill(out, 0);
-        const kernel_shape = pack(ga.TensorShape, .{ .m = shape.m, .n = shape.n, .k_padded = a.cols_padded, .n_padded = b.cols_padded, .accumulate = accumulate, .chunk = chunk, .transpose_out = transpose_out, .output_half = half_out, .split_stride = 0 });
-        const mark = self.step_used;
-        defer self.step_used = mark;
+        const kernel_shape = pack(ga.TensorShape, .{
+            .m = shape.m,
+            .n = shape.n,
+            .k_padded = a.cols_padded,
+            .n_padded = b.cols_padded,
+            .accumulate = accumulate,
+            .chunk = chunk,
+            .transpose_out = transpose_out,
+            .output_half = half_out,
+            .split_stride = 0,
+            .c_pitch = 0,
+            .c_offset = 0,
+        });
+        const scope = self.scratchScope();
+        defer scope.restore();
         const parts = ceilDiv(a.cols_padded, chunk);
         const target, const launched = if (half_out) .{ out, kernel_shape } else try self.orderedTarget(out, kernel_shape, parts);
         try self.launch(.sgemmTensor, .{ toU32(b.cols_padded / 64), toU32(a.rows_padded / 128), parts }, .{ a.data, b.data, target, launched });
@@ -737,11 +928,11 @@ pub const Gpu = struct {
     }
 
     fn matmulTensor(self: *Gpu, a: anytype, b: anytype, out: anytype, shape: MatmulShape, opts: MatmulOpts) Error!void {
-        const mark = self.step_used;
-        defer self.step_used = mark;
-        const k_padded = std.mem.alignForward(usize, shape.k, 32);
-        const a_packed = try self.packMatrix(a, shape.m, shape.k, std.mem.alignForward(usize, shape.m, 128), k_padded, opts.trans_a);
-        const b_packed = try self.packMatrix(b, shape.k, shape.n, k_padded, std.mem.alignForward(usize, shape.n, 64), opts.trans_b);
+        const scope = self.scratchScope();
+        defer scope.restore();
+        const k_padded = padTo(shape.k, .depth);
+        const a_packed = try self.packMatrix(a, shape.m, shape.k, .{ .rows_padded = padTo(shape.m, .rows), .cols_padded = k_padded, .transpose = opts.trans_a });
+        const b_packed = try self.packMatrix(b, shape.k, shape.n, .{ .rows_padded = k_padded, .cols_padded = padTo(shape.n, .columns), .transpose = opts.trans_b });
         try self.matmulPacked(a_packed, b_packed, out, shape, opts.accumulate, false);
     }
     pub fn elementwise(self: *Gpu, op: BinaryOp, a: anytype, b: anytype, out: anytype, plan: BroadcastPlan) Error!void {
@@ -817,20 +1008,24 @@ pub const Gpu = struct {
         try self.launchFlat(variant(.softmaxBackward, dx), 32 * (y.len / cols), .{ y, dy, dx, y.len / cols, cols, scale });
     }
 
+    fn launchHalfConversion(self: *Gpu, comptime kernel: Kernel, x: anytype, y: anytype) Error!void {
+        try self.launchFlat(kernel, x.len, .{ x, y, x.len });
+    }
+
     pub fn toHalf(self: *Gpu, x: []const f32, y: []u16) Error!void {
-        try self.launchFlat(.toHalf, x.len, .{ x, y, x.len });
+        try self.launchHalfConversion(.toHalf, x, y);
     }
 
     pub fn fromHalf(self: *Gpu, x: []const u16, y: []f32) Error!void {
-        try self.launchFlat(.fromHalf, x.len, .{ x, y, x.len });
+        try self.launchHalfConversion(.fromHalf, x, y);
     }
 
     pub fn addFromHalf(self: *Gpu, x: []const u16, y: []f32) Error!void {
-        try self.launchFlat(.addFromHalf, x.len, .{ x, y, x.len });
+        try self.launchHalfConversion(.addFromHalf, x, y);
     }
 
     pub fn addToHalf(self: *Gpu, x: []const f32, y: []u16) Error!void {
-        try self.launchFlat(.addToHalf, x.len, .{ x, y, x.len });
+        try self.launchHalfConversion(.addToHalf, x, y);
     }
 
     pub fn activation(self: *Gpu, x: anytype, out: anytype, kind: Activation) Error!void {
@@ -841,17 +1036,24 @@ pub const Gpu = struct {
         try self.launchFlat(variant(.activationBackward, g_in), x.len, .{ x, y, g_out, g_in, x.len, kind });
     }
 
-    pub fn addRelu(self: *Gpu, a: anytype, b: anytype, out: anytype) Error!void {
+    fn addReluPlan(out: anytype, comptime backward: bool) struct { kernel: Kernel, len: usize } {
         const E = @typeInfo(@TypeOf(out)).pointer.child;
-        if (E == u16 and out.len % 4 == 0) return self.launchFlat(.addReluQuad, out.len / 4, .{ a, b, out, out.len });
-        try self.launchFlat(if (E == u16) .addReluHalf else .addRelu, out.len, .{ a, b, out, out.len });
+        if (E == u16 and out.len % 4 == 0) return .{ .kernel = if (backward) .addReluBackwardQuad else .addReluQuad, .len = out.len / 4 };
+        return .{ .kernel = if (backward)
+            (if (E == u16) .addReluBackwardHalf else .addReluBackward)
+        else
+            (if (E == u16) .addReluHalf else .addRelu), .len = out.len };
+    }
+
+    pub fn addRelu(self: *Gpu, a: anytype, b: anytype, out: anytype) Error!void {
+        const plan = addReluPlan(out, false);
+        try self.launchFlat(plan.kernel, plan.len, .{ a, b, out, out.len });
     }
 
     pub fn addReluBackward(self: *Gpu, out: anytype, g: anytype, grad_a: anytype, grad_b: anytype, a_needs_grad: bool, b_needs_grad: bool) Error!void {
-        const E = @typeInfo(@TypeOf(out)).pointer.child;
         const flags: u32 = @as(u32, @intFromBool(a_needs_grad)) | @as(u32, @intFromBool(b_needs_grad)) << 1;
-        if (E == u16 and out.len % 4 == 0) return self.launchFlat(.addReluBackwardQuad, out.len / 4, .{ out, g, grad_a, grad_b, out.len, flags });
-        try self.launchFlat(if (E == u16) .addReluBackwardHalf else .addReluBackward, out.len, .{ out, g, grad_a, grad_b, out.len, flags });
+        const plan = addReluPlan(out, true);
+        try self.launchFlat(plan.kernel, plan.len, .{ out, g, grad_a, grad_b, out.len, flags });
     }
 
     pub fn addInPlace(self: *Gpu, dst: anytype, src: anytype) Error!void {
@@ -893,8 +1095,8 @@ pub const Gpu = struct {
         var launched = args;
         launched.row_stride = blocks * 8;
         launched.ordered = @intFromBool(self.deterministic);
-        const mark = self.step_used;
-        defer self.step_used = mark;
+        const scope = self.scratchScope();
+        defer scope.restore();
         const partial: []f32 = if (self.deterministic) try self.scratch(f32, @as(usize, blocks) * 2 * args.channels) else &.{};
         launched.partial = partial.ptr;
         try self.launch(if (E == u16) .columnReduceHalf else .columnReduce, .{ blocks, ceilDiv(args.channels, 32), 1 }, .{launched});
@@ -906,7 +1108,21 @@ pub const Gpu = struct {
 
     fn columns(a: anytype, out: []f32, kind: ColumnKind) ga.ColumnArgs {
         const channels = if (kind == .sum) out.len else out.len / 2;
-        return .{ .a = @ptrCast(@alignCast(a.ptr)), .b = @ptrCast(@alignCast(a.ptr)), .mean = out.ptr, .inv_std = out.ptr, .mask = @ptrCast(@alignCast(a.ptr)), .out = out.ptr, .partial = out.ptr, .ordered = 0, .rows = @intCast(a.len / channels), .channels = @intCast(channels), .row_stride = 0, .kind = @backingInt(kind), .scale = 1 };
+        return .{
+            .a = @ptrCast(@alignCast(a.ptr)),
+            .b = @ptrCast(@alignCast(a.ptr)),
+            .mean = out.ptr,
+            .inv_std = out.ptr,
+            .mask = @ptrCast(@alignCast(a.ptr)),
+            .out = out.ptr,
+            .partial = out.ptr,
+            .ordered = 0,
+            .rows = @intCast(a.len / channels),
+            .channels = @intCast(channels),
+            .row_stride = 0,
+            .kind = @backingInt(kind),
+            .scale = 1,
+        };
     }
 
     pub fn columnSums(self: *Gpu, in: []const f32, out: []f32) Error!void {
@@ -984,7 +1200,23 @@ pub const Gpu = struct {
     pub fn gather(self: *Gpu, from: GatherFrom, to: GatherTo, start: usize, augment: Augment) Error!void {
         const rows = to.labels.len;
         const pixels = to.batch.len / rows;
-        const args = pack(ga.GatherArgs, .{ .start = start, .rows = rows, .pixels = pixels, .max_shift = augment.max_shift, .max_angle = augment.max_angle, .max_scale = augment.max_scale, .channels = augment.channels, .flip = augment.flip, .mirror = augment.mirror, .cutout = augment.cutout, .x0 = augment.box.x0, .y0 = augment.box.y0, .x1 = augment.box.x1, .y1 = augment.box.y1, .seed = augment.seed });
+        const args = pack(ga.GatherArgs, .{
+            .start = start,
+            .rows = rows,
+            .pixels = pixels,
+            .max_shift = augment.max_shift,
+            .max_angle = augment.max_angle,
+            .max_scale = augment.max_scale,
+            .channels = augment.channels,
+            .flip = augment.flip,
+            .mirror = augment.mirror,
+            .cutout = augment.cutout,
+            .x0 = augment.box.x0,
+            .y0 = augment.box.y0,
+            .x1 = augment.box.x1,
+            .y1 = augment.box.y1,
+            .seed = augment.seed,
+        });
         try self.launchFlat(.gather, rows * pixels, .{ from.images, from.labels, from.order, to.batch, to.labels, to.other_labels, args });
     }
 };

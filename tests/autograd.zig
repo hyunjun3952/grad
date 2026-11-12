@@ -336,6 +336,50 @@ const WideConvNet = struct {
     }
 };
 
+const DilatedConvNet = struct {
+    const X = Tensor(f32, &.{ 4, 16, 16, 64 });
+    const W = Tensor(f32, &.{ 576, 32 });
+    const Y = Tensor(f32, &.{ 4, 16 * 16 * 32 });
+
+    pub const Inputs = struct { x: X, w: W, y: Y };
+    pub const names = .{ "x", "w", "y" };
+    pub const labels: [4]u8 = @splat(0);
+    const Result = struct { loss: Var(Tensor(f32, &.{})), x: Var(X), w: Var(W), y: Var(Y) };
+
+    pub fn build(t: *Tape, p: Inputs, _: []const u8) !Result {
+        const x = try t.leaf(p.x);
+        const w = try t.leaf(p.w);
+        const y = try t.leaf(p.y);
+        return .{ .loss = try t.mse(reshape(try t.conv2d(x, w, .{ .pad = 2, .dilation = 2 }), &.{ 4, 16 * 16 * 32 }), y), .x = x, .w = w, .y = y };
+    }
+
+    pub fn acceptable(_: Allocator, _: Inputs) !bool {
+        return true;
+    }
+};
+
+const GroupedConvNet = struct {
+    const X = Tensor(f32, &.{ 8, 16, 16, 64 });
+    const W = Tensor(f32, &.{ 144, 64 });
+    const Y = Tensor(f32, &.{ 8, 16 * 16 * 64 });
+
+    pub const Inputs = struct { x: X, w: W, y: Y };
+    pub const names = .{ "x", "w", "y" };
+    pub const labels: [8]u8 = @splat(0);
+    const Result = struct { loss: Var(Tensor(f32, &.{})), x: Var(X), w: Var(W), y: Var(Y) };
+
+    pub fn build(t: *Tape, p: Inputs, _: []const u8) !Result {
+        const x = try t.leaf(p.x);
+        const w = try t.leaf(p.w);
+        const y = try t.leaf(p.y);
+        return .{ .loss = try t.mse(reshape(try t.conv2d(x, w, .{ .pad = 1, .groups = 4 }), &.{ 8, 16 * 16 * 64 }), y), .x = x, .w = w, .y = y };
+    }
+
+    pub fn acceptable(_: Allocator, _: Inputs) !bool {
+        return true;
+    }
+};
+
 fn LayerNormNet(comptime rows: usize, comptime cols: usize) type {
     return struct {
         const X = Tensor(f32, &.{ rows, cols });
@@ -689,7 +733,16 @@ const BnAddReluCase = struct {
     pub const names = .{ "x", "r", "gamma", "beta", "v" };
     pub const value_names = BnCase.value_names;
     pub const labels = BnCase.labels;
-    const Result = struct { loss: Var(Tensor(f32, &.{})), x: Var(BnCase.X), r: Var(BnCase.X), gamma: Var(BnCase.Channels), beta: Var(BnCase.Channels), v: Var(BnCase.V), running_mean: BnCase.Channels, running_var: BnCase.Channels };
+    const Result = struct {
+        loss: Var(Tensor(f32, &.{})),
+        x: Var(BnCase.X),
+        r: Var(BnCase.X),
+        gamma: Var(BnCase.Channels),
+        beta: Var(BnCase.Channels),
+        v: Var(BnCase.V),
+        running_mean: BnCase.Channels,
+        running_var: BnCase.Channels,
+    };
 
     fn network(t: *Tape, p: Inputs, label_slice: []const u8, comptime fused: bool) !Result {
         const x = try t.leaf(p.x);
@@ -1185,24 +1238,6 @@ test "a convolution on bf16 activations agrees with the f32 convolution within b
     for (wide_dw, half_dw) |want, got| try testing.expectApproxEqAbs(want, got, 0.6 + 0.03 * @abs(want));
 }
 
-test "a gpu im2col convolution that rebuilds its column matrix in the backward pass gives the same outputs and gradients" {
-    const gpu = try gpu_mod.Gpu.forTest(32 << 20);
-    defer gpu.deinit();
-    var prng = std.Random.DefaultPrng.init(38);
-    const rng = prng.random();
-    var values: [2 * 8 * 8 * 64 + 576 * 32 + 2 * 8 * 8 * 32]f32 = undefined;
-    for (&values) |*v| v.* = rng.floatNorm(f32) * 0.3;
-    const x = values[0 .. 2 * 8 * 8 * 64];
-    const w = values[x.len..][0 .. 576 * 32];
-    const g = values[x.len + w.len ..];
-    var results: [2][2 * 8 * 8 * 32 + 2 * 8 * 8 * 64 + 576 * 32]f32 = undefined;
-    for (&results, [_]bool{ false, true }) |*r, recompute| {
-        gpu.recompute_columns = recompute;
-        try runConvChain(false, gpu, x, w, g, r[0..g.len], r[g.len..][0..x.len], r[g.len + x.len ..]);
-    }
-    try testing.expectEqualSlices(f32, &results[0], &results[1]);
-}
-
 test "softmax rows, with and without a causal mask, have correct values and gradients on the cpu and the gpu" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1476,6 +1511,9 @@ test "grouped, depthwise and dilated convolutions match a direct convolution, fi
         .{ ConvOpts{ .pad = 2, .dilation = 2 }, 3, 3, 4 },
         .{ ConvOpts{ .stride = 2, .pad = 2, .dilation = 2, .groups = 2 }, 3, 4, 2 },
         .{ ConvOpts{ .dilation = 2, .groups = 2 }, 2, 2, 4 },
+        // Padding beyond the reverse geometry (dilation * (k - 1) < pad) used to fail to compile.
+        .{ ConvOpts{ .pad = 1 }, 1, 3, 4 },
+        .{ ConvOpts{ .pad = 1, .groups = 2 }, 1, 4, 6 },
     }) |config| {
         const Case = ConvCase(config[0], config[1], config[2], config[3]);
         try Case.expectDirectConvolution();
@@ -1486,6 +1524,16 @@ test "grouped, depthwise and dilated convolutions match a direct convolution, fi
 
 test "the wide 128x128 tensor-core kernels agree with the cpu on a grid large enough to select them" {
     try gradcheck.expectTensorCoresClose(WideConvNet, 12, 0.2);
+}
+
+test "dilated convolutions on the implicit GEMM match the cpu" {
+    try gradcheck.expectGpuMatchesCpu(DilatedConvNet, 41, 1e-4);
+    try gradcheck.expectTensorCoresClose(DilatedConvNet, 42, 0.2);
+}
+
+test "grouped convolutions on the implicit GEMM match the cpu" {
+    try gradcheck.expectGpuMatchesCpu(GroupedConvNet, 43, 1e-4);
+    try gradcheck.expectTensorCoresClose(GroupedConvNet, 44, 3e-2);
 }
 
 test "implicit-GEMM convolutions on tensor cores match a direct convolution and the cpu" {

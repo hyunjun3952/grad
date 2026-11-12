@@ -100,20 +100,32 @@ pub fn BroadcastResult(comptime A: type, comptime B: type) type {
     return shaped(A.Elem, bc.dims);
 }
 
-fn binary(gpa: Allocator, a: anytype, b: anytype, comptime f: anytype) Error!BroadcastResult(@TypeOf(a), @TypeOf(b)) {
+const BinaryOp = enum { add, sub, mul, div };
+const UnaryOp = enum { neg, relu, exp, log };
+
+fn applyBinary(comptime op: BinaryOp, x: anytype, y: anytype) @TypeOf(x) {
+    return switch (op) {
+        .add => x + y,
+        .sub => x - y,
+        .mul => x * y,
+        .div => x / y,
+    };
+}
+
+fn binary(gpa: Allocator, a: anytype, b: anytype, comptime op: BinaryOp) Error!BroadcastResult(@TypeOf(a), @TypeOf(b)) {
     const A = @TypeOf(a);
     const B = @TypeOf(b);
     const R = BroadcastResult(A, B);
     const out = try R.empty(gpa);
 
     if (comptime sameShape(A.shape, B.shape)) {
-        for (out.data, a.data, b.data) |*o, x, y| o.* = f(x, y);
+        for (out.data, a.data, b.data) |*o, x, y| o.* = applyBinary(op, x, y);
     } else if (comptime B.len == 1 and R.len == A.len) {
         const y = b.data[0];
-        for (out.data, a.data) |*o, x| o.* = f(x, y);
+        for (out.data, a.data) |*o, x| o.* = applyBinary(op, x, y);
     } else if (comptime A.len == 1 and R.len == B.len) {
         const x = a.data[0];
-        for (out.data, b.data) |*o, y| o.* = f(x, y);
+        for (out.data, b.data) |*o, y| o.* = applyBinary(op, x, y);
     } else {
         const bc = comptime broadcast(A.shape, B.shape);
         const last = R.rank - 1;
@@ -122,7 +134,7 @@ fn binary(gpa: Allocator, a: anytype, b: anytype, comptime f: anytype) Error!Bro
         var base: usize = 0;
         while (base < R.len) : (base += inner) {
             for (out.data[base..][0..inner], 0..) |*o, i| {
-                o.* = f(a.data[w.off[0] + i * bc.a[last]], b.data[w.off[1] + i * bc.b[last]]);
+                o.* = applyBinary(op, a.data[w.off[0] + i * bc.a[last]], b.data[w.off[1] + i * bc.b[last]]);
             }
             w.next();
         }
@@ -130,74 +142,51 @@ fn binary(gpa: Allocator, a: anytype, b: anytype, comptime f: anytype) Error!Bro
     return out;
 }
 
-fn unary(gpa: Allocator, a: anytype, comptime f: anytype) Error!@TypeOf(a) {
+fn applyUnary(comptime op: UnaryOp, x: anytype) @TypeOf(x) {
+    return switch (op) {
+        .neg => -x,
+        .relu => @max(x, 0),
+        .exp => @exp(x),
+        .log => @log(x),
+    };
+}
+
+fn unary(gpa: Allocator, a: anytype, comptime op: UnaryOp) Error!@TypeOf(a) {
     const out = try @TypeOf(a).empty(gpa);
-    for (out.data, a.data) |*o, x| o.* = f(x);
+    for (out.data, a.data) |*o, x| o.* = applyUnary(op, x);
     return out;
 }
 
 pub fn add(gpa: Allocator, a: anytype, b: anytype) Error!BroadcastResult(@TypeOf(a), @TypeOf(b)) {
-    return binary(gpa, a, b, struct {
-        fn f(x: anytype, y: anytype) @TypeOf(x) {
-            return x + y;
-        }
-    }.f);
+    return binary(gpa, a, b, .add);
 }
 
 pub fn sub(gpa: Allocator, a: anytype, b: anytype) Error!BroadcastResult(@TypeOf(a), @TypeOf(b)) {
-    return binary(gpa, a, b, struct {
-        fn f(x: anytype, y: anytype) @TypeOf(x) {
-            return x - y;
-        }
-    }.f);
+    return binary(gpa, a, b, .sub);
 }
 
 pub fn mul(gpa: Allocator, a: anytype, b: anytype) Error!BroadcastResult(@TypeOf(a), @TypeOf(b)) {
-    return binary(gpa, a, b, struct {
-        fn f(x: anytype, y: anytype) @TypeOf(x) {
-            return x * y;
-        }
-    }.f);
+    return binary(gpa, a, b, .mul);
 }
 
 pub fn div(gpa: Allocator, a: anytype, b: anytype) Error!BroadcastResult(@TypeOf(a), @TypeOf(b)) {
-    return binary(gpa, a, b, struct {
-        fn f(x: anytype, y: anytype) @TypeOf(x) {
-            return x / y;
-        }
-    }.f);
+    return binary(gpa, a, b, .div);
 }
 
 pub fn neg(gpa: Allocator, a: anytype) Error!@TypeOf(a) {
-    return unary(gpa, a, struct {
-        fn f(x: anytype) @TypeOf(x) {
-            return -x;
-        }
-    }.f);
+    return unary(gpa, a, .neg);
 }
 
 pub fn relu(gpa: Allocator, a: anytype) Error!@TypeOf(a) {
-    return unary(gpa, a, struct {
-        fn f(x: anytype) @TypeOf(x) {
-            return @max(x, 0);
-        }
-    }.f);
+    return unary(gpa, a, .relu);
 }
 
 pub fn exp(gpa: Allocator, a: anytype) Error!@TypeOf(a) {
-    return unary(gpa, a, struct {
-        fn f(x: anytype) @TypeOf(x) {
-            return @exp(x);
-        }
-    }.f);
+    return unary(gpa, a, .exp);
 }
 
 pub fn log(gpa: Allocator, a: anytype) Error!@TypeOf(a) {
-    return unary(gpa, a, struct {
-        fn f(x: anytype) @TypeOf(x) {
-            return @log(x);
-        }
-    }.f);
+    return unary(gpa, a, .log);
 }
 
 pub const Reduction = enum { sum, mean, argmax };

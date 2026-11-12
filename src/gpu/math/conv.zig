@@ -1,6 +1,21 @@
 const bf16 = @import("bf16.zig");
 
-pub const Op = enum { im2col, col2im, col2imHalf, maxPool, maxPoolBackward, avgPool, avgPoolBackward, maxPoolHalf, maxPoolBackwardHalf, avgPoolHalf, avgPoolBackwardHalf, groupedForward, groupedInputGrad, groupedWeightGrad };
+pub const Op = enum {
+    im2col,
+    col2im,
+    col2imHalf,
+    maxPool,
+    maxPoolBackward,
+    avgPool,
+    avgPoolBackward,
+    maxPoolHalf,
+    maxPoolBackwardHalf,
+    avgPoolHalf,
+    avgPoolBackwardHalf,
+    groupedForward,
+    groupedInputGrad,
+    groupedWeightGrad,
+};
 
 const Index = u32;
 
@@ -37,16 +52,16 @@ pub inline fn patchOf(row: Index, d: Dims) Patch {
 
 pub inline fn patchValue(x: [*]const f32, patch: Patch, cc: Index, d: Dims) f32 {
     const tap = cc / d.c;
-    const py = patch.top + tap / d.k;
-    const px = patch.left + tap % d.k;
+    const py = patch.top + tap / d.k * d.dilation;
+    const px = patch.left + tap % d.k * d.dilation;
     const inside = py >= d.pad and px >= d.pad and py - d.pad < d.h and px - d.pad < d.w;
     return if (inside) x[((patch.n * d.h + py - d.pad) * d.w + px - d.pad) * d.c + cc % d.c] else 0;
 }
 
 pub inline fn patchValues(x: [*]const f32, patch: Patch, cc: Index, d: Dims) @Vector(4, f32) {
     const tap = cc / d.c;
-    const py = patch.top + tap / d.k;
-    const px = patch.left + tap % d.k;
+    const py = patch.top + tap / d.k * d.dilation;
+    const px = patch.left + tap % d.k * d.dilation;
     const inside = py >= d.pad and px >= d.pad and py - d.pad < d.h and px - d.pad < d.w;
     if (!inside) return @splat(0);
     const at = ((patch.n * d.h + py - d.pad) * d.w + px - d.pad) * d.c + cc % d.c;
@@ -72,13 +87,15 @@ inline fn col2imSum(comptime T: type, t: Index, dcol: [*]const T, d: Dims) f32 {
     var total: f32 = 0;
     var ky: Index = 0;
     while (ky < d.k) : (ky += 1) {
-        if (y < ky or (d.stride != 1 and (y - ky) % d.stride != 0)) continue;
-        const oy = if (d.stride == 1) y - ky else (y - ky) / d.stride;
+        const shift_y = ky * d.dilation;
+        if (y < shift_y or (d.stride != 1 and (y - shift_y) % d.stride != 0)) continue;
+        const oy = if (d.stride == 1) y - shift_y else (y - shift_y) / d.stride;
         if (oy >= oh) continue;
         var kx: Index = 0;
         while (kx < d.k) : (kx += 1) {
-            if (x < kx or (d.stride != 1 and (x - kx) % d.stride != 0)) continue;
-            const ox = if (d.stride == 1) x - kx else (x - kx) / d.stride;
+            const shift_x = kx * d.dilation;
+            if (x < shift_x or (d.stride != 1 and (x - shift_x) % d.stride != 0)) continue;
+            const ox = if (d.stride == 1) x - shift_x else (x - shift_x) / d.stride;
             if (ox >= ow) continue;
             const row = (n * oh + oy) * ow + ox;
             const value = dcol[row * kc + (ky * d.k + kx) * d.c + ch];

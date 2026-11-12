@@ -60,7 +60,6 @@ const Options = struct {
     tensor_cores: bool = false,
     tf32: bool = false,
     deterministic: bool = false,
-    recompute: bool = false,
     progress: bool = false,
     mirrored: bool = false,
     cudnn_dir: ?[:0]const u8 = null,
@@ -93,8 +92,6 @@ const Options = struct {
                 o.progress = true;
             } else if (std.mem.eql(u8, arg, "--deterministic")) {
                 o.deterministic = true;
-            } else if (std.mem.eql(u8, arg, "--recompute")) {
-                o.recompute = true;
             } else if (std.mem.eql(u8, arg, "--tf32")) {
                 o.tf32 = true;
             } else if (std.mem.eql(u8, arg, "--tensor-cores")) {
@@ -254,13 +251,14 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
             var trace: onnx.Trace = .{ .gpa = gpa };
             defer trace.deinit();
             var tape: Tape = .{ .gpa = arena.allocator(), .par = par, .trace = &trace };
-            const input = try tape.constant(try tape.zeroedTensor(Tensor(f32, &.{ 1, pixels })));
+            // NOTE: traced with two images, not one, so that the leading axis of the exported graph can be told from a size-one axis; it is dynamic.
+            const input = try tape.constant(try tape.zeroedTensor(Tensor(f32, &.{ 2, pixels })));
             const logits = try Spec.forward(model, &tape, input);
 
             const slices = nn.state(model);
             const weights = try onnx.WeightSet(slices.len).collect(gpa, par, slices);
             defer weights.deinit(gpa);
-            try onnx.save(gpa, io, path, .{ .trace = &trace, .weights = &weights.items, .inputs = &.{onnx.View.of(input)}, .outputs = &.{onnx.View.of(logits)} });
+            try onnx.save(gpa, io, path, .{ .trace = &trace, .weights = &weights.items, .inputs = &.{onnx.View.of(input)}, .outputs = &.{onnx.View.of(logits)}, .dynamic_batch = true });
         }
 
         const Feed = struct {
@@ -304,7 +302,12 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
 
             // Fills the batch with the slice number slice of the shuffled order; slices are batch_size rows long.
             fn fill(self: Feed, slice: usize, augment: augment_math.Config) !void {
-                if (self.par.gpu) |dev| return dev.gather(.{ .images = self.device.images, .labels = self.device.labels, .order = self.order_device }, .{ .batch = self.batch.data, .labels = self.labels, .other_labels = self.other_labels }, slice * batch_size, augment);
+                if (self.par.gpu) |dev| return dev.gather(
+                    .{ .images = self.device.images, .labels = self.device.labels, .order = self.order_device },
+                    .{ .batch = self.batch.data, .labels = self.labels, .other_labels = self.other_labels },
+                    slice * batch_size,
+                    augment,
+                );
                 const rows = self.order[slice * batch_size ..][0..batch_size];
                 for (rows, 0..) |idx, row| {
                     const partner = (row + 1) % batch_size;
@@ -354,176 +357,275 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
             };
         }
 
-        // Trains one replica. Replica 0 runs on the main thread, owns the console output, the evaluation and the optional outputs.
-        // NOTE: every replica builds its own Gpu inside its thread, because a CUDA context is current per thread.
-        fn work(shared: *Shared, index: usize) !void {
-            const io = shared.io;
-            const gpa = shared.gpa;
+        fn initGpu(shared: *Shared, index: usize) !?*Gpu {
             const opts = shared.opts;
-            const out = shared.out;
-            const train = shared.train;
-            const test_set = shared.test_set;
-            const replicas = opts.replicas;
-
             // NOTE: --scratch=N reserves N MiB for each arena instead of Spec.scratch_bytes and a quarter of it; the zero arena
             // holds the gradients, which need about as much as the activations in bf16, hence the same size for both.
             const scratch_bytes: usize = if (opts.scratch_mib) |mib| mib << 20 else Spec.scratch_bytes;
             const zero_bytes: ?usize = if (opts.scratch_mib) |mib| mib << 20 else null;
-            const gpu: ?*Gpu = if (opts.gpu) try Gpu.init(gpa, .{ .step_bytes = scratch_bytes, .zero_bytes = zero_bytes, .device = index % @max(1, Gpu.deviceCount()) }) else null;
-            defer if (gpu) |dev| dev.deinit();
+            const gpu: ?*Gpu = if (opts.gpu) try Gpu.init(shared.gpa, .{
+                .step_bytes = scratch_bytes,
+                .zero_bytes = zero_bytes,
+                .device = index % @max(1, Gpu.deviceCount()),
+                .tensor_cores = opts.tensor_cores,
+                .tf32 = opts.tf32,
+                .deterministic = opts.deterministic,
+            }) else null;
             if (gpu) |dev| {
-                if (opts.profile and index == 0) dev.startProfile(io);
-                dev.tensor_cores = opts.tensor_cores;
-                dev.tf32 = opts.tf32;
-                dev.deterministic = opts.deterministic;
-                dev.recompute_columns = opts.recompute;
-                if (opts.cudnn_dir) |dir| dev.enableCudnn(dir) catch |err| if (index == 0) try out.print("cuDNN unavailable ({s}), using the built-in kernels\n", .{@errorName(err)});
+                if (opts.profile and index == 0) dev.startProfile(shared.io);
+                if (opts.cudnn_dir) |dir| dev.enableCudnn(dir) catch |err| if (index == 0) try shared.out.print("cuDNN unavailable ({s}), using the built-in kernels\n", .{@errorName(err)});
             }
-            // NOTE: replica threads must not share the CPU worker pool, which is a single global one.
-            const par: kernels.Parallel = .{ .io = if (replicas > 1) null else io, .threads = std.Thread.getCpuCount() catch 1, .gpu = gpu };
+            return gpu;
+        }
 
-            var prng = std.Random.DefaultPrng.init(1234);
-            const host_model = try nn.initAll(Spec.Layers, gpa, prng.random());
-            defer nn.deinitAll(host_model, gpa);
-            const model = if (gpu) |dev| try nn.toGpuAll(host_model, dev) else host_model;
-            const params = nn.params(model);
-            const learning_rate = opts.learning_rate orelse Spec.learning_rate;
-            var adam = try optim.Adam.init(gpa, par, learning_rate, params);
-            defer adam.deinit();
-            adam.weight_decay = Spec.weight_decay;
-            var average = try optim.Ema.init(gpa, par, nn.state(model));
-            defer average.deinit();
-            average.decay = opts.ema_decay;
-            var start_epoch: usize = 0;
-            if (opts.load_path) |path| {
+        const ModelState = struct {
+            host_model: Spec.Layers,
+            model: Spec.Layers,
+            adam: optim.Adam,
+            average: optim.Ema,
+            learning_rate: f32,
+
+            fn init(shared: *Shared, gpu: ?*Gpu, par: kernels.Parallel) !ModelState {
+                const gpa = shared.gpa;
+                var prng = std.Random.DefaultPrng.init(1234);
+                const host_model = try nn.initAll(Spec.Layers, gpa, prng.random());
+                errdefer nn.deinitAll(host_model, gpa);
+                const model = if (gpu) |dev| try nn.toGpuAll(host_model, dev) else host_model;
+                const learning_rate = shared.opts.learning_rate orelse Spec.learning_rate;
+                var adam = try optim.Adam.init(gpa, par, learning_rate, nn.params(model));
+                errdefer adam.deinit();
+                adam.weight_decay = Spec.weight_decay;
+                var average = try optim.Ema.init(gpa, par, nn.state(model));
+                average.decay = shared.opts.ema_decay;
+                return .{ .host_model = host_model, .model = model, .adam = adam, .average = average, .learning_rate = learning_rate };
+            }
+
+            fn deinit(self: ModelState, gpa: Allocator) void {
+                self.average.deinit();
+                self.adam.deinit();
+                nn.deinitAll(self.host_model, gpa);
+            }
+
+            fn loadCheckpoint(self: *ModelState, shared: *Shared, gpu: ?*Gpu) !usize {
+                const path = shared.opts.load_path orelse return 0;
                 var counters: [2]u32 = undefined;
-                try checkpoint.load(gpa, io, path, gpu, nn.state(model) ++ adam.state() ++ average.state(), &counters);
-                start_epoch = counters[0];
-                adam.t = counters[1];
+                try checkpoint.load(shared.gpa, shared.io, path, gpu, nn.state(self.model) ++ self.adam.state() ++ self.average.state(), &counters);
+                self.adam.t = counters[1];
+                return counters[0];
             }
+        };
 
-            const train_data = if (gpu) |dev| try train.toGpu(dev) else train;
-            const test_data = if (gpu) |dev| try test_set.toGpu(dev) else test_set;
-            if (opts.load_path != null and index == 0) try out.print("loaded checkpoint after {d} epochs, test accuracy {d:.2}%\n", .{ start_epoch, try accuracy(gpa, par, model, test_data, false) });
+        const Loop = struct {
+            shared: *Shared,
+            index: usize,
+            gpu: ?*Gpu,
+            par: kernels.Parallel,
+            state: *ModelState,
+            start_epoch: usize,
+            train_data: Dataset,
+            test_data: Dataset,
+            feed: Feed,
+            arena: *std.heap.ArenaAllocator,
+            loss_total: []f32,
+            use_graph: bool,
+            mix_weights: ?[]f32,
+            graph: ?Gpu.Graph = null,
+            steps_run: usize = 0,
+            graph_loss: autograd.Var(Tensor(f32, &.{})) = undefined,
+            loss_sum: f64 = 0,
 
-            const feed = try Feed.init(gpa, par, train, train_data);
-            defer feed.deinit(gpa);
-            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-            defer arena.deinit();
-            const loss_total: []f32 = if (gpu) |dev| try dev.alloc(f32, 1) else &.{};
+            const StepInput = struct { global_step: usize, feed_slice: usize, augment: augment_math.Config, kept: f32 };
 
-            if (index == 0) {
-                try out.print("{s}, AdamW, batch {d}, {s}, {d} training images", .{ Spec.name, batch_size * replicas, if (gpu != null) "GPU" else "CPU", train.count() });
-                if (replicas > 1) try out.print(", {d} replicas of {d}", .{ replicas, batch_size });
-                try out.writeByte('\n');
-                try out.flush();
-            }
+            fn trainStep(self: *Loop, input: StepInput) !void {
+                const shared = self.shared;
+                const opts = shared.opts;
+                const state = self.state;
+                const params = nn.params(state.model);
+                try self.feed.fill(input.feed_slice, input.augment);
 
-            const epochs = opts.epochs;
-            const steps = train.count() / (batch_size * replicas);
-            const stop_epoch = @min(opts.until orelse epochs, epochs);
-            const live = index == 0 and (opts.progress or try Io.File.stdout().isTty(io));
-            if (live) Io.File.stdout().enableAnsiEscapeCodes(io) catch {};
-            const progress_every = @max(1, steps / 100);
-            // NOTE: a training step is the same sequence of launches every time, so on the GPU the forward and backward pass is
-            // recorded once and replayed. What changes per step stays outside or in device buffers: the batch is gathered in
-            // place, the dropout seed offset and the CutMix weights are uploaded before each replay, and Adam, EMA and the
-            // loss sum run after it. Profiling cannot record, replicas exchange gradients through the host and cuDNN plans
-            // are not captured, so those runs launch every step normally.
-            const use_graph = gpu != null and !opts.profile and replicas == 1 and opts.cudnn_dir == null;
-            var graph: ?Gpu.Graph = null;
-            var graph_loss: autograd.Var(Tensor(f32, &.{})) = undefined;
-            const mix_weights: ?[]f32 = if (use_graph and opts.cutmix > 0) try gpu.?.alloc(f32, 2) else null;
-            for (start_epoch..@max(start_epoch, stop_epoch)) |epoch| {
-                const started = Io.Clock.awake.now(io);
-                try feed.shuffle(epoch);
-                var loss_sum: f64 = 0;
-                if (gpu) |dev| try dev.fill(loss_total, 0);
-                var augment = opts.augment;
-                augment.seed = epoch;
-                for (0..steps) |step| {
-                    const global_step = epoch * steps + step;
-                    const mix = drawMix(Spec.side, opts.cutmix, 0x5EED0000 + global_step);
-                    augment.box = mix.box;
-                    // NOTE: replica r takes slice step * replicas + r, so together the replicas see the rows a single replica
-                    // with the whole batch would. CutMix pairs rows inside a slice only.
-                    try feed.fill(step * replicas + index, augment);
-
-                    adam.lr = optim.cosineLr(learning_rate, global_step, epochs * steps, opts.warmup_epochs * steps);
-                    // NOTE: dropout seeds are (global_step * replicas + index) * 8 plus the op number; a recorded step keeps
-                    // index * 8 on the tape and takes the step part from the device, which gives the same masks.
-                    const step_seed = global_step * replicas * 8;
-                    if (use_graph) {
-                        const dev = gpu.?;
-                        try dev.setStepSeed(step_seed);
-                        if (mix_weights) |w| try dev.upload(w, &[2]f32{ mix.kept, 1 - mix.kept });
-                    }
-                    if (!use_graph or graph == null) {
-                        _ = arena.reset(.retain_capacity);
-                        if (gpu) |dev| {
-                            try dev.resetStep();
-                            if (use_graph) try dev.beginCapture();
-                        }
-                        var tape: Tape = .{ .gpa = arena.allocator(), .par = par, .training = true, .smoothing = opts.smoothing, .seed = index * 8 + if (use_graph) 0 else step_seed };
-                        try optim.zeroGrad(par, params);
-                        const logits = try Spec.forward(model, &tape, try tape.constant(feed.batch));
-                        graph_loss = try mixedLoss(&tape, logits, feed.labels, feed.other_labels, mix.kept, mix_weights);
-                        try tape.backward(graph_loss);
-                        if (use_graph) graph = try gpu.?.endCapture();
-                    }
-                    if (use_graph) try gpu.?.replay(graph.?);
-                    const loss = graph_loss;
-                    try shared.group.averageGrads(index, par, params);
-                    try adam.step(par, params);
-                    if (opts.ema_decay > 0) try average.update(par, adam.t);
-                    if (gpu) |dev| try dev.addInPlace(loss_total, loss.value.data) else loss_sum += loss.value.data[0];
-                    if (live and ((step + 1) % progress_every == 0 or step + 1 == steps)) {
-                        const so_far = if (gpu) |dev| try dev.scalar(loss_total) else loss_sum;
-                        try printProgress(out, .{ .epoch = epoch, .epochs = epochs, .done = step + 1, .steps = steps, .loss = so_far / @as(f64, @floatFromInt(step + 1)), .elapsed_ns = Io.Clock.awake.now(io).nanoseconds - started.nanoseconds, .epochs_left = stop_epoch - epoch - 1 });
-                    }
+                const steps = shared.train.count() / (batch_size * opts.replicas);
+                state.adam.lr = optim.cosineLr(state.learning_rate, input.global_step, opts.epochs * steps, opts.warmup_epochs * steps);
+                // NOTE: dropout seeds are (global_step * replicas + index) * 8 plus the op number; a recorded step keeps
+                // index * 8 on the tape and takes the step part from the device, which gives the same masks.
+                const step_seed = input.global_step * opts.replicas * 8;
+                if (self.use_graph) {
+                    const dev = self.gpu.?;
+                    try dev.setStepSeed(step_seed);
+                    if (self.mix_weights) |w| try dev.upload(w, &[2]f32{ input.kept, 1 - input.kept });
                 }
-                if (index != 0) continue;
-                if (gpu) |dev| loss_sum = try dev.scalar(loss_total);
+                const record = self.use_graph and self.graph == null and (opts.cudnn_dir == null or self.steps_run > 0);
+                if (!self.use_graph or self.graph == null) {
+                    _ = self.arena.reset(.retain_capacity);
+                    if (self.gpu) |dev| {
+                        try dev.resetStep();
+                        if (record) try dev.beginCapture();
+                    }
+                    var tape: Tape = .{ .gpa = self.arena.allocator(), .par = self.par, .training = true, .smoothing = opts.smoothing, .seed = self.index * 8 + if (self.use_graph) 0 else step_seed };
+                    try optim.zeroGrad(self.par, params);
+                    const logits = try Spec.forward(state.model, &tape, try tape.constant(self.feed.batch));
+                    self.graph_loss = try mixedLoss(&tape, logits, self.feed.labels, self.feed.other_labels, input.kept, self.mix_weights);
+                    try tape.backward(self.graph_loss);
+                    if (record) self.graph = try self.gpu.?.endCapture();
+                }
+                if (self.graph) |recorded| try self.gpu.?.replay(recorded);
+                self.steps_run += 1;
+                try shared.group.averageGrads(self.index, self.par, params);
+                try state.adam.step(self.par, params);
+                if (opts.ema_decay > 0) try state.average.update(self.par, state.adam.t);
+                if (self.gpu) |dev| try dev.addInPlace(self.loss_total, self.graph_loss.value.data) else self.loss_sum += self.graph_loss.value.data[0];
+            }
 
-                const seconds = @as(f64, @floatFromInt(Io.Clock.awake.now(io).nanoseconds - started.nanoseconds)) / 1e9;
-                const acc = try accuracy(gpa, par, model, test_data, false);
+            fn finishEpoch(self: *Loop, epoch: usize, live: bool, started_ns: i96) !void {
+                const opts = self.shared.opts;
+                const out = self.shared.out;
+                const state = self.state;
+                if (self.gpu) |dev| self.loss_sum = try dev.scalar(self.loss_total);
+                const seconds = @as(f64, @floatFromInt(Io.Clock.awake.now(self.shared.io).nanoseconds - started_ns)) / 1e9;
+                const acc = try accuracy(self.shared.gpa, self.par, state.model, self.test_data, false);
                 if (live) try out.writeAll("\r\x1b[2K");
-                try out.print("epoch {d}/{d}  train loss {d:.4}  test accuracy {d:.2}%", .{ epoch + 1, epochs, loss_sum / @as(f64, @floatFromInt(steps)), acc });
+                const steps = self.shared.train.count() / (batch_size * opts.replicas);
+                try out.print("epoch {d}/{d}  train loss {d:.4}  test accuracy {d:.2}%", .{ epoch + 1, opts.epochs, self.loss_sum / @as(f64, @floatFromInt(steps)), acc });
                 if (opts.ema_decay > 0) {
-                    try average.swap(par);
-                    try out.print("  ema {d:.2}%", .{try accuracy(gpa, par, model, test_data, false)});
-                    try average.swap(par);
+                    try state.average.swap(self.par);
+                    try out.print("  ema {d:.2}%", .{try accuracy(self.shared.gpa, self.par, state.model, self.test_data, false)});
+                    try state.average.swap(self.par);
                 }
                 try out.print("  ({d:.2} s)\n", .{seconds});
                 try out.flush();
             }
-            // NOTE: only replica 0 evaluates and writes outputs. Its loss is the mean over its own slice, and batch norm
-            // statistics are those of its slices, so they differ slightly from a single replica with the whole batch.
-            if (index != 0) return;
-            if (opts.mirrored) {
-                try out.print("final test accuracy {d:.2}%, with mirrored inputs averaged {d:.2}%\n", .{ try accuracy(gpa, par, model, test_data, false), try accuracy(gpa, par, model, test_data, true) });
-                if (opts.ema_decay > 0) {
-                    try average.swap(par);
-                    try out.print("ema   test accuracy {d:.2}%, with mirrored inputs averaged {d:.2}%\n", .{ try accuracy(gpa, par, model, test_data, false), try accuracy(gpa, par, model, test_data, true) });
-                    try average.swap(par);
+
+            fn run(self: *Loop) !void {
+                const shared = self.shared;
+                const opts = shared.opts;
+                const epochs = opts.epochs;
+                const steps = shared.train.count() / (batch_size * opts.replicas);
+                const stop_epoch = @min(opts.until orelse epochs, epochs);
+                const live = self.index == 0 and (opts.progress or try Io.File.stdout().isTty(shared.io));
+                if (live) Io.File.stdout().enableAnsiEscapeCodes(shared.io) catch {};
+                const progress_every = @max(1, steps / 100);
+                for (self.start_epoch..@max(self.start_epoch, stop_epoch)) |epoch| {
+                    const started = Io.Clock.awake.now(shared.io);
+                    try self.feed.shuffle(epoch);
+                    self.loss_sum = 0;
+                    if (self.gpu) |dev| try dev.fill(self.loss_total, 0);
+                    var augment = opts.augment;
+                    augment.seed = epoch;
+                    for (0..steps) |step| {
+                        const global_step = epoch * steps + step;
+                        const mix = drawMix(Spec.side, opts.cutmix, 0x5EED0000 + global_step);
+                        augment.box = mix.box;
+                        // NOTE: replica r takes slice step * replicas + r, so together the replicas see the rows a single replica
+                        // with the whole batch would. CutMix pairs rows inside a slice only.
+                        try self.trainStep(.{ .global_step = global_step, .feed_slice = step * opts.replicas + self.index, .augment = augment, .kept = mix.kept });
+                        if (live and ((step + 1) % progress_every == 0 or step + 1 == steps)) {
+                            const so_far = if (self.gpu) |dev| try dev.scalar(self.loss_total) else self.loss_sum;
+                            try printProgress(shared.out, .{
+                                .epoch = epoch,
+                                .epochs = epochs,
+                                .done = step + 1,
+                                .steps = steps,
+                                .loss = so_far / @as(f64, @floatFromInt(step + 1)),
+                                .elapsed_ns = Io.Clock.awake.now(shared.io).nanoseconds - started.nanoseconds,
+                                .epochs_left = stop_epoch - epoch - 1,
+                            });
+                        }
+                    }
+                    if (self.index == 0) try self.finishEpoch(epoch, live, started.nanoseconds);
                 }
             }
-            if (opts.predict > 0) try predict(gpa, par, model, test_data, opts.predict, out);
-            if (opts.onnx_path) |path| {
-                try exportOnnx(gpa, io, par, model, path);
-                try out.print("exported {s}\n", .{path});
+
+            fn finish(self: *Loop) !void {
+                const shared = self.shared;
+                const opts = shared.opts;
+                const out = shared.out;
+                const state = self.state;
+                // NOTE: only replica 0 evaluates and writes outputs. Its loss is the mean over its own slice, and batch norm
+                // statistics are those of its slices, so they differ slightly from a single replica with the whole batch.
+                if (self.index != 0) return;
+                if (opts.mirrored) {
+                    try out.print("final test accuracy {d:.2}%, with mirrored inputs averaged {d:.2}%\n", .{ try accuracy(shared.gpa, self.par, state.model, self.test_data, false), try accuracy(shared.gpa, self.par, state.model, self.test_data, true) });
+                    if (opts.ema_decay > 0) {
+                        try state.average.swap(self.par);
+                        try out.print("ema   test accuracy {d:.2}%, with mirrored inputs averaged {d:.2}%\n", .{ try accuracy(shared.gpa, self.par, state.model, self.test_data, false), try accuracy(shared.gpa, self.par, state.model, self.test_data, true) });
+                        try state.average.swap(self.par);
+                    }
+                }
+                if (opts.predict > 0) try predict(shared.gpa, self.par, state.model, self.test_data, opts.predict, out);
+                if (opts.onnx_path) |path| {
+                    try exportOnnx(shared.gpa, shared.io, self.par, state.model, path);
+                    try out.print("exported {s}\n", .{path});
+                }
+                if (opts.save_path) |path| {
+                    const stop_epoch = @min(opts.until orelse opts.epochs, opts.epochs);
+                    const counters = [_]u32{ @intCast(@max(stop_epoch, self.start_epoch)), state.adam.t };
+                    try checkpoint.save(shared.gpa, shared.io, path, self.gpu, nn.state(state.model) ++ state.adam.state() ++ state.average.state(), &counters);
+                    try out.print("saved {s}\n", .{path});
+                }
+                if (self.gpu) |dev| {
+                    const peak = dev.peakUsage();
+                    try out.print("device scratch peak {d} MiB of {d} MiB, zero arena peak {d} MiB of {d} MiB\n", .{ peak.step >> 20, dev.step_size >> 20, peak.zero >> 20, dev.zero_size >> 20 });
+                    try dev.printProfile(out);
+                }
+                try out.flush();
             }
-            if (opts.save_path) |path| {
-                const counters = [_]u32{ @intCast(@max(stop_epoch, start_epoch)), adam.t };
-                try checkpoint.save(gpa, io, path, gpu, nn.state(model) ++ adam.state() ++ average.state(), &counters);
-                try out.print("saved {s}\n", .{path});
+        };
+
+        // Trains one replica. Replica 0 runs on the main thread, owns the console output, the evaluation and the optional outputs.
+        // NOTE: every replica builds its own Gpu inside its thread, because a CUDA context is current per thread.
+        fn work(shared: *Shared, index: usize) !void {
+            const gpa = shared.gpa;
+            const opts = shared.opts;
+            const out = shared.out;
+            const gpu = try initGpu(shared, index);
+            defer if (gpu) |dev| dev.deinit();
+            // NOTE: replica threads must not share the CPU worker pool, which is a single global one.
+            const par: kernels.Parallel = .{ .io = if (opts.replicas > 1) null else shared.io, .threads = std.Thread.getCpuCount() catch 1, .gpu = gpu };
+
+            var state = try ModelState.init(shared, gpu, par);
+            defer state.deinit(gpa);
+            const start_epoch = try state.loadCheckpoint(shared, gpu);
+            const train_data = if (gpu) |dev| try shared.train.toGpu(dev) else shared.train;
+            const test_data = if (gpu) |dev| try shared.test_set.toGpu(dev) else shared.test_set;
+            if (opts.load_path != null and index == 0) try out.print("loaded checkpoint after {d} epochs, test accuracy {d:.2}%\n", .{ start_epoch, try accuracy(gpa, par, state.model, test_data, false) });
+
+            const feed = try Feed.init(gpa, par, shared.train, train_data);
+            defer feed.deinit(gpa);
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const loss_total: []f32 = if (gpu) |dev| try dev.alloc(f32, 1) else &.{};
+            if (index == 0) {
+                try out.print("{s}, AdamW, batch {d}, {s}, {d} training images", .{ Spec.name, batch_size * opts.replicas, if (gpu != null) "GPU" else "CPU", shared.train.count() });
+                if (opts.replicas > 1) try out.print(", {d} replicas of {d}", .{ opts.replicas, batch_size });
+                try out.writeByte('\n');
+                try out.flush();
             }
-            if (gpu) |dev| {
-                const peak = dev.peakUsage();
-                try out.print("device scratch peak {d} MiB of {d} MiB, zero arena peak {d} MiB of {d} MiB\n", .{ peak.step >> 20, dev.step_size >> 20, peak.zero >> 20, dev.zero_size >> 20 });
-                try dev.printProfile(out);
-            }
-            try out.flush();
+
+            // NOTE: a training step is the same sequence of launches every time, so on the GPU the forward and backward pass is
+            // recorded once and replayed. What changes per step stays outside or in device buffers: the batch is gathered in
+            // place, the dropout seed offset and the CutMix weights are uploaded before each replay, and Adam, EMA and the
+            // loss sum run after it. Replicas record too, since their gradient exchange happens after the replay. Only profiling
+            // cannot record, because it waits for the device after every launch, so a profiled run launches every step normally.
+            // cuDNN chooses its algorithms by timing real convolutions the first time it sees a shape, which a recording cannot
+            // do, so with it the first step runs normally and the second one is recorded.
+            const use_graph = gpu != null and !opts.profile;
+            const mix_weights: ?[]f32 = if (use_graph and opts.cutmix > 0) try gpu.?.alloc(f32, 2) else null;
+            var loop: Loop = .{
+                .shared = shared,
+                .index = index,
+                .gpu = gpu,
+                .par = par,
+                .state = &state,
+                .start_epoch = start_epoch,
+                .train_data = train_data,
+                .test_data = test_data,
+                .feed = feed,
+                .arena = &arena,
+                .loss_total = loss_total,
+                .use_graph = use_graph,
+                .mix_weights = mix_weights,
+            };
+            try loop.run();
+            try loop.finish();
         }
 
         fn run(init: std.process.Init) !void {
