@@ -699,7 +699,8 @@ pub const Gpu = struct {
         const rows_padded = padTo(rows, .rows);
         const cols_padded = padTo(d.k * d.k * d.c, .columns);
         const dst = try self.scratch(u16, rows_padded * cols_padded);
-        try self.launch(.im2colHalf, .{ toU32(rows_padded), 1, 1 }, .{ x, dst, d, cols_padded });
+        const len = rows_padded * cols_padded;
+        try self.launchFlat(.im2colHalf, if (d.c % 4 == 0) len / 4 else len, .{ x, dst, d, cols_padded, len });
         return .{ .data = dst, .rows_padded = rows_padded, .cols_padded = cols_padded };
     }
 

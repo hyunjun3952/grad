@@ -1033,25 +1033,24 @@ const transpose_tile = struct {
     var values: [32 * 33]f32 addrspace(.shared) = undefined;
 };
 
-export fn im2colHalf(x: [*]const f32, dst: [*]u16, d: cv.Dims, cols_padded: u32) callconv(.nvptx_kernel) void {
-    const row: u32 = @workGroupId(0);
+// NOTE: one thread per output element (per four elements when the channel count is divisible by four). A block per row left
+// most of its 256 threads idle for the narrow rows of the stem convolution (27 values per position), and launched one block
+// per position. len is the element count of the padded matrix; cols_padded is a multiple of four, so a quad never crosses a row.
+export fn im2colHalf(x: [*]const f32, dst: [*]u16, d: cv.Dims, cols_padded: u32, len: u32) callconv(.nvptx_kernel) void {
+    const wide = d.c % 4 == 0;
+    const first = globalIndex() * @as(usize, if (wide) 4 else 1);
+    if (first >= len) return;
+    const row: u32 = @intCast(first / cols_padded);
+    const cc: u32 = @intCast(first % cols_padded);
     const real = row < d.n * cv.outHeight(d) * cv.outWidth(d);
-    const patch = cv.patchOf(row, d);
     const kc = d.k * d.k * d.c;
-    const line = dst + @as(usize, row) * cols_padded;
-    if (d.c % 4 == 0) {
-        var cc: u32 = @workItemId(0) * 4;
-        while (cc < cols_padded) : (cc += threads * 4) {
-            const values: @Vector(4, f32) = if (real and cc < kc) cv.patchValues(x, patch, cc, d) else @splat(0);
-            const packed_pair: *align(8) u64 = @ptrCast(@alignCast(line + cc));
-            packed_pair.* = @as(u64, bf16.encode(values[0])) | @as(u64, bf16.encode(values[1])) << 16 | @as(u64, bf16.encode(values[2])) << 32 | @as(u64, bf16.encode(values[3])) << 48;
-        }
-    } else {
-        var cc: u32 = @workItemId(0);
-        while (cc < cols_padded) : (cc += threads) {
-            line[cc] = if (real and cc < kc) bf16.encode(cv.patchValue(x, patch, cc, d)) else 0;
-        }
+    if (!wide) {
+        dst[first] = if (real and cc < kc) bf16.encode(cv.patchValue(x, cv.patchOf(row, d), cc, d)) else 0;
+        return;
     }
+    const values: @Vector(4, f32) = if (real and cc < kc) cv.patchValues(x, cv.patchOf(row, d), cc, d) else @splat(0);
+    const packed_quad: *align(8) u64 = @ptrCast(@alignCast(dst + first));
+    packed_quad.* = @as(u64, bf16.encode(values[0])) | @as(u64, bf16.encode(values[1])) << 16 | @as(u64, bf16.encode(values[2])) << 32 | @as(u64, bf16.encode(values[3])) << 48;
 }
 export fn packHalfTransposed(src: [*]const f32, dst: [*]u16, args: ga.PackArgs) callconv(.nvptx_kernel) void {
     packTransposedOf(f32, src, dst, args);
