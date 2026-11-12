@@ -1469,7 +1469,9 @@ fn Tf32Tile(comptime tile_rows: usize, comptime tile_cols: usize) type {
         const cols = tile_cols;
         const warp_m = rows * cols / 256;
         const depth = 16;
-        const stages = 3;
+        // NOTE: an f32 tile is twice the bytes of its bf16 twin, so the 128 x 128 tile drops to two stages to stay under the
+        // 48 KiB of static shared memory; the smaller tiles keep the three-stage pipeline.
+        const stages = if (tile_rows * tile_cols > 128 * 64) 2 else 3;
         const a_pitch = depth + 4;
         const b_pitch = cols + 8;
         const a_elems = rows * a_pitch;
@@ -1533,6 +1535,14 @@ export fn convTf32WeightGradShort(dy_t: [*]const f32, x: [*]const f32, c: [*]f32
 
 export fn convExactForward(x: [*]const f32, w: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
     tileGemm(.{ .tf32 = true, .exact = true, .mode = .gather_a }, x, w, c, shape, geo);
+}
+
+export fn convExactForwardWide(x: [*]const f32, w: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
+    tileGemm(.{ .tf32 = true, .exact = true, .rows = 128, .cols = 128, .mode = .gather_a }, x, w, c, shape, geo);
+}
+
+export fn convExactWeightGradWide(dy_t: [*]const f32, x: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
+    tileGemm(.{ .tf32 = true, .exact = true, .rows = 128, .cols = 128, .mode = .gather_b }, dy_t, x, c, shape, geo);
 }
 
 export fn convExactWeightGrad(dy_t: [*]const f32, x: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {

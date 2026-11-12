@@ -54,8 +54,10 @@ const Kernel = enum {
     convTf32WeightGrad,
     convTf32WeightGradShort,
     convExactForward,
+    convExactForwardWide,
     convExactWeightGrad,
     convExactWeightGradShort,
+    convExactWeightGradWide,
     rotateWeightsF32,
     transposeF32,
     addKrscGradient,
@@ -671,7 +673,10 @@ pub const Gpu = struct {
         const m = @as(usize, geo.n) * geo.out_h * geo.out_w;
         const k_total = @as(usize, geo.k) * geo.k * geo.c;
         const kernel_shape = pack(ga.TensorShape, .{ .m = m, .n = c_out, .k_padded = k_total, .n_padded = w_pitch, .accumulate = accumulate, .chunk = k_total, .transpose_out = false, .output_half = false, .split_stride = 0, .c_pitch = c_layout.pitch, .c_offset = c_layout.offset });
-        try self.launch(if (self.tf32) .convTf32Forward else .convExactForward, .{ ceilDiv(c_out, 64), ceilDiv(m, 128), 1 }, .{ x, w, out, kernel_shape, geo });
+        // NOTE: on the CUDA cores the 128 x 128 tile wins from 128 channels up when there are at least 8192 rows (the
+        // CIFAR stage 2 shape); the smaller stage 3 keeps the three-stage 128 x 64 tile.
+        const wide = !self.tf32 and c_out >= 128 and m >= 8192 and c_layout.pitch == 0;
+        try self.launch(if (self.tf32) .convTf32Forward else if (wide) .convExactForwardWide else .convExactForward, .{ ceilDiv(c_out, if (wide) 128 else 64), ceilDiv(m, 128), 1 }, .{ x, w, out, kernel_shape, geo });
     }
 
     /// Weight gradient of the implicit GEMM over f32 activations; dy_t is the transposed output gradient (see transposeF32).
@@ -681,13 +686,16 @@ pub const Gpu = struct {
         const taps = @as(usize, geo.k) * geo.k * geo.c;
         const positions_padded = std.mem.alignForward(usize, geo.positions, 32);
         const short = c_out <= 64;
-        const tile_rows: usize = if (short) 64 else 128;
-        const tile_cols: usize = if (short) 128 else 64;
+        // NOTE: like the forward, the wide 128 x 128 tile wins on the CUDA cores from 128 channels and taps up; the
+        // tensor-core paths keep their tiles.
+        const wide = !self.tf32 and c_out >= 128 and taps >= 128 and c_layout.pitch == 0;
+        const tile_rows: usize = if (wide) 128 else if (short) 64 else 128;
+        const tile_cols: usize = if (wide) 128 else if (short) 128 else 64;
         const blocks = @as(usize, ceilDiv(c_out, tile_rows)) * ceilDiv(taps, tile_cols);
         const splits = @max(1, @min(positions_padded / 256, (128 + blocks - 1) / blocks));
         const chunk = std.mem.alignForward(usize, (positions_padded + splits - 1) / splits, 16);
         const kernel_shape = pack(ga.TensorShape, .{ .m = c_out, .n = taps, .k_padded = positions_padded, .n_padded = taps, .accumulate = true, .chunk = chunk, .transpose_out = true, .output_half = false, .split_stride = 0, .c_pitch = c_layout.pitch, .c_offset = c_layout.offset });
-        const kernel: Kernel = if (self.tf32) (if (short) .convTf32WeightGradShort else .convTf32WeightGrad) else (if (short) .convExactWeightGradShort else .convExactWeightGrad);
+        const kernel: Kernel = if (self.tf32) (if (short) .convTf32WeightGradShort else .convTf32WeightGrad) else if (wide) .convExactWeightGradWide else (if (short) .convExactWeightGradShort else .convExactWeightGrad);
         const mark = self.step_used;
         defer self.step_used = mark;
         const parts = ceilDiv(positions_padded, chunk);
