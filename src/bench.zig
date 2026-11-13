@@ -21,16 +21,18 @@ fn tiled(p: Problem, work: []T) void {
     kernels.matmulTiled(T, .{}, .{}, p, work);
 }
 
-fn tiledWork(n: usize) usize {
-    return kernels.matmulTiledWorkLen(T, .{}, .{}, n, n, n);
+fn tiledWork(m: usize, k: usize, n: usize) usize {
+    return kernels.matmulTiledWorkLen(T, .{}, .{}, m, k, n);
 }
 
-fn noWork(n: usize) usize {
+fn noWork(m: usize, k: usize, n: usize) usize {
+    _ = m;
+    _ = k;
     _ = n;
     return 0;
 }
 
-const Entry = struct { name: []const u8, run: Kernel, work_len: *const fn (usize) usize = noWork };
+const Entry = struct { name: []const u8, run: Kernel, work_len: *const fn (usize, usize, usize) usize = noWork };
 const entries = [_]Entry{
     .{ .name = "naive (ijk)", .run = wrap(kernels.matmulNaive) },
     .{ .name = "@Vector", .run = wrap(kernels.matmulVector) },
@@ -39,30 +41,34 @@ const entries = [_]Entry{
 
 fn kernelTable(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, rng: std.Random) !void {
     try out.print("f32 matmul, vector lanes = {d}\n\n", .{std.simd.suggestVectorLength(T) orelse 1});
-    try out.print("{s:>5}  {s:<20} {s:>10} {s:>9} {s:>8}\n", .{ "size", "kernel", "best ms", "GFLOPS", "speedup" });
+    try out.print("{s:<15}  {s:<20} {s:>10} {s:>9} {s:>8}\n", .{ "m x k x n", "kernel", "best ms", "GFLOPS", "speedup" });
 
-    for ([_]usize{ 64, 256, 512, 1024 }) |n| {
-        const a = try gpa.alloc(T, n * n);
+    // NOTE: the last three shapes have A rows at least a page apart, so the tiled kernel packs A; they exist to time that
+    // path. 1024x2304x256 is the chunked im2col GEMM of a CIFAR ResNet stage-3 convolution.
+    const shapes = [_][3]usize{ .{ 64, 64, 64 }, .{ 256, 256, 256 }, .{ 512, 512, 512 }, .{ 1024, 1024, 1024 }, .{ 64, 4096, 4096 }, .{ 4096, 4096, 64 }, .{ 1024, 2304, 256 } };
+    for (shapes) |s| {
+        const m, const k, const n = s;
+        const a = try gpa.alloc(T, m * k);
         defer gpa.free(a);
-        const b = try gpa.alloc(T, n * n);
+        const b = try gpa.alloc(T, k * n);
         defer gpa.free(b);
-        const ref = try gpa.alloc(T, n * n);
+        const ref = try gpa.alloc(T, m * n);
         defer gpa.free(ref);
-        const res = try gpa.alloc(T, n * n);
+        const res = try gpa.alloc(T, m * n);
         defer gpa.free(res);
         for (a) |*x| x.* = rng.float(T) - 0.5;
         for (b) |*x| x.* = rng.float(T) - 0.5;
 
-        kernels.matmulNaive(T, .{ .m = n, .k = n, .n = n, .a = a, .b = b, .out = ref });
+        kernels.matmulNaive(T, .{ .m = m, .k = k, .n = n, .a = a, .b = b, .out = ref });
 
-        const flops = 2.0 * std.math.pow(f64, @floatFromInt(n), 3);
+        const flops = 2.0 * @as(f64, @floatFromInt(m)) * @as(f64, @floatFromInt(k)) * @as(f64, @floatFromInt(n));
         const reps: usize = @max(3, @as(usize, @intFromFloat(2e9 / flops)));
 
         var base_ms: f64 = 0;
         for (entries, 0..) |e, idx| {
-            const work = try gpa.alignedAlloc(T, .@"64", e.work_len(n));
+            const work = try gpa.alignedAlloc(T, .@"64", e.work_len(m, k, n));
             defer gpa.free(work);
-            const problem: Problem = .{ .m = n, .k = n, .n = n, .a = a, .b = b, .out = res };
+            const problem: Problem = .{ .m = m, .k = k, .n = n, .a = a, .b = b, .out = res };
 
             e.run(problem, work);
 
@@ -78,14 +84,14 @@ fn kernelTable(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, rng: std.Random)
             var max_err: T = 0;
             for (ref, res) |r, g| max_err = @max(max_err, @abs(r - g));
             if (max_err > 1e-3) {
-                try out.print("MISMATCH in {s} at n={d}: max abs err {d}\n", .{ e.name, n, max_err });
+                try out.print("MISMATCH in {s} at {d}x{d}x{d}: max abs err {d}\n", .{ e.name, m, k, n, max_err });
                 try out.flush();
                 return error.KernelMismatch;
             }
 
             const ms = @as(f64, @floatFromInt(best_ns)) / 1e6;
             if (idx == 0) base_ms = ms;
-            try out.print("{d:>5}  {s:<20} {d:>10.3} {d:>9.2} {d:>7.1}x\n", .{ n, e.name, ms, flops / (ms * 1e6), base_ms / ms });
+            try out.print("{d}x{d}x{d}  {s:<20} {d:>10.3} {d:>9.2} {d:>7.1}x\n", .{ m, k, n, e.name, ms, flops / (ms * 1e6), base_ms / ms });
         }
         try out.writeAll("\n");
         try out.flush();
@@ -300,6 +306,59 @@ fn gpuMatmul(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
         try out.writeAll("\n");
     }
     try out.writeAll("\n");
+}
+
+// Times a chain of near-empty kernels launched one by one and replayed from a graph, to get the cost of one graph node. The
+// per-node cost is the slope between two chain lengths, so the fixed cost of a replay cancels out.
+fn gpuGraph(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
+    const dev = grad.gpu.Gpu.init(gpa, .{ .step_bytes = 1 << 20 }) catch |err| switch (err) {
+        error.DriverNotFound => return out.writeAll("no NVIDIA driver\n"),
+        else => return err,
+    };
+    defer dev.deinit();
+    const x = try dev.alloc(T, 32);
+    const y = try dev.alloc(T, 32);
+    try dev.fill(x, 0.5);
+    try dev.fill(y, 0.5);
+
+    const lengths = [_]usize{ 10, 200, 800 };
+    const rounds = 50;
+    var direct: [lengths.len]f64 = undefined;
+    var replayed: [lengths.len]f64 = undefined;
+    for (lengths, 0..) |len, i| {
+        // NOTE: a launch is asynchronous, so one sync per chain makes the direct time the host launch rate, which is what a
+        // step without a graph pays.
+        var best_direct: f64 = 1e18;
+        for (0..rounds) |_| {
+            const started = Io.Clock.awake.now(io);
+            for (0..len) |_| try dev.relu(x, y);
+            try dev.cu.sync();
+            best_direct = @min(best_direct, nanoseconds(io, started));
+        }
+        direct[i] = best_direct / @as(f64, @floatFromInt(len));
+
+        try dev.beginCapture();
+        for (0..len) |_| try dev.relu(x, y);
+        const graph = try dev.endCapture();
+        try dev.replay(graph);
+        try dev.cu.sync();
+        var best_replay: f64 = 1e18;
+        for (0..rounds) |_| {
+            const started = Io.Clock.awake.now(io);
+            try dev.replay(graph);
+            try dev.cu.sync();
+            best_replay = @min(best_replay, nanoseconds(io, started));
+        }
+        replayed[i] = best_replay;
+    }
+    try out.print("near-empty kernel chains (relu on 32 floats), best of {d}\n{s:>8}{s:>20}{s:>16}{s:>20}\n", .{ rounds, "nodes", "direct us/launch", "graph us total", "graph us/node" });
+    for (lengths, direct, replayed) |len, d, r| {
+        try out.print("{d:>8}{d:>20.2}{d:>16.1}{d:>20.2}\n", .{ len, d / 1000, r / 1000, r / 1000 / @as(f64, @floatFromInt(len)) });
+    }
+    const last = lengths.len - 1;
+    const slope = (replayed[last] - replayed[0]) / @as(f64, @floatFromInt(lengths[last] - lengths[0]));
+    const fixed = replayed[0] - slope * @as(f64, @floatFromInt(lengths[0]));
+    try out.print("per node (slope between {d} and {d} nodes): {d:.2} us; fixed cost of one replay: {d:.1} us\n\n", .{ lengths[0], lengths[last], slope / 1000, fixed / 1000 });
 }
 
 fn cudnnConvolutions(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, dir: [:0]const u8) !void {
@@ -664,6 +723,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len > 1 and std.mem.eql(u8, args[1], "gpu")) {
         try gpuMatmul(io, gpa, out);
+        try gpuGraph(io, gpa, out);
         try out.flush();
         return;
     }
