@@ -1020,10 +1020,11 @@ test "casting to bf16 and back rounds the values and passes the gradient through
 }
 
 // Runs batchNormRelu (or batchNormAddRelu with residual r when r_values is not empty) on the device in f32 or bf16 and downloads
-// the output, the input gradient, the residual gradient into dr_values and the running statistics.
-fn runBatchNorm(comptime half: bool, gpu: *gpu_mod.Gpu, x_values: []const f32, r_values: []const f32, dy_values: []const f32, out_values: []f32, dx_values: []f32, dr_values: []f32, running: []f32) !void {
-    const X = Tensor(f32, &.{ 600, 16 });
-    const Channels = Tensor(f32, &.{16});
+// the output, the input gradient, the residual gradient into dr_values and the running statistics. The channel count selects
+// the reduction kernel: an even count lets a bf16 lane read two channels at once, an odd count keeps the one-channel path.
+fn runBatchNorm(comptime half: bool, comptime channels: usize, gpu: *gpu_mod.Gpu, x_values: []const f32, r_values: []const f32, dy_values: []const f32, out_values: []f32, dx_values: []f32, dr_values: []f32, running: []f32) !void {
+    const X = Tensor(f32, &.{ 600, channels });
+    const Channels = Tensor(f32, &.{channels});
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try gpu.resetStep();
@@ -1035,14 +1036,14 @@ fn runBatchNorm(comptime half: bool, gpu: *gpu_mod.Gpu, x_values: []const f32, r
     try gpu.fill(r.value.data, 0);
     if (r_values.len != 0) try gpu.upload(r.value.data, r_values);
     try gpu.fill(r.grad.data, 0);
-    const gamma = try t.leaf(Channels{ .data = try gpu.alloc(f32, 16) });
-    const beta = try t.leaf(Channels{ .data = try gpu.alloc(f32, 16) });
+    const gamma = try t.leaf(Channels{ .data = try gpu.alloc(f32, channels) });
+    const beta = try t.leaf(Channels{ .data = try gpu.alloc(f32, channels) });
     try gpu.fill(gamma.value.data, 1.5);
     try gpu.fill(beta.value.data, 0.25);
     try gpu.fill(gamma.grad.data, 0);
     try gpu.fill(beta.grad.data, 0);
-    const mean = Channels{ .data = try gpu.alloc(f32, 16) };
-    const variance = Channels{ .data = try gpu.alloc(f32, 16) };
+    const mean = Channels{ .data = try gpu.alloc(f32, channels) };
+    const variance = Channels{ .data = try gpu.alloc(f32, channels) };
     try gpu.fill(mean.data, 0);
     try gpu.fill(variance.data, 1);
 
@@ -1062,8 +1063,8 @@ fn runBatchNorm(comptime half: bool, gpu: *gpu_mod.Gpu, x_values: []const f32, r
     }
     try gpu.download(dx_values, x.grad.data);
     try gpu.download(dr_values, r.grad.data);
-    try gpu.download(running[0..16], mean.data);
-    try gpu.download(running[16..], variance.data);
+    try gpu.download(running[0..channels], mean.data);
+    try gpu.download(running[channels..], variance.data);
 }
 
 test "batch norm on bf16 activations matches the f32 path within bf16 rounding, forward, backward and running statistics" {
@@ -1082,8 +1083,37 @@ test "batch norm on bf16 activations matches the f32 path within bf16 rounding, 
     var wide_running: [32]f32 = undefined;
     var half_running: [32]f32 = undefined;
     var unused: [600 * 16]f32 = undefined;
-    try runBatchNorm(false, gpu, &x, &.{}, &dy, &wide_out, &wide_dx, &unused, &wide_running);
-    try runBatchNorm(true, gpu, &x, &.{}, &dy, &half_out, &half_dx, &unused, &half_running);
+    try runBatchNorm(false, 16, gpu, &x, &.{}, &dy, &wide_out, &wide_dx, &unused, &wide_running);
+    try runBatchNorm(true, 16, gpu, &x, &.{}, &dy, &half_out, &half_dx, &unused, &half_running);
+    for (wide_out, half_out) |want, got| try testing.expectApproxEqAbs(want, got, 0.04 + 0.01 * @abs(want));
+    var flipped: usize = 0;
+    for (wide_dx, half_dx) |want, got| {
+        if (@abs(want - got) > 0.03 + 0.02 * @abs(want)) flipped += 1;
+    }
+    try testing.expect(flipped <= 3);
+    for (wide_running, half_running) |want, got| try testing.expectApproxEqAbs(want, got, 0.02 + 0.01 * @abs(want));
+}
+
+test "batch norm on bf16 activations with an odd channel count matches the f32 path within bf16 rounding" {
+    const gpu = try gpu_mod.Gpu.forTest(8 << 20);
+    defer gpu.deinit();
+    var prng = std.Random.DefaultPrng.init(34);
+    const rng = prng.random();
+    const c = 15;
+    var x: [600 * c]f32 = undefined;
+    var dy: [600 * c]f32 = undefined;
+    for (&x) |*v| v.* = rng.floatNorm(f32) * 2 + 0.5;
+    for (&dy) |*v| v.* = rng.floatNorm(f32);
+    var wide_out: [600 * c]f32 = undefined;
+    var half_out: [600 * c]f32 = undefined;
+    var wide_dx: [600 * c]f32 = undefined;
+    var half_dx: [600 * c]f32 = undefined;
+    var wide_running: [2 * c]f32 = undefined;
+    var half_running: [2 * c]f32 = undefined;
+    var unused: [600 * c]f32 = undefined;
+    // NOTE: 15 channels keep a bf16 lane on one channel per read; the even-count tests take the paired path instead.
+    try runBatchNorm(false, c, gpu, &x, &.{}, &dy, &wide_out, &wide_dx, &unused, &wide_running);
+    try runBatchNorm(true, c, gpu, &x, &.{}, &dy, &half_out, &half_dx, &unused, &half_running);
     for (wide_out, half_out) |want, got| try testing.expectApproxEqAbs(want, got, 0.04 + 0.01 * @abs(want));
     var flipped: usize = 0;
     for (wide_dx, half_dx) |want, got| {
@@ -1114,8 +1144,8 @@ test "batch norm with a fused residual and relu on bf16 activations matches the 
     var half_dr: [x.len]f32 = undefined;
     var wide_running: [32]f32 = undefined;
     var half_running: [32]f32 = undefined;
-    try runBatchNorm(false, gpu, &x, &r, &dy, &wide_out, &wide_dx, &wide_dr, &wide_running);
-    try runBatchNorm(true, gpu, &x, &r, &dy, &half_out, &half_dx, &half_dr, &half_running);
+    try runBatchNorm(false, 16, gpu, &x, &r, &dy, &wide_out, &wide_dx, &wide_dr, &wide_running);
+    try runBatchNorm(true, 16, gpu, &x, &r, &dy, &half_out, &half_dx, &half_dr, &half_running);
     for (wide_out, half_out) |want, got| try testing.expectApproxEqAbs(want, got, 0.04 + 0.01 * @abs(want));
     var flipped: usize = 0;
     var active: usize = 0;
