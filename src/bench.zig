@@ -43,8 +43,9 @@ fn kernelTable(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, rng: std.Random)
     try out.print("f32 matmul, vector lanes = {d}\n\n", .{std.simd.suggestVectorLength(T) orelse 1});
     try out.print("{s:<15}  {s:<20} {s:>10} {s:>9} {s:>8}\n", .{ "m x k x n", "kernel", "best ms", "GFLOPS", "speedup" });
 
-    // NOTE: the last three shapes have A rows at least a page apart, so the tiled kernel packs A; they exist to time that
-    // path. 1024x2304x256 is the chunked im2col GEMM of a CIFAR ResNet stage-3 convolution.
+    // NOTE: the last three shapes have A rows at least a page apart, where packing A into micro-panels was tried and measured
+    // 5 to 9% slower for narrow n; they stay to catch a regression of the strided reads. 1024x2304x256 is the chunked im2col
+    // GEMM of a CIFAR ResNet stage-3 convolution.
     const shapes = [_][3]usize{ .{ 64, 64, 64 }, .{ 256, 256, 256 }, .{ 512, 512, 512 }, .{ 1024, 1024, 1024 }, .{ 64, 4096, 4096 }, .{ 4096, 4096, 64 }, .{ 1024, 2304, 256 } };
     for (shapes) |s| {
         const m, const k, const n = s;
