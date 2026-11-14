@@ -11,7 +11,7 @@ const ptx = @embedFile("kernels_ptx");
 
 /// Everything that can fail on the device path. The CUDA driver and cuDNN are loaded at run time,
 /// so a missing library is an error value rather than a link failure.
-pub const Error = Allocator.Error || error{ NoDevice, TooManyChannels, NoGraphSupport, ProfilingWhileCapturing, CudnnPlanWhileCapturing, NoSuchDevice, DriverNotFound, MissingSymbol, CudaFailed, CudnnNotFound, CudnnFailed, NoAlgorithm };
+pub const Error = Allocator.Error || error{ NoDevice, TooManyChannels, InvalidIndex, NoGraphSupport, ProfilingWhileCapturing, CudnnPlanWhileCapturing, NoSuchDevice, DriverNotFound, MissingSymbol, CudaFailed, CudnnNotFound, CudnnFailed, NoAlgorithm };
 
 pub const BinaryOp = enum { add, mul };
 
@@ -1161,7 +1161,7 @@ pub const Gpu = struct {
         const rows = p.mean.len;
         const cols = p.gamma.len;
         if (dx) |out| try self.launchFlat(variant(.layerNormBackward, p.x), 32 * rows, .{ p.x, dy, out, p.gamma, p.mean, p.inv_std, rows, cols });
-        if (dgamma) |g| {
+        if (dgamma != null or dbeta != null) {
             // The sums over the rows go through the column reduction, which spreads the rows over many blocks.
             const sums = try self.scratchZeroed(f32, 2 * cols);
             var args = columns(dy, sums, .row_gradient_sums);
@@ -1169,7 +1169,9 @@ pub const Gpu = struct {
             args.mean = p.mean.ptr;
             args.inv_std = p.inv_std.ptr;
             try self.columnReduce(@typeInfo(@TypeOf(p.x)).pointer.child, args);
-            try self.launchFlat(.batchNormGradFinish, cols, .{ sums, g, dbeta.?, cols });
+            // NOTE: one reduction yields both sums, so a parameter without a gradient gets a scratch sink for its half.
+            const sink: []f32 = if (dgamma == null or dbeta == null) try self.scratchZeroed(f32, cols) else &.{};
+            try self.launchFlat(.batchNormGradFinish, cols, .{ sums, dgamma orelse sink, dbeta orelse sink, cols });
         }
     }
 

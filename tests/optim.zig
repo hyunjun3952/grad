@@ -270,3 +270,13 @@ test "gpu optimizers update more tensors than fit in one device table" {
         for (back) |g| try testing.expectEqual(@as(f32, 0), g);
     }
 }
+
+test "an ema with decay zero copies the live weights into the shadow, which a checkpoint relies on" {
+    const gpa = testing.allocator;
+    var live = [_]f32{ 1, 2, 3 };
+    var average = try Ema.init(gpa, .{}, .{@as([]f32, &live)});
+    defer average.deinit();
+    live = .{ 7, 8, 9 };
+    try average.update(.{}, 100);
+    try testing.expectEqualSlices(f32, &.{ 7, 8, 9 }, average.values);
+}

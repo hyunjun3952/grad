@@ -31,13 +31,13 @@ pub inline fn backwardRow(comptime E: type, x: [*]const E, dy: [*]const E, dx: [
     }
 }
 
-pub inline fn parameterGradient(comptime E: type, x: [*]const E, dy: [*]const E, mean: [*]const f32, inv_std: [*]const f32, dgamma: [*]f32, dbeta: [*]f32, rows: usize, cols: usize, j: usize) void {
+pub inline fn parameterGradient(comptime E: type, x: [*]const E, dy: [*]const E, mean: [*]const f32, inv_std: [*]const f32, dgamma: ?[*]f32, dbeta: ?[*]f32, rows: usize, cols: usize, j: usize) void {
     var g: f32 = 0;
     var b: f32 = 0;
     for (0..rows) |r| {
         g += bf16.load(E, dy, r * cols + j) * (bf16.load(E, x, r * cols + j) - mean[r]) * inv_std[r];
         b += bf16.load(E, dy, r * cols + j);
     }
-    dgamma[j] += g;
-    dbeta[j] += b;
+    if (dgamma) |out| out[j] += g;
+    if (dbeta) |out| out[j] += b;
 }

@@ -452,3 +452,71 @@ test "a graph whose Conv reads another tensor than the transposed one is not fus
     try testing.expectEqualSlices(f32, &.{ 2, 4, 6, 8 }, result.outputs[0].data);
     try testing.expectEqualSlices(f32, &.{ 0, 2, 0, 4 }, result.outputs[1].data);
 }
+
+test "average pooling can count the padding, and ceil_mode keeps a partial last window" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var small = [_]f32{ 1, 2, 3, 4 };
+    const counted = try pool(a, .{}, .{ .attributes = &.{
+        .{ .name = "kernel_shape", .ints = &.{ 2, 2 } },
+        .{ .name = "strides", .ints = &.{ 2, 2 } },
+        .{ .name = "pads", .ints = &.{ 1, 1, 1, 1 } },
+        .{ .name = "count_include_pad", .int = 1 },
+    } }, .{ .dims = &.{ 1, 1, 2, 2 }, .data = &small }, false);
+    try testing.expectEqualSlices(f32, &.{ 0.25, 0.5, 0.75, 1 }, counted.data);
+    const uncounted = try pool(a, .{}, .{ .attributes = &.{
+        .{ .name = "kernel_shape", .ints = &.{ 2, 2 } },
+        .{ .name = "strides", .ints = &.{ 2, 2 } },
+        .{ .name = "pads", .ints = &.{ 1, 1, 1, 1 } },
+    } }, .{ .dims = &.{ 1, 1, 2, 2 }, .data = &small }, false);
+    try testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, uncounted.data);
+
+    var big = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    const ceiled = try pool(a, .{}, .{ .attributes = &.{
+        .{ .name = "kernel_shape", .ints = &.{ 2, 2 } },
+        .{ .name = "strides", .ints = &.{ 2, 2 } },
+        .{ .name = "ceil_mode", .int = 1 },
+    } }, .{ .dims = &.{ 1, 1, 3, 3 }, .data = &big }, true);
+    try testing.expectEqualSlices(usize, &.{ 1, 1, 2, 2 }, ceiled.dims);
+    try testing.expectEqualSlices(f32, &.{ 5, 6, 8, 9 }, ceiled.data);
+    try testing.expectError(error.UnsupportedOp, pool(a, .{}, .{ .attributes = &.{
+        .{ .name = "kernel_shape", .ints = &.{ 2, 2 } },
+        .{ .name = "dilations", .ints = &.{ 2, 2 } },
+    } }, .{ .dims = &.{ 1, 1, 3, 3 }, .data = &big }, true));
+}
+
+test "a convolution honours asymmetric pads and refuses an auto_pad rule" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var x = [_]f32{ 1, 2, 3, 4 };
+    var w = [_]f32{1};
+    const image: Array = .{ .dims = &.{ 1, 1, 2, 2 }, .data = &x };
+    const kernel: Array = .{ .dims = &.{ 1, 1, 1, 1 }, .data = &w };
+    const padded = try convolve(a, .{}, .{ .attributes = &.{.{ .name = "pads", .ints = &.{ 0, 0, 1, 1 } }} }, image, kernel, null);
+    try testing.expectEqualSlices(usize, &.{ 1, 1, 3, 3 }, padded.dims);
+    try testing.expectEqualSlices(f32, &.{ 1, 2, 0, 3, 4, 0, 0, 0, 0 }, padded.data);
+    try testing.expectError(error.UnsupportedOp, convolve(a, .{}, .{ .attributes = &.{.{ .name = "auto_pad", .text = "SAME_UPPER" }} }, image, kernel, null));
+}
+
+test "Gather accepts negative indices and a malformed model is rejected instead of crashing" {
+    const gpa = testing.allocator;
+    const nodes = [_]lib.onnx_runtime.Node{.{ .op = "Gather", .inputs = &.{ "d", "i" }, .outputs = &.{"o"} }};
+    var model: Model = .{ .arena = .init(gpa), .nodes = &nodes, .initializers = .init(gpa), .inputs = &.{}, .outputs = &.{"o"} };
+    defer model.deinit();
+    const table = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const index = [_]f32{-1};
+    var result = try model.run(gpa, .{}, &.{ .{ .name = "d", .dims = &.{ 3, 2 }, .data = &table }, .{ .name = "i", .dims = &.{1}, .data = &index } });
+    defer result.deinit();
+    try testing.expectEqualSlices(f32, &.{ 5, 6 }, result.outputs[0].data);
+
+    var long_varint: [12]u8 = @splat(0xff);
+    long_varint[0] = 0x08;
+    long_varint[11] = 0;
+    try testing.expectError(error.BadModel, Model.parse(gpa, &long_varint));
+    var huge_length: [11]u8 = @splat(0xff);
+    huge_length[0] = 0x3a;
+    huge_length[10] = 0x01;
+    try testing.expectError(error.BadModel, Model.parse(gpa, &huge_length));
+}

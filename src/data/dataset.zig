@@ -11,6 +11,13 @@ pub const Dataset = struct {
         return self.labels.len;
     }
 
+    /// Fails with LabelOutOfRange when a label is not below classes; run it on host data before training, because the loss indexes by label.
+    pub fn checkLabels(self: Dataset, classes: usize) error{LabelOutOfRange}!void {
+        for (self.labels) |label| {
+            if (label >= classes) return error.LabelOutOfRange;
+        }
+    }
+
     pub fn toGpu(self: Dataset, gpu: *Gpu) !Dataset {
         const images = try gpu.alloc(f32, self.images.len);
         const labels = try gpu.alloc(u8, self.labels.len);

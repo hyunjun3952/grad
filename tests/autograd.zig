@@ -2430,3 +2430,46 @@ test "cross entropy and mean squared error accept bf16 inputs and compute in f32
         try expectCloseToReference(&want_mse_grad, &grad, 0.02, 1e-3);
     }
 }
+
+test "layerNorm trains gamma alone when beta is a constant, and rejects out-of-range indices on the CPU" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var t: Tape = .{ .gpa = arena.allocator() };
+    const x = try t.constant(try Tensor(f32, &.{ 3, 4 }).fromSlice(t.gpa, &.{ 1, 2, 3, 5, -1, 0, 2, 1, 4, 4, 1, 0 }));
+    const gamma = try t.leaf(try Tensor(f32, &.{4}).full(t.gpa, 1));
+    const beta = try t.constant(try Tensor(f32, &.{4}).zeros(t.gpa));
+    const target = try t.constant(try Tensor(f32, &.{ 3, 4 }).zeros(t.gpa));
+    const loss = try t.mse(try t.layerNorm(x, gamma, beta), target);
+    try t.backward(loss);
+    var total: f32 = 0;
+    for (gamma.grad.data) |g| total += @abs(g);
+    try testing.expect(total > 0);
+
+    const table = try t.leaf(try Tensor(f32, &.{ 4, 2 }).zeros(t.gpa));
+    try testing.expectError(error.InvalidIndex, t.embedding(table, 2, &.{ 0, 9 }, f32));
+    const logits = try t.constant(try Tensor(f32, &.{ 1, 3 }).zeros(t.gpa));
+    try testing.expectError(error.InvalidIndex, t.crossEntropy(logits, &.{5}));
+}
+
+test "equal-shape add and mul on the CPU agree between one thread and a worker pool" {
+    var prng = std.Random.DefaultPrng.init(31);
+    const rng = prng.random();
+    const T = Tensor(f32, &.{ 300, 200 });
+    for ([_]kernels.Parallel{ .{}, .{ .io = testing.io, .threads = 3 } }) |par| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var t: Tape = .{ .gpa = arena.allocator(), .par = par };
+        const a = try T.empty(t.gpa);
+        const b = try T.empty(t.gpa);
+        for (a.data, b.data) |*x, *y| {
+            x.* = rng.floatNorm(f32);
+            y.* = rng.floatNorm(f32);
+        }
+        const sum = try t.add(try t.constant(a), try t.constant(b));
+        const product = try t.mul(try t.constant(a), try t.constant(b));
+        for (a.data, b.data, sum.value.data, product.value.data) |x, y, s, p| {
+            try testing.expectEqual(x + y, s);
+            try testing.expectEqual(x * y, p);
+        }
+    }
+}

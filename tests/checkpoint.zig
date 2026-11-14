@@ -110,3 +110,19 @@ test "resuming from a checkpoint with optimizer state reproduces uninterrupted t
     try trainSteps(forgetful, &forgetful_adam, 3, 6);
     try testing.expect(!std.mem.eql(f32, straight.w.value.data, forgetful.w.value.data));
 }
+
+test "a rejected load leaves every tensor and counter untouched" {
+    const gpa = testing.allocator;
+    const path = ".zig-cache/checkpoint-reject-test.bin";
+    defer Io.Dir.cwd().deleteFile(testing.io, path) catch {};
+    var a = [_]f32{ 1, 2, 3 };
+    var b = [_]f32{ 4, 5 };
+    try save(gpa, testing.io, path, null, .{ @as([]f32, &a), @as([]f32, &b) }, &.{ 3, 9 });
+
+    var a2 = [_]f32{ 0, 0, 0 };
+    var b2 = [_]f32{ 0, 0, 0 };
+    var counters = [2]u32{ 77, 78 };
+    try testing.expectError(error.CheckpointMismatch, load(gpa, testing.io, path, null, .{ @as([]f32, &a2), @as([]f32, &b2) }, &counters));
+    try testing.expectEqualSlices(f32, &.{ 0, 0, 0 }, &a2);
+    try testing.expectEqualSlices(u32, &.{ 77, 78 }, &counters);
+}

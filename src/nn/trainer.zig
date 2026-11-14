@@ -562,6 +562,9 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
                     try out.print("exported {s}\n", .{path});
                 }
                 if (opts.save_path) |path| {
+                    // NOTE: without --ema the shadow was never updated and still holds the random initial weights; a later run that
+                    // loads this file with --ema must start its average from the trained weights, and decay 0 copies them.
+                    if (opts.ema_decay == 0) try state.average.update(self.par, 0);
                     const stop_epoch = @min(opts.until orelse opts.epochs, opts.epochs);
                     const counters = [_]u32{ @intCast(@max(stop_epoch, self.start_epoch)), state.adam.t };
                     try checkpoint.save(shared.gpa, shared.io, path, self.gpu, nn.state(state.model) ++ state.adam.state() ++ state.average.state(), &counters);
@@ -652,6 +655,10 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
             const test_set = try Spec.Loader.load(gpa, io, opts.data_dir orelse Spec.data_dir, "t10k");
             defer test_set.deinit(gpa);
             if (train.pixels != pixels) return error.UnexpectedImageSize;
+            // NOTE: the loss indexes the logits by label, and on the device a bad label would read other memory without any error.
+            try train.checkLabels(Spec.classes);
+            try test_set.checkLabels(Spec.classes);
+            if (train.count() < batch_size * opts.replicas) return error.TrainingSetTooSmall;
 
             // The gradient buffer length comes from a throwaway host model, so the barrier state can exist before any replica does.
             const grad_len = blk: {

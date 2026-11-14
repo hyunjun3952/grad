@@ -206,6 +206,13 @@ fn rowElementwise(job: RowJob, lo: usize, hi: usize) void {
     }
 }
 
+// out = a op b over equal shapes, split by element range so that a large tensor spreads over the worker pool.
+const FlatJob = struct { a: [*]const f32, b: [*]const f32, out: [*]f32, multiply: bool };
+
+fn flatElementwise(job: FlatJob, lo: usize, hi: usize) void {
+    for (job.out[lo..hi], job.a[lo..hi], job.b[lo..hi]) |*o, x, y| o.* = if (job.multiply) x * y else x + y;
+}
+
 // ***** tape *****
 
 const Node = struct {
@@ -282,10 +289,16 @@ pub const Tape = struct {
         // the worker pool; anything else takes the general broadcasting loop of ops.
         const equal = comptime std.mem.eql(usize, A.shape, B.shape);
         const per_row = comptime A.rank >= 2 and B.rank == 1 and B.shape[0] == A.shape[A.rank - 1] and std.mem.eql(usize, R.shape, A.shape);
-        if (comptime equal or per_row) {
+        if (comptime equal) {
+            // NOTE: a row job over equal shapes would be one row of A.len values, which never splits across threads.
             const out = try R.empty(self.gpa);
-            const cols = if (per_row) B.len else A.len;
-            const job: RowJob = .{ .a = a.data.ptr, .b = b.data.ptr, .out = out.data.ptr, .cols = cols, .repeat_b = per_row, .multiply = op == .mul };
+            kernels.parallelFor(self.par, A.len, 1 << 15, FlatJob{ .a = a.data.ptr, .b = b.data.ptr, .out = out.data.ptr, .multiply = op == .mul }, flatElementwise);
+            return out;
+        }
+        if (comptime per_row) {
+            const out = try R.empty(self.gpa);
+            const cols = B.len;
+            const job: RowJob = .{ .a = a.data.ptr, .b = b.data.ptr, .out = out.data.ptr, .cols = cols, .repeat_b = true, .multiply = op == .mul };
             kernels.parallelFor(self.par, A.len / cols, @max(1, (1 << 14) / cols), job, rowElementwise);
             return out;
         }
@@ -515,6 +528,10 @@ pub const Tape = struct {
             try dev.embeddingGather(table.value.data, ids, value.data);
         } else {
             if (comptime Out != f32) return error.NoDevice;
+            // NOTE: ids are host data here, so a bad one is caught before it reads another row of memory.
+            for (ids) |id| {
+                if (id >= @TypeOf(table.value).shape[0]) return error.InvalidIndex;
+            }
             for (ids, 0..) |id, i| @memcpy(value.data[i * width ..][0..width], table.value.data[@as(usize, id) * width ..][0..width]);
         }
         const out = try self.makeVar(value, table.needs_grad);
@@ -558,7 +575,7 @@ pub const Tape = struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
                 if (t.par.gpu) |dev| {
                     const p: gpu_mod.Gpu.LayerNorm(X.Elem) = .{ .x = c.x.value.data, .gamma = c.gamma.value.data, .mean = c.mean.data, .inv_std = c.inv_std.data };
-                    return dev.layerNormBackward(p, c.out.grad.data, if (c.x.needs_grad) c.x.grad.data else null, if (c.gamma.needs_grad) c.gamma.grad.data else null, if (c.gamma.needs_grad) c.beta.grad.data else null);
+                    return dev.layerNormBackward(p, c.out.grad.data, if (c.x.needs_grad) c.x.grad.data else null, if (c.gamma.needs_grad) c.gamma.grad.data else null, if (c.beta.needs_grad) c.beta.grad.data else null);
                 }
                 if (comptime X.Elem != f32) return error.NoDevice;
                 for (0..rows) |r| {
@@ -572,14 +589,14 @@ pub const Tape = struct {
                         cols,
                     );
                 }
-                if (c.gamma.needs_grad) for (0..cols) |j| layernorm_math.parameterGradient(
+                if (c.gamma.needs_grad or c.beta.needs_grad) for (0..cols) |j| layernorm_math.parameterGradient(
                     f32,
                     c.x.value.data.ptr,
                     c.out.grad.data.ptr,
                     c.mean.data.ptr,
                     c.inv_std.data.ptr,
-                    c.gamma.grad.data.ptr,
-                    c.beta.grad.data.ptr,
+                    if (c.gamma.needs_grad) c.gamma.grad.data.ptr else null,
+                    if (c.beta.needs_grad) c.beta.grad.data.ptr else null,
                     rows,
                     cols,
                     j,
@@ -1402,6 +1419,10 @@ pub const Tape = struct {
             value = try self.newTensor(Scalar);
             try dev.crossEntropy(logits.value.data, logp.data, labels, value.data, cols, self.smoothing);
         } else {
+            // NOTE: on the device the labels are device memory and cannot be read here, so Dataset.checkLabels covers that path.
+            for (labels) |y| {
+                if (y >= cols) return error.InvalidIndex;
+            }
             logp = try ops.logSoftmax(self.gpa, logits.value);
             var total: f64 = 0;
             for (labels, 0..) |y, i| {

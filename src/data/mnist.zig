@@ -13,8 +13,10 @@ pub fn parse(gpa: Allocator, image_bytes: []const u8, label_bytes: []const u8) !
     if (label_bytes.len < 8 or bigEndian(label_bytes, 0) != 2049) return error.BadLabelFile;
 
     const n = bigEndian(image_bytes, 4);
-    const pixels = bigEndian(image_bytes, 8) * bigEndian(image_bytes, 12);
-    if (bigEndian(label_bytes, 4) != n or image_bytes.len != 16 + n * pixels or label_bytes.len != 8 + n) {
+    // NOTE: the header fields are 32 bits each, so their products can overflow usize in a corrupt file.
+    const pixels = std.math.mul(usize, bigEndian(image_bytes, 8), bigEndian(image_bytes, 12)) catch return error.SizeMismatch;
+    const body = std.math.mul(usize, n, pixels) catch return error.SizeMismatch;
+    if (bigEndian(label_bytes, 4) != n or image_bytes.len - 16 != body or label_bytes.len != 8 + n) {
         return error.SizeMismatch;
     }
 

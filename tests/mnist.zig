@@ -47,3 +47,16 @@ test "the real MNIST files, when present, have the documented shape" {
     for (train.labels) |l| try testing.expect(l < 10);
     for (train.images) |v| try testing.expect(v >= 0 and v <= 1);
 }
+
+test "parse rejects a header whose sizes overflow, and labels can be checked against the class count" {
+    const images = idxHeader(2051, &.{ 0xFFFFFFFF, 0xFFFFFFFF, 2 });
+    const labels = idxHeader(2049, &.{0xFFFFFFFF});
+    try testing.expectError(error.SizeMismatch, parse(testing.allocator, &images, &labels));
+
+    const ok_images = idxHeader(2051, &.{ 2, 1, 3 }) ++ [_]u8{ 0, 255, 51, 255, 0, 102 };
+    const ok_labels = idxHeader(2049, &.{2}) ++ [_]u8{ 7, 3 };
+    const data = try parse(testing.allocator, &ok_images, &ok_labels);
+    defer data.deinit(testing.allocator);
+    try data.checkLabels(10);
+    try testing.expectError(error.LabelOutOfRange, data.checkLabels(5));
+}

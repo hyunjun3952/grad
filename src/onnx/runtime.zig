@@ -32,12 +32,13 @@ const Reader = struct {
 
     fn varint(self: *Reader) Error!u64 {
         var value: u64 = 0;
-        var shift: u6 = 0;
+        var shift: u7 = 0;
         while (true) {
-            if (self.at >= self.bytes.len) return error.BadModel;
+            // A varint has at most ten bytes; a longer one is corrupt and must not overflow the shift.
+            if (self.at >= self.bytes.len or shift > 63) return error.BadModel;
             const b = self.bytes[self.at];
             self.at += 1;
-            value |= @as(u64, b & 0x7f) << shift;
+            value |= @as(u64, b & 0x7f) << @intCast(shift);
             if (b & 0x80 == 0) return value;
             shift += 7;
         }
@@ -60,7 +61,7 @@ const Reader = struct {
     }
 
     fn take(self: *Reader, n: u64) Error![]const u8 {
-        if (self.at + n > self.bytes.len) return error.BadModel;
+        if (n > self.bytes.len - self.at) return error.BadModel;
         defer self.at += n;
         return self.bytes[self.at..][0..n];
     }
@@ -291,7 +292,10 @@ fn parseAttribute(a: Allocator, bytes: []const u8) Error!Attribute {
     var r: Reader = .{ .bytes = bytes };
     while (try r.next()) |f| switch (f.number) {
         1 => attribute.name = f.bytes,
-        2 => attribute.float = @bitCast(std.mem.readInt(u32, f.bytes[0..4], .little)),
+        2 => {
+            if (f.bytes.len < 4) return error.BadModel;
+            attribute.float = @bitCast(std.mem.readInt(u32, f.bytes[0..4], .little));
+        },
         3 => attribute.int = @bitCast(f.varint),
         4 => attribute.text = f.bytes,
         8 => try appendVarints(a, &ints, f),
@@ -667,6 +671,17 @@ fn addBias(par: kernels.Parallel, out: []f32, bias: []const f32, channels: usize
     }
 }
 
+fn autoPadIsNone(node: Node) bool {
+    const rule = node.text("auto_pad", "NOTSET");
+    return rule.len == 0 or std.mem.eql(u8, rule, "NOTSET");
+}
+
+// The pads attribute lists the begin pads of every spatial axis, then the end pads; without end pads they equal the begin pads.
+fn padEnds(pads: []const i64) struct { y: usize, x: usize } {
+    if (pads.len == 4) return .{ .y = pair(pads, 2, 0), .x = pair(pads, 3, 0) };
+    return .{ .y = pair(pads, 0, 0), .x = pair(pads, 1, 0) };
+}
+
 pub fn convolve(a: Allocator, par: kernels.Parallel, node: Node, x: Array, w: Array, bias: ?Array) Error!Array {
     if (x.dims.len != 4 or w.dims.len != 4) return error.UnsupportedOp;
     const n = x.dims[0];
@@ -687,8 +702,11 @@ pub fn convolve(a: Allocator, par: kernels.Parallel, node: Node, x: Array, w: Ar
     const px = pair(pads, 1, 0);
     const dy = pair(dilations, 0, 1);
     const dx = pair(dilations, 1, 1);
-    const oh = (h + 2 * py - dy * (kh - 1) - 1) / sy + 1;
-    const ow = (width + 2 * px - dx * (kw - 1) - 1) / sx + 1;
+    if (!autoPadIsNone(node)) return error.UnsupportedOp;
+    const ends = padEnds(pads);
+    if (dy * (kh - 1) + 1 > h + py + ends.y or dx * (kw - 1) + 1 > width + px + ends.x) return error.ShapeMismatch;
+    const oh = (h + py + ends.y - dy * (kh - 1) - 1) / sy + 1;
+    const ow = (width + px + ends.x - dx * (kw - 1) - 1) / sx + 1;
     if (w.dims[1] != per_group) return error.ShapeMismatch;
     const out = try make(a, &.{ n, m, oh, ow });
     if (groups == 1) {
@@ -801,7 +819,7 @@ pub fn convolveNhwc(a: Allocator, par: kernels.Parallel, node: Node, x: Array, w
     return out;
 }
 
-const PoolJob = struct { x: []const f32, out: []f32, v: Window, is_max: bool };
+const PoolJob = struct { x: []const f32, out: []f32, v: Window, is_max: bool, include_pad: bool, padded_h: usize, padded_w: usize };
 
 // Pools the planes (image and channel pairs) lo to hi.
 fn poolPlanes(job: PoolJob, lo: usize, hi: usize) void {
@@ -824,13 +842,24 @@ fn poolPlanes(job: PoolJob, lo: usize, hi: usize) void {
                         count += 1;
                     }
                 }
+                if (job.include_pad) {
+                    // The divisor covers the window inside the padded input, so a ceil_mode window past the end pad is not counted.
+                    count = (@min(oy * v.sy + v.kh, job.padded_h) - oy * v.sy) * (@min(ox * v.sx + v.kw, job.padded_w) - ox * v.sx);
+                }
                 job.out[(plane * v.oh + oy) * v.ow + ox] = if (job.is_max) best else total / @as(f32, @floatFromInt(@max(count, 1)));
             }
         }
     }
 }
 
-/// Max or average pooling of an NCHW tensor (count_include_pad off), one plane per work item on the worker pool.
+// Number of pooling windows along one axis; with ceil_mode the last window may run past the input, but it must start inside it.
+fn pooledSize(padded: usize, start_limit: usize, k: usize, s: usize, ceil_mode: bool) usize {
+    const span = padded - k;
+    const windows = (if (ceil_mode) (span + s - 1) / s else span / s) + 1;
+    return if (ceil_mode and (windows - 1) * s >= start_limit) windows - 1 else windows;
+}
+
+/// Max or average pooling of an NCHW tensor (count_include_pad off by default; ceil_mode, asymmetric pads and count_include_pad are honoured), one plane per work item on the worker pool.
 pub fn pool(a: Allocator, par: kernels.Parallel, node: Node, x: Array, is_max: bool) Error!Array {
     if (x.dims.len != 4) return error.UnsupportedOp;
     const kernel = node.ints("kernel_shape");
@@ -846,11 +875,16 @@ pub fn pool(a: Allocator, par: kernels.Parallel, node: Node, x: Array, is_max: b
     const c = x.dims[1];
     const h = x.dims[2];
     const w = x.dims[3];
-    const oh = (h + 2 * py - ky) / sy + 1;
-    const ow = (w + 2 * px - kx) / sx + 1;
+    // NOTE: dilated pooling is not implemented, and refusing it beats a silently wrong result.
+    if (!autoPadIsNone(node) or pair(node.ints("dilations"), 0, 1) != 1 or pair(node.ints("dilations"), 1, 1) != 1) return error.UnsupportedOp;
+    const ends = padEnds(pads);
+    const ceil_mode = node.int("ceil_mode", 0) != 0;
+    if (h + py + ends.y < ky or w + px + ends.x < kx) return error.ShapeMismatch;
+    const oh = pooledSize(h + py + ends.y, h + py, ky, sy, ceil_mode);
+    const ow = pooledSize(w + px + ends.x, w + px, kx, sx, ceil_mode);
     const out = try make(a, &.{ n, c, oh, ow });
     const view: Window = .{ .c = c, .h = h, .w = w, .kh = ky, .kw = kx, .sy = sy, .sx = sx, .py = py, .px = px, .dy = 1, .dx = 1, .oh = oh, .ow = ow };
-    kernels.parallelFor(par, n * c, @max(1, 8192 / @max(1, oh * ow * ky * kx)), PoolJob{ .x = x.data, .out = out.data, .v = view, .is_max = is_max }, poolPlanes);
+    kernels.parallelFor(par, n * c, @max(1, 8192 / @max(1, oh * ow * ky * kx)), PoolJob{ .x = x.data, .out = out.data, .v = view, .is_max = is_max, .include_pad = node.int("count_include_pad", 0) != 0, .padded_h = h + py + ends.y, .padded_w = w + px + ends.x }, poolPlanes);
     return out;
 }
 
@@ -1029,8 +1063,11 @@ fn gather(a: Allocator, node: Node, data: Array, indices: Array) Error!Array {
     @memcpy(dims[indices.dims.len..], data.dims[1..]);
     const out: Array = .{ .dims = dims, .data = try a.alloc(f32, product(dims)) };
     for (indices.data, 0..) |raw, i| {
-        const row: usize = @intFromFloat(raw);
-        if (row >= data.dims[0]) return error.ShapeMismatch;
+        // ONNX counts a negative index from the end.
+        const signed: i64 = @intFromFloat(raw);
+        const wrapped = if (signed < 0) signed + @as(i64, @intCast(data.dims[0])) else signed;
+        if (wrapped < 0 or wrapped >= data.dims[0]) return error.ShapeMismatch;
+        const row: usize = @intCast(wrapped);
         @memcpy(out.data[i * inner ..][0..inner], data.data[row * inner ..][0..inner]);
     }
     return out;

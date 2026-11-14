@@ -40,7 +40,7 @@ zig build -Dtarget=x86_64-linux-gnu --prefix zig-out-linux   # Linux compile che
 
 **CPU path.** `src/cpu/kernels.zig` is a packed/tiled GEMM with a worker pool (`Parallel`); `src/cpu/ops.zig` has the row-wise im2col, col2im and batch-norm kernels. Work buffers are sized by `matmulTiledWorkLen`, which must be called with the same `TileConfig` as `matmulTiled`.
 
-**Trainer and layers.** A layer is any struct with `init`, `deinit`, `toGpu`, `forward`, `params`, `state`; tuples of layers are walked by `nn.initAll/params/state`. `grad.trainer.run(Spec, init)` (`src/nn/trainer.zig`) owns batching, augmentation (gather kernel shared with the CPU loop), CutMix, EMA, checkpoints, `--predict`, `--onnx`. Checkpoints hold weights, BN statistics, Adam moments and the EMA shadow, so a checkpoint only loads with the same `--ema` setting.
+**Trainer and layers.** A layer is any struct with `init`, `deinit`, `toGpu`, `forward`, `params`, `state`; tuples of layers are walked by `nn.initAll/params/state`. `grad.trainer.run(Spec, init)` (`src/nn/trainer.zig`) owns batching, augmentation (gather kernel shared with the CPU loop), CutMix, EMA, checkpoints, `--predict`, `--onnx`. Checkpoints hold weights, BN statistics, Adam moments and the EMA shadow; a run without --ema stores the trained weights as the shadow, so any checkpoint loads with or without --ema, and a load is all or nothing.
 
 ## Conventions specific to this repo
 
