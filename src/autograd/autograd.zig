@@ -190,6 +190,23 @@ fn reluGradRange(job: ReluGradJob, lo: usize, hi: usize) void {
     for (job.dst[lo..hi], job.x[lo..hi], job.g[lo..hi]) |*d, v, g| d.* += if (v > 0) g else 0;
 }
 
+const AddReluJob = struct { a: []const f32, b: []const f32, out: []f32 };
+
+fn addReluRange(job: AddReluJob, lo: usize, hi: usize) void {
+    for (job.out[lo..hi], job.a[lo..hi], job.b[lo..hi]) |*o, x, y| o.* = @max(x + y, 0);
+}
+
+// The gradient slices are null for an operand that needs none; the two may be the same buffer (a + a).
+const AddReluGradJob = struct { out: []const f32, g: []const f32, grad_a: ?[]f32, grad_b: ?[]f32 };
+
+fn addReluGradRange(job: AddReluGradJob, lo: usize, hi: usize) void {
+    for (lo..hi) |i| {
+        const v = if (job.out[i] > 0) job.g[i] else 0;
+        if (job.grad_a) |ga_| ga_[i] += v;
+        if (job.grad_b) |gb| gb[i] += v;
+    }
+}
+
 // out = a op b over rows of cols values; with repeat_b every row uses the same vector b instead of its own row of b.
 const RowJob = struct { a: [*]const f32, b: [*]const f32, out: [*]f32, cols: usize, repeat_b: bool, multiply: bool };
 
@@ -375,7 +392,7 @@ pub const Tape = struct {
         if (self.par.gpu) |dev| {
             try dev.addRelu(a.value.data, b.value.data, value.data);
         } else if (T.Elem == f32) {
-            for (value.data, a.value.data, b.value.data) |*o, x, y| o.* = @max(x + y, 0);
+            kernels.parallelFor(self.par, T.len, 1 << 15, AddReluJob{ .a = a.value.data, .b = b.value.data, .out = value.data }, addReluRange);
         } else unreachable;
         const out = try self.makeVar(value, a.needs_grad or b.needs_grad);
         try self.note(.add_relu, .{ a, b }, out, .{});
@@ -384,11 +401,13 @@ pub const Tape = struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
                 if (t.par.gpu) |dev| return dev.addReluBackward(c.out.value.data, c.out.grad.data, c.a.grad.data, c.b.grad.data, c.a.needs_grad, c.b.needs_grad);
                 if (comptime T.Elem != f32) unreachable;
-                for (c.out.value.data, c.out.grad.data, 0..) |o, g, i| {
-                    const v = if (o > 0) g else 0;
-                    if (c.a.needs_grad) c.a.grad.data[i] += v;
-                    if (c.b.needs_grad) c.b.grad.data[i] += v;
-                }
+                const job: AddReluGradJob = .{
+                    .out = c.out.value.data,
+                    .g = c.out.grad.data,
+                    .grad_a = if (c.a.needs_grad) c.a.grad.data else null,
+                    .grad_b = if (c.b.needs_grad) c.b.grad.data else null,
+                };
+                kernels.parallelFor(t.par, T.len, 1 << 15, job, addReluGradRange);
             }
         }.run);
         return out;
@@ -438,9 +457,14 @@ pub const Tape = struct {
             // Reading and writing the same element is safe, so the sum is formed in the product's own buffer.
             try dev.elementwise(.add, value.data, b.value.data, value.data, .{ .dims = padToRank(&bc.dims, 1), .a_strides = padToRank(&bc.a, 0), .b_strides = padToRank(&bc.b, 0) });
         } else {
-            for (0..Out.shape[0]) |r| {
-                for (value.data[r * B.len ..][0..B.len], b.value.data) |*v, bias| v.* += bias;
-            }
+            const Job = struct { rows: []f32, bias: []const f32 };
+            kernels.parallelFor(self.par, Out.shape[0], @max(1, (1 << 14) / B.len), Job{ .rows = value.data, .bias = b.value.data }, struct {
+                fn run(job: Job, lo: usize, hi: usize) void {
+                    for (lo..hi) |r| {
+                        for (job.rows[r * job.bias.len ..][0..job.bias.len], job.bias) |*v, bias| v.* += bias;
+                    }
+                }
+            }.run);
         }
         const out = try self.makeVar(value, x.needs_grad or w.needs_grad or b.needs_grad);
         try self.note(.linear, .{ x, w, b }, out, .{});
@@ -562,11 +586,17 @@ pub const Tape = struct {
             try dev.layerNorm(.{ .x = x.value.data, .gamma = gamma.value.data, .mean = mean.data, .inv_std = inv_std.data }, beta.value.data, value.data);
         } else {
             if (comptime X.Elem != f32) unreachable;
-            for (0..rows) |r| {
-                const row = layernorm_math.forwardRow(f32, x.value.data.ptr + r * cols, value.data.ptr + r * cols, gamma.value.data.ptr, beta.value.data.ptr, cols);
-                mean.data[r] = row.mean;
-                inv_std.data[r] = row.inv_std;
-            }
+            const Job = struct { x: [*]const f32, y: [*]f32, gamma: [*]const f32, beta: [*]const f32, mean: [*]f32, inv_std: [*]f32 };
+            const job: Job = .{ .x = x.value.data.ptr, .y = value.data.ptr, .gamma = gamma.value.data.ptr, .beta = beta.value.data.ptr, .mean = mean.data.ptr, .inv_std = inv_std.data.ptr };
+            kernels.parallelFor(self.par, rows, @max(1, 8192 / cols), job, struct {
+                fn run(j: Job, lo: usize, hi: usize) void {
+                    for (lo..hi) |r| {
+                        const row = layernorm_math.forwardRow(f32, j.x + r * cols, j.y + r * cols, j.gamma, j.beta, cols);
+                        j.mean[r] = row.mean;
+                        j.inv_std[r] = row.inv_std;
+                    }
+                }
+            }.run);
         }
         const out = try self.makeVar(value, x.needs_grad or gamma.needs_grad or beta.needs_grad);
         try self.note(.layer_norm, .{ x, gamma, beta }, out, .{});
@@ -578,16 +608,14 @@ pub const Tape = struct {
                     return dev.layerNormBackward(p, c.out.grad.data, if (c.x.needs_grad) c.x.grad.data else null, if (c.gamma.needs_grad) c.gamma.grad.data else null, if (c.beta.needs_grad) c.beta.grad.data else null);
                 }
                 if (comptime X.Elem != f32) unreachable;
-                for (0..rows) |r| {
-                    if (c.x.needs_grad) layernorm_math.backwardRow(
-                        f32,
-                        c.x.value.data.ptr + r * cols,
-                        c.out.grad.data.ptr + r * cols,
-                        c.x.grad.data.ptr + r * cols,
-                        c.gamma.value.data.ptr,
-                        .{ .mean = c.mean.data[r], .inv_std = c.inv_std.data[r] },
-                        cols,
-                    );
+                if (c.x.needs_grad) {
+                    const Job = struct { x: [*]const f32, dy: [*]const f32, dx: [*]f32, gamma: [*]const f32, mean: [*]const f32, inv_std: [*]const f32 };
+                    const job: Job = .{ .x = c.x.value.data.ptr, .dy = c.out.grad.data.ptr, .dx = c.x.grad.data.ptr, .gamma = c.gamma.value.data.ptr, .mean = c.mean.data.ptr, .inv_std = c.inv_std.data.ptr };
+                    kernels.parallelFor(t.par, rows, @max(1, 8192 / cols), job, struct {
+                        fn run(j: Job, lo: usize, hi: usize) void {
+                            for (lo..hi) |r| layernorm_math.backwardRow(f32, j.x + r * cols, j.dy + r * cols, j.dx + r * cols, j.gamma, .{ .mean = j.mean[r], .inv_std = j.inv_std[r] }, cols);
+                        }
+                    }.run);
                 }
                 if (c.gamma.needs_grad or c.beta.needs_grad) layernorm_math.parameterGradients(
                     f32,
@@ -632,7 +660,12 @@ pub const Tape = struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
                 if (t.par.gpu) |dev| return dev.softmaxBackward(c.out.value.data, c.out.grad.data, c.x.grad.data, cols, opts.scale);
                 if (comptime X.Elem != f32) unreachable;
-                for (0..X.shape[0]) |r| softmax_math.backwardRow(f32, c.out.value.data.ptr + r * cols, c.out.grad.data.ptr + r * cols, c.x.grad.data.ptr + r * cols, cols, opts.scale);
+                const Job = struct { y: [*]const f32, dy: [*]const f32, dx: [*]f32 };
+                kernels.parallelFor(t.par, X.shape[0], 16, Job{ .y = c.out.value.data.ptr, .dy = c.out.grad.data.ptr, .dx = c.x.grad.data.ptr }, struct {
+                    fn run(job: Job, lo: usize, hi: usize) void {
+                        for (lo..hi) |r| softmax_math.backwardRow(f32, job.y + r * cols, job.dy + r * cols, job.dx + r * cols, cols, opts.scale);
+                    }
+                }.run);
             }
         }.run);
         return out;
@@ -659,7 +692,13 @@ pub const Tape = struct {
         if (self.par.gpu) |dev| {
             try dev.gruGates(gx.value.data, gh.value.data, h.value.data, update_value.data, reset_value.data, hidden);
         } else {
-            for (0..H.len) |i| gru_math.gatesForward(gx.value.data.ptr, gh.value.data.ptr, h.value.data.ptr, update_value.data.ptr, reset_value.data.ptr, i, hidden);
+            const Job = struct { gx: [*]const f32, gh: [*]const f32, h: [*]const f32, update: [*]f32, reset_h: [*]f32 };
+            const job: Job = .{ .gx = gx.value.data.ptr, .gh = gh.value.data.ptr, .h = h.value.data.ptr, .update = update_value.data.ptr, .reset_h = reset_value.data.ptr };
+            kernels.parallelFor(self.par, H.len, 1 << 12, job, struct {
+                fn run(j: Job, lo: usize, hi: usize) void {
+                    for (lo..hi) |i| gru_math.gatesForward(j.gx, j.gh, j.h, j.update, j.reset_h, i, hidden);
+                }
+            }.run);
         }
         const needs = gx.needs_grad or gh.needs_grad or h.needs_grad;
         const update = try self.makeVar(update_value, needs);
@@ -672,7 +711,13 @@ pub const Tape = struct {
                 const flags: u32 = (if (c.gx.needs_grad) gru_math.needs_gx else 0) | (if (c.gh.needs_grad) gru_math.needs_gh else 0) | (if (c.h.needs_grad) gru_math.needs_h else 0);
                 const grad: gru_math.GatesGrad = .{ .gx = c.gx.grad.data.ptr, .gh = c.gh.grad.data.ptr, .h = c.h.grad.data.ptr };
                 if (t.par.gpu) |dev| return dev.gruGatesBackward(c.gx.value.data, c.gh.value.data, c.h.value.data, c.update.grad.data, c.reset_h.grad.data, grad, flags, hidden);
-                for (0..H.len) |i| gru_math.gatesBackward(c.gx.value.data.ptr, c.gh.value.data.ptr, c.h.value.data.ptr, c.update.grad.data.ptr, c.reset_h.grad.data.ptr, grad, flags, i, hidden);
+                const Job = struct { gx: [*]const f32, gh: [*]const f32, h: [*]const f32, d_update: [*]const f32, d_reset_h: [*]const f32, grad: gru_math.GatesGrad, flags: u32 };
+                const job: Job = .{ .gx = c.gx.value.data.ptr, .gh = c.gh.value.data.ptr, .h = c.h.value.data.ptr, .d_update = c.update.grad.data.ptr, .d_reset_h = c.reset_h.grad.data.ptr, .grad = grad, .flags = flags };
+                kernels.parallelFor(t.par, H.len, 1 << 12, job, struct {
+                    fn run(j: Job, lo: usize, hi: usize) void {
+                        for (lo..hi) |i| gru_math.gatesBackward(j.gx, j.gh, j.h, j.d_update, j.d_reset_h, j.grad, j.flags, i, hidden);
+                    }
+                }.run);
             }
         }.run);
         return .{ update, reset_h };
@@ -689,7 +734,13 @@ pub const Tape = struct {
         if (self.par.gpu) |dev| {
             try dev.gruNext(gx.value.data, gc.value.data, update.value.data, h.value.data, value.data, hidden);
         } else {
-            for (0..H.len) |i| gru_math.nextForward(gx.value.data.ptr, gc.value.data.ptr, update.value.data.ptr, h.value.data.ptr, value.data.ptr, i, hidden);
+            const Job = struct { gx: [*]const f32, gc: [*]const f32, update: [*]const f32, h: [*]const f32, next: [*]f32 };
+            const job: Job = .{ .gx = gx.value.data.ptr, .gc = gc.value.data.ptr, .update = update.value.data.ptr, .h = h.value.data.ptr, .next = value.data.ptr };
+            kernels.parallelFor(self.par, H.len, 1 << 12, job, struct {
+                fn run(j: Job, lo: usize, hi: usize) void {
+                    for (lo..hi) |i| gru_math.nextForward(j.gx, j.gc, j.update, j.h, j.next, i, hidden);
+                }
+            }.run);
         }
         const out = try self.makeVar(value, gx.needs_grad or gc.needs_grad or update.needs_grad or h.needs_grad);
         try self.note(.gru_next, .{ gx, gc, update, h }, out, .{});
@@ -702,7 +753,13 @@ pub const Tape = struct {
                     (if (c.h.needs_grad) gru_math.needs_h else 0);
                 const grad: gru_math.NextGrad = .{ .gx = c.gx.grad.data.ptr, .gc = c.gc.grad.data.ptr, .update = c.update.grad.data.ptr, .h = c.h.grad.data.ptr };
                 if (t.par.gpu) |dev| return dev.gruNextBackward(c.gx.value.data, c.gc.value.data, c.update.value.data, c.h.value.data, c.out.grad.data, grad, flags, hidden);
-                for (0..H.len) |i| gru_math.nextBackward(c.gx.value.data.ptr, c.gc.value.data.ptr, c.update.value.data.ptr, c.h.value.data.ptr, c.out.grad.data.ptr, grad, flags, i, hidden);
+                const Job = struct { gx: [*]const f32, gc: [*]const f32, update: [*]const f32, h: [*]const f32, d_next: [*]const f32, grad: gru_math.NextGrad, flags: u32 };
+                const job: Job = .{ .gx = c.gx.value.data.ptr, .gc = c.gc.value.data.ptr, .update = c.update.value.data.ptr, .h = c.h.value.data.ptr, .d_next = c.out.grad.data.ptr, .grad = grad, .flags = flags };
+                kernels.parallelFor(t.par, H.len, 1 << 12, job, struct {
+                    fn run(j: Job, lo: usize, hi: usize) void {
+                        for (lo..hi) |i| gru_math.nextBackward(j.gx, j.gc, j.update, j.h, j.d_next, j.grad, j.flags, i, hidden);
+                    }
+                }.run);
             }
         }.run);
         return out;
@@ -777,20 +834,15 @@ pub const Tape = struct {
     }
 
     /// Normalizes over every axis except the last using batch statistics while training and running ones otherwise.
-    pub fn batchNorm(self: *Tape, x: anytype, gamma: anytype, beta: anytype, running: anytype) Error!Var(@TypeOf(x.value)) {
-        return self.batchNormImpl(.none, x, {}, gamma, beta, running);
-    }
-
-    /// Batch norm followed by ReLU, fused into one kernel.
-    pub fn batchNormRelu(self: *Tape, x: anytype, gamma: anytype, beta: anytype, running: anytype) Error!Var(@TypeOf(x.value)) {
-        return self.batchNormImpl(.relu, x, {}, gamma, beta, running);
-    }
-
-    /// Computes max(batchNorm(x) + residual, 0), the end of a residual block, in one pass over the activations.
-    /// residual must have the shape and element type of x.
-    pub fn batchNormAddRelu(self: *Tape, x: anytype, residual: anytype, gamma: anytype, beta: anytype, running: anytype) Error!Var(@TypeOf(x.value)) {
-        comptime if (@TypeOf(x.value) != @TypeOf(residual.value)) @compileError("batchNormAddRelu expects a residual of the same shape as x");
-        return self.batchNormImpl(.add_relu, x, residual, gamma, beta, running);
+    /// The anonymous struct fuse says what the same kernel does afterwards: .{} nothing, .{ .relu = true } a ReLU, and
+    /// .{ .residual = r } the addition of r (the shape and element type of x) and then a ReLU, the end of a residual block.
+    pub fn batchNorm(self: *Tape, x: anytype, gamma: anytype, beta: anytype, running: anytype, fuse: anytype) Error!Var(@TypeOf(x.value)) {
+        const mode: NormFuse = if (@hasField(@TypeOf(fuse), "residual")) .add_relu else if (@hasField(@TypeOf(fuse), "relu") and fuse.relu) .relu else .none;
+        if (mode == .add_relu) {
+            comptime if (@TypeOf(x.value) != @TypeOf(fuse.residual.value)) @compileError("batchNorm expects a residual of the same shape as x");
+            return self.batchNormImpl(.add_relu, x, fuse.residual, gamma, beta, running);
+        }
+        return self.batchNormImpl(mode, x, {}, gamma, beta, running);
     }
 
     fn batchNormImpl(self: *Tape, comptime fuse: NormFuse, x: anytype, residual: anytype, gamma: anytype, beta: anytype, running: anytype) Error!Var(@TypeOf(x.value)) {
@@ -1117,44 +1169,34 @@ pub const Tape = struct {
     }
     /// Convolution followed by batch normalization; on the bf16 GPU training path the conv GEMM's epilogue
     /// accumulates the batch statistics, saving a pass over the feature maps.
-    pub fn convBatchNorm(self: *Tape, x: anytype, w: anytype, gamma: anytype, beta: anytype, running: anytype, comptime opts: ConvOpts) Error!Var(ConvOut(@TypeOf(x.value), @TypeOf(w.value), opts)) {
-        return self.convBn(.none, x, w, {}, gamma, beta, running, opts);
+    /// The fuse argument is the one of batchNorm: .{}, .{ .relu = true } or .{ .residual = r }, where r has the shape and
+    /// element type of the convolution's output.
+    pub fn convBatchNorm(self: *Tape, x: anytype, w: anytype, gamma: anytype, beta: anytype, running: anytype, comptime opts: ConvOpts, fuse: anytype) Error!Var(ConvOut(@TypeOf(x.value), @TypeOf(w.value), opts)) {
+        const mode: NormFuse = if (@hasField(@TypeOf(fuse), "residual")) .add_relu else if (@hasField(@TypeOf(fuse), "relu") and fuse.relu) .relu else .none;
+        if (mode == .add_relu) {
+            comptime if (@TypeOf(fuse.residual.value) != ConvOut(@TypeOf(x.value), @TypeOf(w.value), opts)) @compileError("convBatchNorm expects a residual of the convolution's output shape");
+            return self.convBn(.add_relu, x, w, fuse.residual, gamma, beta, running, opts);
+        }
+        return self.convBn(mode, x, w, {}, gamma, beta, running, opts);
     }
 
-    /// Convolution followed by batch normalization and ReLU; see convBatchNorm.
-    pub fn convBatchNormRelu(self: *Tape, x: anytype, w: anytype, gamma: anytype, beta: anytype, running: anytype, comptime opts: ConvOpts) Error!Var(ConvOut(@TypeOf(x.value), @TypeOf(w.value), opts)) {
-        return self.convBn(.relu, x, w, {}, gamma, beta, running, opts);
-    }
-
-    /// Convolution, batch norm, addition of residual and ReLU; see convBatchNorm. residual must have the
-    /// shape and element type of the convolution's output.
-    pub fn convBatchNormAddRelu(self: *Tape, x: anytype, w: anytype, residual: anytype, gamma: anytype, beta: anytype, running: anytype, comptime opts: ConvOpts) Error!Var(ConvOut(@TypeOf(x.value), @TypeOf(w.value), opts)) {
-        const Out = ConvOut(@TypeOf(x.value), @TypeOf(w.value), opts);
-        comptime if (@TypeOf(residual.value) != Out) @compileError("convBatchNormAddRelu expects a residual of the convolution's output shape");
-        return self.convBn(.add_relu, x, w, residual, gamma, beta, running, opts);
+    // A convolution followed by a separate batch-norm op of the given fuse mode.
+    fn unfusedConvBn(self: *Tape, comptime fuse: NormFuse, x: anytype, w: anytype, residual: anytype, gamma: anytype, beta: anytype, running: anytype, comptime opts: ConvOpts) Error!Var(ConvOut(@TypeOf(x.value), @TypeOf(w.value), opts)) {
+        const y = try self.conv2d(x, w, opts);
+        return switch (fuse) {
+            .none => self.batchNorm(y, gamma, beta, running, .{}),
+            .relu => self.batchNorm(y, gamma, beta, running, .{ .relu = true }),
+            .add_relu => self.batchNorm(y, gamma, beta, running, .{ .residual = residual }),
+        };
     }
 
     fn convBn(self: *Tape, comptime fuse: NormFuse, x: anytype, w: anytype, residual: anytype, gamma: anytype, beta: anytype, running: anytype, comptime opts: ConvOpts) Error!Var(ConvOut(@TypeOf(x.value), @TypeOf(w.value), opts)) {
         const In = @TypeOf(x.value);
         const Out = ConvOut(In, @TypeOf(w.value), opts);
-        if (comptime In.Elem != u16) {
-            const y = try self.conv2d(x, w, opts);
-            return switch (fuse) {
-                .none => self.batchNorm(y, gamma, beta, running),
-                .relu => self.batchNormRelu(y, gamma, beta, running),
-                .add_relu => self.batchNormAddRelu(y, residual, gamma, beta, running),
-            };
-        }
+        if (comptime In.Elem != u16) return self.unfusedConvBn(fuse, x, w, residual, gamma, beta, running, opts);
         // NOTE: only the bf16 implicit GEMM accumulates the statistics in its epilogue; evaluation uses the
         // running statistics and needs no sums, so both take the unfused ops.
-        if (self.par.gpu == null or !self.training) {
-            const y = try self.conv2d(x, w, opts);
-            return switch (fuse) {
-                .none => self.batchNorm(y, gamma, beta, running),
-                .relu => self.batchNormRelu(y, gamma, beta, running),
-                .add_relu => self.batchNormAddRelu(y, residual, gamma, beta, running),
-            };
-        }
+        if (self.par.gpu == null or !self.training) return self.unfusedConvBn(fuse, x, w, residual, gamma, beta, running, opts);
         const dev = self.par.gpu.?;
         const ks = comptime kernelSize(In, @TypeOf(w.value), 1);
         const c_in = In.shape[3];
@@ -1239,27 +1281,29 @@ pub const Tape = struct {
         return out;
     }
 
+    fn unfusedChain(self: *Tape, x: anytype, first: anytype, second: anytype, residual: anytype, comptime opts: ConvOpts) Error!Var(ConvOut(ConvOut(@TypeOf(x.value), @TypeOf(first.w.value), opts), @TypeOf(second.w.value), opts)) {
+        const y1 = try self.convBatchNorm(x, first.w, first.gamma, first.beta, first.running, opts, .{ .relu = true });
+        return self.convBatchNorm(y1, second.w, second.gamma, second.beta, second.running, opts, .{ .residual = residual });
+    }
+
     /// Two convolutions of a residual block fused around a virtual middle map: the batch-norm-plus-ReLU output of
     /// the first convolution is never written to memory. The second convolution's GEMM rebuilds it on load
     /// (relu(scale * x + shift) per element, with scale and shift rounded to bf16 — one extra bf16 step next to
     /// the map's own bf16 storage), and in the backward pass the input-gradient GEMM of the second convolution
     /// accumulates the first norm's masked gradient sums in its epilogue. Both convolutions share
     /// opts. Off the bf16 GPU training path it falls back to the unfused pair.
-    pub fn convBnChain(self: *Tape, x: anytype, w1: anytype, gamma1: anytype, beta1: anytype, running1: anytype, w2: anytype, residual: anytype, gamma2: anytype, beta2: anytype, running2: anytype, comptime opts: ConvOpts) Error!Var(ConvOut(ConvOut(@TypeOf(x.value), @TypeOf(w1.value), opts), @TypeOf(w2.value), opts)) {
+    /// first and second are anonymous structs with the fields w, gamma, beta and running of each convolution and its norm.
+    pub fn convBnChain(self: *Tape, x: anytype, first: anytype, second: anytype, residual: anytype, comptime opts: ConvOpts) Error!Var(ConvOut(ConvOut(@TypeOf(x.value), @TypeOf(first.w.value), opts), @TypeOf(second.w.value), opts)) {
+        const w1, const gamma1, const beta1, const running1 = .{ first.w, first.gamma, first.beta, first.running };
+        const w2, const gamma2, const beta2, const running2 = .{ second.w, second.gamma, second.beta, second.running };
         const In = @TypeOf(x.value);
         const Mid = ConvOut(In, @TypeOf(w1.value), opts);
         const Out = ConvOut(Mid, @TypeOf(w2.value), opts);
         comptime if (@TypeOf(residual.value) != Out) @compileError("convBnChain expects a residual of the chain's output shape");
-        if (comptime In.Elem != u16) {
-            const y1 = try self.convBatchNormRelu(x, w1, gamma1, beta1, running1, opts);
-            return self.convBatchNormAddRelu(y1, w2, residual, gamma2, beta2, running2, opts);
-        }
+        if (comptime In.Elem != u16) return self.unfusedChain(x, first, second, residual, opts);
         // NOTE: only the bf16 implicit GEMM rebuilds the virtual map on load; evaluation uses the running
         // statistics and both convolutions take the unfused ops, like convBn.
-        if (self.par.gpu == null or !self.training) {
-            const y1 = try self.convBatchNormRelu(x, w1, gamma1, beta1, running1, opts);
-            return self.convBatchNormAddRelu(y1, w2, residual, gamma2, beta2, running2, opts);
-        }
+        if (self.par.gpu == null or !self.training) return self.unfusedChain(x, first, second, residual, opts);
         const dev = self.par.gpu.?;
         const ks1 = comptime kernelSize(In, @TypeOf(w1.value), 1);
         const ks2 = comptime kernelSize(Mid, @TypeOf(w2.value), 1);

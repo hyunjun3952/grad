@@ -37,6 +37,74 @@ test "crossEntropy of equal logits, and gradient fan-out accumulates" {
     try testing.expectApproxEqAbs(@as(f32, 1), x.grad.data[1], 1e-6);
 }
 
+fn randomTensor(comptime T: type, gpa: Allocator, rng: std.Random) !T {
+    const t = try T.empty(gpa);
+    for (t.data) |*v| v.* = rng.floatNorm(f32);
+    return t;
+}
+
+// Runs linear, addRelu, layerNorm, softmax and cross entropy, or the two GRU halves, on shapes large enough that every
+// element-wise loop splits over the pool; returns the loss and every leaf gradient in one list.
+fn parallelLoopsChain(gpa: Allocator, par: kernels.Parallel, comptime gru: bool) ![]f32 {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(21);
+    const rng = prng.random();
+    const rows = 300;
+    const cols = 256;
+    const Mat = Tensor(f32, &.{ rows, cols });
+    var labels: [rows]u8 = undefined;
+    for (&labels) |*l| l.* = @intCast(rng.uintLessThan(u32, cols));
+    var tape: Tape = .{ .gpa = a, .par = par };
+
+    var leaves: [5]Var(Mat) = undefined;
+    var loss: Var(Tensor(f32, &.{})) = undefined;
+    var extra: [3][]f32 = undefined;
+    if (gru) {
+        const gx = try tape.leaf(try randomTensor(Tensor(f32, &.{ rows, 3 * cols }), a, rng));
+        const gh = try tape.leaf(try randomTensor(Tensor(f32, &.{ rows, 2 * cols }), a, rng));
+        const h = try tape.leaf(try randomTensor(Mat, a, rng));
+        const update, const reset_h = try tape.gruGates(gx, gh, h);
+        const next = try tape.gruNext(gx, reset_h, update, h);
+        loss = try tape.crossEntropy(next, &labels);
+        try tape.backward(loss);
+        leaves[0] = h;
+        extra = .{ gx.grad.data, gh.grad.data, &.{} };
+    } else {
+        const w = try tape.leaf(try randomTensor(Tensor(f32, &.{ cols, cols }), a, rng));
+        const b = try tape.leaf(try randomTensor(Tensor(f32, &.{cols}), a, rng));
+        const x = try tape.leaf(try randomTensor(Mat, a, rng));
+        const skip = try tape.leaf(try randomTensor(Mat, a, rng));
+        const gamma = try tape.leaf(try randomTensor(Tensor(f32, &.{cols}), a, rng));
+        const beta = try tape.leaf(try randomTensor(Tensor(f32, &.{cols}), a, rng));
+        const normed = try tape.layerNorm(try tape.addRelu(try tape.linear(x, w, b), skip), gamma, beta);
+        loss = try tape.crossEntropy(try tape.softmax(normed, .{}), &labels);
+        try tape.backward(loss);
+        leaves[0] = x;
+        leaves[1] = skip;
+        extra = .{ w.grad.data, gamma.grad.data, b.grad.data };
+    }
+    var result: std.ArrayList(f32) = .empty;
+    errdefer result.deinit(gpa);
+    try result.append(gpa, loss.value.data[0]);
+    try result.appendSlice(gpa, leaves[0].grad.data);
+    if (!gru) try result.appendSlice(gpa, leaves[1].grad.data);
+    for (extra) |g| try result.appendSlice(gpa, g);
+    return result.toOwnedSlice(gpa);
+}
+
+test "the element-wise CPU loops give the same loss and gradients on a worker pool as on one thread" {
+    inline for (.{ false, true }) |gru| {
+        const serial = try parallelLoopsChain(testing.allocator, .{}, gru);
+        defer testing.allocator.free(serial);
+        const pooled = try parallelLoopsChain(testing.allocator, .{ .io = testing.io, .threads = 4 }, gru);
+        defer testing.allocator.free(pooled);
+        try testing.expectEqual(serial.len, pooled.len);
+        for (serial, pooled) |s, p| try testing.expectApproxEqRel(s, p, 1e-4);
+    }
+}
+
 fn bigGradients(gpa: Allocator, threads: usize, x: Tensor(f32, &.{ 64, 784 }), w1: Tensor(f32, &.{ 784, 128 }), w2: Tensor(f32, &.{ 128, 10 }), labels: []const u8) !struct { loss: f32, g1: []f32, g2: []f32 } {
     var t: Tape = .{ .gpa = gpa, .par = if (threads > 1) .{ .io = testing.io, .threads = threads } else .{} };
     const vx = try t.constant(x);
@@ -159,7 +227,7 @@ test "batch norm at eval time uses the running statistics" {
 
     var t: Tape = .{ .gpa = gpa };
     const x = try t.constant(p.x);
-    const y = try t.batchNorm(x, try t.constant(p.gamma), try t.constant(p.beta), .{ .mean = running_mean, .variance = running_var });
+    const y = try t.batchNorm(x, try t.constant(p.gamma), try t.constant(p.beta), .{ .mean = running_mean, .variance = running_var }, .{});
     for (0..6) |r| {
         for (0..3) |ch| {
             const want = p.gamma.data[ch] * (p.x.data[r * 3 + ch] - running_mean.data[ch]) / @sqrt(running_var.data[ch] + 1e-5) + p.beta.data[ch];
@@ -684,7 +752,7 @@ const BnCase = struct {
         const v = try t.leaf(p.v);
         const running_mean = try t.zeroedTensor(Channels);
         const running_var = try t.filledTensor(Channels, 1);
-        const normalized = try t.batchNorm(x, gamma, beta, .{ .mean = running_mean, .variance = running_var });
+        const normalized = try t.batchNorm(x, gamma, beta, .{ .mean = running_mean, .variance = running_var }, .{});
         const loss = try t.crossEntropy(try t.matmul(normalized, v), label_slice);
         return .{ .loss = loss, .x = x, .gamma = gamma, .beta = beta, .v = v, .running_mean = running_mean, .running_var = running_var };
     }
@@ -704,7 +772,7 @@ const BnReluCase = struct {
         const running_mean = try t.zeroedTensor(BnCase.Channels);
         const running_var = try t.filledTensor(BnCase.Channels, 1);
         const stats = .{ .mean = running_mean, .variance = running_var };
-        const activated = if (fused) try t.batchNormRelu(x, gamma, beta, stats) else try t.relu(try t.batchNorm(x, gamma, beta, stats));
+        const activated = if (fused) try t.batchNorm(x, gamma, beta, stats, .{ .relu = true }) else try t.relu(try t.batchNorm(x, gamma, beta, stats, .{}));
         const loss = try t.crossEntropy(try t.matmul(activated, v), label_slice);
         return .{ .loss = loss, .x = x, .gamma = gamma, .beta = beta, .v = v, .running_mean = running_mean, .running_var = running_var };
     }
@@ -717,7 +785,7 @@ const BnReluCase = struct {
         var t: Tape = .{ .gpa = gpa, .training = true };
         const running_mean = try t.zeroedTensor(BnCase.Channels);
         const running_var = try t.filledTensor(BnCase.Channels, 1);
-        const y = try t.batchNorm(try t.constant(p.x), try t.constant(p.gamma), try t.constant(p.beta), .{ .mean = running_mean, .variance = running_var });
+        const y = try t.batchNorm(try t.constant(p.x), try t.constant(p.gamma), try t.constant(p.beta), .{ .mean = running_mean, .variance = running_var }, .{});
         var smallest: f32 = std.math.floatMax(f32);
         for (y.value.data) |v| smallest = @min(smallest, @abs(v));
         return smallest > 0.05;
@@ -775,7 +843,7 @@ const BnAddReluCase = struct {
         const running_mean = try t.zeroedTensor(BnCase.Channels);
         const running_var = try t.filledTensor(BnCase.Channels, 1);
         const stats = .{ .mean = running_mean, .variance = running_var };
-        const activated = if (fused) try t.batchNormAddRelu(x, r, gamma, beta, stats) else try t.addRelu(try t.batchNorm(x, gamma, beta, stats), r);
+        const activated = if (fused) try t.batchNorm(x, gamma, beta, stats, .{ .residual = r }) else try t.addRelu(try t.batchNorm(x, gamma, beta, stats, .{}), r);
         const loss = try t.crossEntropy(try t.matmul(activated, v), label_slice);
         return .{ .loss = loss, .x = x, .r = r, .gamma = gamma, .beta = beta, .v = v, .running_mean = running_mean, .running_var = running_var };
     }
@@ -788,7 +856,7 @@ const BnAddReluCase = struct {
         var t: Tape = .{ .gpa = gpa, .training = true };
         const running_mean = try t.zeroedTensor(BnCase.Channels);
         const running_var = try t.filledTensor(BnCase.Channels, 1);
-        const y = try t.add(try t.batchNorm(try t.constant(p.x), try t.constant(p.gamma), try t.constant(p.beta), .{ .mean = running_mean, .variance = running_var }), try t.constant(p.r));
+        const y = try t.add(try t.batchNorm(try t.constant(p.x), try t.constant(p.gamma), try t.constant(p.beta), .{ .mean = running_mean, .variance = running_var }, .{}), try t.constant(p.r));
         var smallest: f32 = std.math.floatMax(f32);
         for (y.value.data) |v| smallest = @min(smallest, @abs(v));
         return smallest > 0.05;
@@ -1041,7 +1109,7 @@ test "casting to bf16 and back rounds the values and passes the gradient through
     for (host) |g| try testing.expectEqual(@as(f32, 2), g);
 }
 
-// Runs batchNormRelu (or batchNormAddRelu with residual r when r_values is not empty) on the device in f32 or bf16 and downloads
+// Runs batchNorm with a ReLU (or with residual r added before it when r_values is not empty) on the device in f32 or bf16 and downloads
 // the output, the input gradient, the residual gradient into dr_values and the running statistics. The channel count selects
 // the reduction kernel: an even count lets a bf16 lane read two channels at once, an odd count keeps the one-channel path.
 fn runBatchNorm(comptime half: bool, comptime channels: usize, gpu: *gpu_mod.Gpu, x_values: []const f32, r_values: []const f32, dy_values: []const f32, out_values: []f32, dx_values: []f32, dr_values: []f32, running: []f32) !void {
@@ -1072,9 +1140,9 @@ fn runBatchNorm(comptime half: bool, comptime channels: usize, gpu: *gpu_mod.Gpu
     const input = if (half) try t.cast(x, u16) else x;
     const running_stats = .{ .mean = mean, .variance = variance };
     const out = if (r_values.len == 0)
-        try t.batchNormRelu(input, gamma, beta, running_stats)
+        try t.batchNorm(input, gamma, beta, running_stats, .{ .relu = true })
     else
-        try t.batchNormAddRelu(input, if (half) try t.cast(r, u16) else r, gamma, beta, running_stats);
+        try t.batchNorm(input, gamma, beta, running_stats, .{ .residual = if (half) try t.cast(r, u16) else r });
     const back = try t.cast(out, f32);
     try gpu.download(out_values, back.value.data);
     try gpu.upload(back.grad.data, dy_values);
@@ -1290,7 +1358,7 @@ test "a convolution on bf16 activations agrees with the f32 convolution within b
     for (wide_dw, half_dw) |want, got| try testing.expectApproxEqAbs(want, got, 0.6 + 0.03 * @abs(want));
 }
 
-// Runs convBatchNormRelu (batch statistics from the conv epilogue) or conv2d followed by batchNormRelu (a separate
+// Runs convBatchNorm with a ReLU (batch statistics from the conv epilogue) or conv2d followed by batchNorm with a ReLU (a separate
 // reduction) on bf16 activations and downloads the output, the input, weight, gamma, beta and residual gradients
 // and the running statistics. r_values empty selects the plain ReLU variant.
 fn runConvBn(comptime fused: bool, comptime n: usize, comptime side: usize, comptime c_in: usize, comptime c_out: usize, gpu: *gpu_mod.Gpu, x_values: []const f32, w_values: []const f32, r_values: []const f32, dy_values: []const f32, out: []f32, dx: []f32, dw: []f32, dgamma: []f32, dbeta: []f32, dr: []f32, running: []f32) !void {
@@ -1327,15 +1395,15 @@ fn runConvBn(comptime fused: bool, comptime n: usize, comptime side: usize, comp
     const stats = .{ .mean = mean, .variance = variance };
     const y = if (r_values.len == 0)
         (if (fused)
-            try t.convBatchNormRelu(input, w, gamma, beta, stats, .{ .pad = 1 })
+            try t.convBatchNorm(input, w, gamma, beta, stats, .{ .pad = 1 }, .{ .relu = true })
         else
-            try t.batchNormRelu(try t.conv2d(input, w, .{ .pad = 1 }), gamma, beta, stats))
+            try t.batchNorm(try t.conv2d(input, w, .{ .pad = 1 }), gamma, beta, stats, .{ .relu = true }))
     else blk: {
         const residual = try t.cast(r, u16);
         break :blk if (fused)
-            try t.convBatchNormAddRelu(input, w, residual, gamma, beta, stats, .{ .pad = 1 })
+            try t.convBatchNorm(input, w, gamma, beta, stats, .{ .pad = 1 }, .{ .residual = residual })
         else
-            try t.batchNormAddRelu(try t.conv2d(input, w, .{ .pad = 1 }), residual, gamma, beta, stats);
+            try t.batchNorm(try t.conv2d(input, w, .{ .pad = 1 }), gamma, beta, stats, .{ .residual = residual });
     };
     const back = try t.cast(y, f32);
     try gpu.download(out, back.value.data);
@@ -1435,9 +1503,9 @@ fn runConvBnChain(comptime fused: bool, comptime n: usize, comptime side: usize,
     const stats1 = .{ .mean = mean1, .variance = variance1 };
     const stats2 = .{ .mean = mean2, .variance = variance2 };
     const y = if (fused)
-        try t.convBnChain(input, w1, gamma1, beta1, stats1, w2, residual, gamma2, beta2, stats2, .{ .pad = 1 })
+        try t.convBnChain(input, .{ .w = w1, .gamma = gamma1, .beta = beta1, .running = stats1 }, .{ .w = w2, .gamma = gamma2, .beta = beta2, .running = stats2 }, residual, .{ .pad = 1 })
     else
-        try t.convBatchNormAddRelu(try t.convBatchNormRelu(input, w1, gamma1, beta1, stats1, .{ .pad = 1 }), w2, residual, gamma2, beta2, stats2, .{ .pad = 1 });
+        try t.convBatchNorm(try t.convBatchNorm(input, w1, gamma1, beta1, stats1, .{ .pad = 1 }, .{ .relu = true }), w2, gamma2, beta2, stats2, .{ .pad = 1 }, .{ .residual = residual });
     const back = try t.cast(y, f32);
     try gpu.download(bufs.out, back.value.data);
     try gpu.upload(back.grad.data, dy_values);

@@ -183,16 +183,16 @@ pub fn BatchNorm(comptime c: usize) type {
         }
 
         pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(@TypeOf(x.value)) {
-            return tape.batchNorm(x, self.gamma, self.beta, self.stats());
+            return tape.batchNorm(x, self.gamma, self.beta, self.stats(), .{});
         }
 
         pub fn forwardRelu(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(@TypeOf(x.value)) {
-            return tape.batchNormRelu(x, self.gamma, self.beta, self.stats());
+            return tape.batchNorm(x, self.gamma, self.beta, self.stats(), .{ .relu = true });
         }
 
         /// Computes max(norm(x) + residual, 0), the end of a residual block, in one kernel.
         pub fn forwardAddRelu(self: Self, tape: *Tape, x: anytype, residual: anytype) autograd.Error!Var(@TypeOf(x.value)) {
-            return tape.batchNormAddRelu(x, residual, self.gamma, self.beta, self.stats());
+            return tape.batchNorm(x, self.gamma, self.beta, self.stats(), .{ .residual = residual });
         }
 
         pub fn params(self: Self) DirectParams(Self) {
@@ -268,23 +268,23 @@ pub fn ConvBn(comptime c_in: usize, comptime c_out: usize, comptime k: usize, co
         }
 
         pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(autograd.ConvOut(@TypeOf(x.value), W, opts)) {
-            return tape.convBatchNorm(x, self.w, self.norm.gamma, self.norm.beta, self.norm.stats(), opts);
+            return tape.convBatchNorm(x, self.w, self.norm.gamma, self.norm.beta, self.norm.stats(), opts, .{});
         }
 
         pub fn forwardRelu(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(autograd.ConvOut(@TypeOf(x.value), W, opts)) {
-            return tape.convBatchNormRelu(x, self.w, self.norm.gamma, self.norm.beta, self.norm.stats(), opts);
+            return tape.convBatchNorm(x, self.w, self.norm.gamma, self.norm.beta, self.norm.stats(), opts, .{ .relu = true });
         }
 
         /// Convolution, batch norm, addition of residual and ReLU; the last three run as one kernel, and on the
         /// bf16 GPU path the batch statistics come from the convolution's epilogue.
         pub fn forwardAddRelu(self: Self, tape: *Tape, x: anytype, residual: anytype) autograd.Error!Var(autograd.ConvOut(@TypeOf(x.value), W, opts)) {
-            return tape.convBatchNormAddRelu(x, self.w, residual, self.norm.gamma, self.norm.beta, self.norm.stats(), opts);
+            return tape.convBatchNorm(x, self.w, self.norm.gamma, self.norm.beta, self.norm.stats(), opts, .{ .residual = residual });
         }
 
         /// A residual block of this convolution fused with a preceding one around a virtual middle map: the
         /// first convolution's batch norm and ReLU are never written to memory. first must use the same opts.
         pub fn forwardChain(self: Self, tape: *Tape, first: anytype, x: anytype, residual: anytype) autograd.Error!Var(autograd.ConvOut(autograd.ConvOut(@TypeOf(x.value), @TypeOf(first.w.value), opts), W, opts)) {
-            return tape.convBnChain(x, first.w, first.norm.gamma, first.norm.beta, first.norm.stats(), self.w, residual, self.norm.gamma, self.norm.beta, self.norm.stats(), opts);
+            return tape.convBnChain(x, .{ .w = first.w, .gamma = first.norm.gamma, .beta = first.norm.beta, .running = first.norm.stats() }, .{ .w = self.w, .gamma = self.norm.gamma, .beta = self.norm.beta, .running = self.norm.stats() }, residual, opts);
         }
 
         pub fn params(self: Self) @TypeOf(.{self.w} ++ self.norm.params()) {

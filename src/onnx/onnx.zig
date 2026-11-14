@@ -90,8 +90,10 @@ const Builder = struct {
     gpa: Allocator,
     names: std.heap.ArenaAllocator,
     graph: Proto = .{},
-    weights: []const Weight,
-    constants: []const trace_mod.Constant,
+    // Weights and constants by tensor id, and how many traced ops read each tensor id.
+    weight_of: std.AutoHashMap(usize, []const f32),
+    constant_of: std.AutoHashMap(usize, f32),
+    uses: std.AutoHashMap(usize, usize),
     values: std.AutoHashMap(usize, Known),
     emitted: std.AutoHashMap(usize, []const u8),
     outputs: []const View,
@@ -107,10 +109,7 @@ const Builder = struct {
     }
 
     fn weightOf(self: *const Builder, id: usize) ?[]const f32 {
-        for (self.weights) |w| {
-            if (w.id == id) return w.data;
-        }
-        return null;
+        return self.weight_of.get(id);
     }
 
     fn tensor(self: *Builder, name: []const u8, dims: []const usize, data_type: u32, raw: []const u8) !void {
@@ -191,11 +190,10 @@ const Builder = struct {
             return name;
         }
         if (self.emitted.get(view.id)) |name| return name;
-        for (self.constants) |constant| {
-            if (constant.view.id != view.id) continue;
+        if (self.constant_of.get(view.id)) |value| {
             const data = try self.gpa.alloc(f32, view.len());
             defer self.gpa.free(data);
-            @memset(data, constant.value);
+            @memset(data, value);
             const name = try self.floats("constant", view.shape(), data);
             try self.emitted.put(view.id, name);
             return name;
@@ -264,12 +262,8 @@ const Builder = struct {
         const next = rest[0];
         if (next.op != .batch_norm and next.op != .batch_norm_relu and next.op != .batch_norm_add_relu) return null;
         if (next.inputs[0].id != conv.output.id) return null;
-        if (next.op == .batch_norm_add_relu and next.inputs[5].id == conv.output.id) return null;
-        for (rest[1..]) |later| {
-            for (later.inputs[0..later.count]) |input| {
-                if (input.id == conv.output.id) return null;
-            }
-        }
+        // The norm's own read is the only one, which also rules out a residual that is the convolution's output.
+        if ((self.uses.get(conv.output.id) orelse 0) != 1) return null;
         for (self.outputs) |output| {
             if (output.id == conv.output.id) return null;
         }
@@ -476,8 +470,9 @@ pub fn build(gpa: Allocator, graph: Graph) Error![]u8 {
     var b: Builder = .{
         .gpa = gpa,
         .names = .init(gpa),
-        .weights = weights,
-        .constants = trace.constants.items,
+        .weight_of = .init(gpa),
+        .constant_of = .init(gpa),
+        .uses = .init(gpa),
         .values = .init(gpa),
         .emitted = .init(gpa),
         .outputs = outputs,
@@ -485,9 +480,18 @@ pub fn build(gpa: Allocator, graph: Graph) Error![]u8 {
     };
     defer {
         b.names.deinit();
+        b.weight_of.deinit();
+        b.constant_of.deinit();
+        b.uses.deinit();
         b.values.deinit();
         b.emitted.deinit();
         b.graph.bytes.deinit(gpa);
+    }
+    // NOTE: the first entry wins for a repeated id, as the linear scans did.
+    for (weights) |w| _ = try b.weight_of.getOrPutValue(w.id, w.data);
+    for (trace.constants.items) |c| _ = try b.constant_of.getOrPutValue(c.view.id, c.value);
+    for (trace.entries.items) |e| {
+        for (e.inputs[0..e.count]) |input| (try b.uses.getOrPutValue(input.id, 0)).value_ptr.* += 1;
     }
     for (inputs, 0..) |input, i| try b.produce(input, try b.boundary("input", i, inputs.len));
     for (trace.entries.items, 0..) |e, i| try b.convert(e, trace.entries.items[i + 1 ..]);

@@ -675,7 +675,7 @@ fn cpuOps(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
         best[0][1] = @min(best[0][1], milliseconds(io, started));
 
         started = Io.Clock.awake.now(io);
-        const normalized = try tape.batchNormRelu(x, gamma, beta, .{ .mean = mean, .variance = variance });
+        const normalized = try tape.batchNorm(x, gamma, beta, .{ .mean = mean, .variance = variance }, .{ .relu = true });
         best[1][0] = @min(best[1][0], milliseconds(io, started));
         @memset(normalized.grad.data, 1);
         started = Io.Clock.awake.now(io);
