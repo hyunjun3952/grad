@@ -54,13 +54,13 @@ pub fn im2colRange(par: kernels.Parallel, x: []const f32, col: []f32, d: cv.Dims
 const chunk_bytes = 1 << 21;
 
 fn chunkRows(d: cv.Dims) usize {
-    const kc = @as(usize, d.k) * d.k * d.c;
+    const kc: usize = cv.patchLen(d);
     return @min(rowsOf(d), @max(1024, chunk_bytes / (kc * @sizeOf(f32))));
 }
 
 // The matmul work buffer must fit both the full chunks and the shorter last one.
 fn chunkWorkLen(comptime cfg: kernels.TileConfig, par: kernels.Parallel, d: cv.Dims, chunk: usize) usize {
-    const kc = @as(usize, d.k) * d.k * d.c;
+    const kc: usize = cv.patchLen(d);
     const tail = rowsOf(d) % chunk;
     const full = if (cfg.trans_a)
         kernels.matmulTiledWorkLen(f32, cfg, par, kc, chunk, d.c_out)
@@ -130,7 +130,7 @@ fn convDirectRows(job: DirectJob, lo: usize, hi: usize) void {
 /// matrix and accumulates the taps directly.
 pub fn convForward(gpa: std.mem.Allocator, par: kernels.Parallel, x: []const f32, w: []const f32, out: []f32, d: cv.Dims) !void {
     if (convIsDirect(d)) return kernels.parallelFor(par, rowsOf(d), 64, DirectJob{ .x = x, .w = w, .out = out, .d = d }, convDirectRows);
-    const kc = @as(usize, d.k) * d.k * d.c;
+    const kc: usize = cv.patchLen(d);
     const rows = rowsOf(d);
     const chunk = chunkRows(d);
     const cfg: kernels.TileConfig = .{};
@@ -149,7 +149,7 @@ pub fn convForward(gpa: std.mem.Allocator, par: kernels.Parallel, x: []const f32
 /// Adds the input gradient of a convolution to dx: grad * w^T is formed and scattered back (col2im) for a few images at a
 /// time, which is exact because images do not overlap. w is (k*k*c) x c_out, grad is positions x c_out.
 pub fn convInputGrad(gpa: std.mem.Allocator, par: kernels.Parallel, grad: []const f32, w: []const f32, dx: []f32, d: cv.Dims) !void {
-    const kc = @as(usize, d.k) * d.k * d.c;
+    const kc: usize = cv.patchLen(d);
     const per_image = cv.outHeight(d) * cv.outWidth(d);
     const images = @min(@as(usize, d.n), @max(1, chunk_bytes / (per_image * kc * @sizeOf(f32))));
     const cfg: kernels.TileConfig = .{ .trans_b = true };
@@ -234,7 +234,7 @@ fn convDirectWeightGrad(gpa: std.mem.Allocator, par: kernels.Parallel, x: []cons
 /// A single-channel convolution without padding sums the taps directly instead.
 pub fn convWeightGrad(gpa: std.mem.Allocator, par: kernels.Parallel, x: []const f32, grad: []const f32, dw: []f32, d: cv.Dims) !void {
     if (convIsDirect(d)) return convDirectWeightGrad(gpa, par, x, grad, dw, d);
-    const kc = @as(usize, d.k) * d.k * d.c;
+    const kc: usize = cv.patchLen(d);
     const rows = rowsOf(d);
     const chunk = chunkRows(d);
     const cfg: kernels.TileConfig = .{ .trans_a = true, .accumulate = true };
@@ -253,7 +253,7 @@ pub fn convWeightGrad(gpa: std.mem.Allocator, par: kernels.Parallel, x: []const 
 fn col2imPixels(job: Job, lo: usize, hi: usize) void {
     const d = job.d;
     const c: usize = d.c;
-    const kc = @as(usize, d.k) * d.k * c;
+    const kc: usize = cv.patchLen(d);
     const oh = cv.outHeight(d);
     const ow = cv.outWidth(d);
     for (lo..hi) |pixel| {

@@ -50,21 +50,27 @@ pub inline fn patchOf(row: Index, d: Dims) Patch {
     return .{ .n = row / ow / oh, .top = row / ow % oh * d.stride, .left = row % ow * d.stride };
 }
 
-pub inline fn patchValue(x: [*]const f32, patch: Patch, cc: Index, d: Dims) f32 {
+/// Length of one im2col row: the taps of a k x k window over all input channels.
+pub inline fn patchLen(d: Dims) Index {
+    return d.k * d.k * d.c;
+}
+
+// Position in x that column cc of a patch reads, or null when the tap falls into the padding.
+inline fn patchSource(patch: Patch, cc: Index, d: Dims) ?Index {
     const tap = cc / d.c;
     const py = patch.top + tap / d.k * d.dilation;
     const px = patch.left + tap % d.k * d.dilation;
-    const inside = py >= d.pad and px >= d.pad and py - d.pad < d.h and px - d.pad < d.w;
-    return if (inside) x[((patch.n * d.h + py - d.pad) * d.w + px - d.pad) * d.c + cc % d.c] else 0;
+    if (py < d.pad or px < d.pad or py - d.pad >= d.h or px - d.pad >= d.w) return null;
+    return ((patch.n * d.h + py - d.pad) * d.w + px - d.pad) * d.c + cc % d.c;
+}
+
+pub inline fn patchValue(x: [*]const f32, patch: Patch, cc: Index, d: Dims) f32 {
+    const at = patchSource(patch, cc, d) orelse return 0;
+    return x[at];
 }
 
 pub inline fn patchValues(x: [*]const f32, patch: Patch, cc: Index, d: Dims) @Vector(4, f32) {
-    const tap = cc / d.c;
-    const py = patch.top + tap / d.k * d.dilation;
-    const px = patch.left + tap % d.k * d.dilation;
-    const inside = py >= d.pad and px >= d.pad and py - d.pad < d.h and px - d.pad < d.w;
-    if (!inside) return @splat(0);
-    const at = ((patch.n * d.h + py - d.pad) * d.w + px - d.pad) * d.c + cc % d.c;
+    const at = patchSource(patch, cc, d) orelse return @splat(0);
     const source: *align(16) const [4]f32 = @ptrCast(@alignCast(x + at));
     return source.*;
 }
@@ -73,32 +79,42 @@ pub inline fn im2colValue(x: [*]const f32, row: Index, cc: Index, d: Dims) f32 {
     return patchValue(x, patchOf(row, d), cc, d);
 }
 pub inline fn im2col(t: Index, x: [*]const f32, col: [*]f32, d: Dims) void {
-    const kc = d.k * d.k * d.c;
+    const kc = patchLen(d);
     col[t] = im2colValue(x, t / kc, t % kc, d);
 }
+
+// An input element split from its flat index.
+const Pixel = struct { n: Index, y: Index, x: Index, ch: Index };
+
+inline fn pixelOf(t: Index, d: Dims) Pixel {
+    return .{ .ch = t % d.c, .x = t / d.c % d.w, .y = t / d.c / d.w % d.h, .n = t / d.c / d.w / d.h };
+}
+
+// Output coordinate whose window starts at pos - shift, or null when no window of this stride lands there. Stride 1 skips the
+// division, which is slow on the device.
+inline fn outputCoord(pos: Index, shift: Index, d: Dims) ?Index {
+    if (pos < shift) return null;
+    if (d.stride == 1) return pos - shift;
+    if ((pos - shift) % d.stride != 0) return null;
+    return (pos - shift) / d.stride;
+}
+
 inline fn col2imSum(comptime T: type, t: Index, dcol: [*]const T, d: Dims) f32 {
-    const kc = d.k * d.k * d.c;
+    const kc = patchLen(d);
     const ow = outWidth(d);
     const oh = outHeight(d);
-    const ch = t % d.c;
-    const x = t / d.c % d.w + d.pad;
-    const y = t / d.c / d.w % d.h + d.pad;
-    const n = t / d.c / d.w / d.h;
+    const pixel = pixelOf(t, d);
     var total: f32 = 0;
     var ky: Index = 0;
     while (ky < d.k) : (ky += 1) {
-        const shift_y = ky * d.dilation;
-        if (y < shift_y or (d.stride != 1 and (y - shift_y) % d.stride != 0)) continue;
-        const oy = if (d.stride == 1) y - shift_y else (y - shift_y) / d.stride;
+        const oy = outputCoord(pixel.y + d.pad, ky * d.dilation, d) orelse continue;
         if (oy >= oh) continue;
         var kx: Index = 0;
         while (kx < d.k) : (kx += 1) {
-            const shift_x = kx * d.dilation;
-            if (x < shift_x or (d.stride != 1 and (x - shift_x) % d.stride != 0)) continue;
-            const ox = if (d.stride == 1) x - shift_x else (x - shift_x) / d.stride;
+            const ox = outputCoord(pixel.x + d.pad, kx * d.dilation, d) orelse continue;
             if (ox >= ow) continue;
-            const row = (n * oh + oy) * ow + ox;
-            const value = dcol[row * kc + (ky * d.k + kx) * d.c + ch];
+            const row = (pixel.n * oh + oy) * ow + ox;
+            const value = dcol[row * kc + (ky * d.k + kx) * d.c + pixel.ch];
             total += if (T == u16) bf16.decode(value) else value;
         }
     }
@@ -114,10 +130,15 @@ pub inline fn col2imHalf(t: Index, dcol: [*]const u16, dx: [*]f32, d: Dims) void
 }
 const Window = struct { n: Index, oy: Index, ox: Index, ch: Index };
 
-inline fn windowOf(t: Index, d: Dims) Window {
+// An output element split from its flat index; channels is the channel count of the output (c for pooling, c_out for convolution).
+inline fn outputOf(t: Index, channels: Index, d: Dims) Window {
     const ow = outWidth(d);
     const oh = outHeight(d);
-    return .{ .ch = t % d.c, .ox = t / d.c % ow, .oy = t / d.c / ow % oh, .n = t / d.c / ow / oh };
+    return .{ .ch = t % channels, .ox = t / channels % ow, .oy = t / channels / ow % oh, .n = t / channels / ow / oh };
+}
+
+inline fn windowOf(t: Index, d: Dims) Window {
+    return outputOf(t, d.c, d);
 }
 
 const Bounds = struct { y0: Index, y1: Index, x0: Index, x1: Index };
@@ -180,24 +201,21 @@ inline fn firstWindow(position: Index, d: Dims) Index {
 }
 
 inline fn pooledGradient(comptime E: type, comptime winner: bool, t: Index, index: [*]const u32, gout: [*]const E, d: Dims) f32 {
-    const ch = t % d.c;
-    const xx = t / d.c % d.w;
-    const yy = t / d.c / d.w % d.h;
-    const n = t / d.c / d.w / d.h;
+    const pixel = pixelOf(t, d);
     const oh = outHeight(d);
     const ow = outWidth(d);
-    const last_y = @min((yy + d.pad) / d.stride, oh - 1);
-    const last_x = @min((xx + d.pad) / d.stride, ow - 1);
+    const last_y = @min((pixel.y + d.pad) / d.stride, oh - 1);
+    const last_x = @min((pixel.x + d.pad) / d.stride, ow - 1);
     var total: f32 = 0;
-    var oy = firstWindow(yy, d);
+    var oy = firstWindow(pixel.y, d);
     while (oy <= last_y) : (oy += 1) {
-        var ox = firstWindow(xx, d);
+        var ox = firstWindow(pixel.x, d);
         while (ox <= last_x) : (ox += 1) {
-            const at = ((n * oh + oy) * ow + ox) * d.c + ch;
+            const at = ((pixel.n * oh + oy) * ow + ox) * d.c + pixel.ch;
             if (winner) {
                 if (index[at] == t) total += bf16.load(E, gout, at);
             } else {
-                total += bf16.load(E, gout, at) / windowCount(.{ .n = n, .oy = oy, .ox = ox, .ch = ch }, d);
+                total += bf16.load(E, gout, at) / windowCount(.{ .n = pixel.n, .oy = oy, .ox = ox, .ch = pixel.ch }, d);
             }
         }
     }
@@ -248,27 +266,22 @@ pub inline fn maxPoolBackwardHalf(t: Index, index: [*]const u32, gout: [*]const 
     maxPoolBackwardOf(u16, t, index, gout, gin, d);
 }
 pub inline fn groupedForward(t: Index, x: [*]const f32, w: [*]const f32, out: [*]f32, d: Dims) void {
-    const ow = outWidth(d);
-    const oh = outHeight(d);
     const cg = d.c / d.groups;
-    const oc = t % d.c_out;
-    const ox = t / d.c_out % ow;
-    const oy = t / d.c_out / ow % oh;
-    const n = t / d.c_out / ow / oh;
-    const base = oc / (d.c_out / d.groups) * cg;
+    const pos = outputOf(t, d.c_out, d);
+    const base = pos.ch / (d.c_out / d.groups) * cg;
     var total: f32 = 0;
     var ky: Index = 0;
     while (ky < d.k) : (ky += 1) {
-        const py = oy * d.stride + ky * d.dilation;
+        const py = pos.oy * d.stride + ky * d.dilation;
         if (py < d.pad or py - d.pad >= d.h) continue;
         var kx: Index = 0;
         while (kx < d.k) : (kx += 1) {
-            const px = ox * d.stride + kx * d.dilation;
+            const px = pos.ox * d.stride + kx * d.dilation;
             if (px < d.pad or px - d.pad >= d.w) continue;
-            const source = ((n * d.h + py - d.pad) * d.w + px - d.pad) * d.c + base;
+            const source = ((pos.n * d.h + py - d.pad) * d.w + px - d.pad) * d.c + base;
             const weights = (ky * d.k + kx) * cg;
             var ic: Index = 0;
-            while (ic < cg) : (ic += 1) total += x[source + ic] * w[(weights + ic) * d.c_out + oc];
+            while (ic < cg) : (ic += 1) total += x[source + ic] * w[(weights + ic) * d.c_out + pos.ch];
         }
     }
     out[t] = total;
@@ -279,26 +292,19 @@ pub inline fn groupedInputGrad(t: Index, dy: [*]const f32, w: [*]const f32, dx: 
     const oh = outHeight(d);
     const cg = d.c / d.groups;
     const per_group = d.c_out / d.groups;
-    const ch = t % d.c;
-    const xx = t / d.c % d.w + d.pad;
-    const yy = t / d.c / d.w % d.h + d.pad;
-    const n = t / d.c / d.w / d.h;
-    const group = ch / cg;
+    const pixel = pixelOf(t, d);
+    const first_out = pixel.ch / cg * per_group;
     var total: f32 = 0;
     var ky: Index = 0;
     while (ky < d.k) : (ky += 1) {
-        const shift_y = ky * d.dilation;
-        if (yy < shift_y or (yy - shift_y) % d.stride != 0) continue;
-        const oy = (yy - shift_y) / d.stride;
+        const oy = outputCoord(pixel.y + d.pad, ky * d.dilation, d) orelse continue;
         if (oy >= oh) continue;
         var kx: Index = 0;
         while (kx < d.k) : (kx += 1) {
-            const shift_x = kx * d.dilation;
-            if (xx < shift_x or (xx - shift_x) % d.stride != 0) continue;
-            const ox = (xx - shift_x) / d.stride;
+            const ox = outputCoord(pixel.x + d.pad, kx * d.dilation, d) orelse continue;
             if (ox >= ow) continue;
-            const grad = ((n * oh + oy) * ow + ox) * d.c_out + group * per_group;
-            const weights = ((ky * d.k + kx) * cg + ch % cg) * d.c_out + group * per_group;
+            const grad = ((pixel.n * oh + oy) * ow + ox) * d.c_out + first_out;
+            const weights = ((ky * d.k + kx) * cg + pixel.ch % cg) * d.c_out + first_out;
             var oc: Index = 0;
             while (oc < per_group) : (oc += 1) total += dy[grad + oc] * w[weights + oc];
         }

@@ -582,7 +582,7 @@ fn measureGpu(io: Io, dev: *grad.gpu.Gpu, comptime operation: anytype, args: any
 // cache-sized chunks, so building it whole here overstates im2col a little (the chunk stays in cache there).
 fn convSplit(io: Io, gpa: std.mem.Allocator, par: kernels.Parallel, out: *Io.Writer, name: []const u8, d: grad.math.conv.Dims) !void {
     const rows = grad.cpu_ops.rowsOf(d);
-    const kc = @as(usize, d.k) * d.k * d.c;
+    const kc: usize = grad.math.conv.patchLen(d);
     const x = try gpa.alloc(f32, @as(usize, d.n) * d.h * d.w * d.c);
     defer gpa.free(x);
     const w = try gpa.alloc(f32, kc * d.c_out);
