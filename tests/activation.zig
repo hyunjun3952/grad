@@ -19,3 +19,9 @@ test "activations match reference values and their derivatives match finite diff
         }
     }
 }
+
+test "pointwise functions match reference values" {
+    const pointwise = lib.math.activation.pointwise;
+    try std.testing.expectEqual(@as(f32, 3), pointwise(.sqrt, 9));
+    try std.testing.expectEqual(@as(f32, 0.25), pointwise(.reciprocal, 4));
+}

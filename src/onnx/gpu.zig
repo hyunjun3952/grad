@@ -95,6 +95,15 @@ fn hasInput(node: Node, index: usize) bool {
     return index < node.inputs.len and node.inputs[index].len != 0;
 }
 
+// The runtime reads only the integers of a Slice operand, so the data stays empty for tensors that may be on the device.
+fn boundsOf(v: Value) Array {
+    return .{ .dims = v.dims, .data = &.{}, .ints = v.ints };
+}
+
+// Most copies a Concat may take: it copies one block per input and outer index, because the elementwise kernel writes only
+// contiguous output. TODO: a kernel with output strides would take any axis in one launch.
+const max_concat_copies = 64;
+
 // ***** window parameters *****
 
 const ConvParams = struct { k: usize, stride: usize, pad: usize, dilation: usize, groups: usize };
@@ -298,12 +307,16 @@ pub const Executor = struct {
 
     // Runs one node on the device, or returns null when it has no device kernel for this node so that the host takes it.
     fn onDevice(self: *Executor, a: Allocator, values: *Values, node: Node) Error!?Value {
-        const Kind = enum { Add, Sub, Mul, Relu, Sigmoid, Tanh, Gelu, Identity, Dropout, Flatten, Reshape, Transpose, MatMul, Gemm, Conv, MaxPool, AveragePool, GlobalAveragePool, BatchNormalization, Softmax, LayerNormalization, Gather };
+        const Kind = enum { Add, Sub, Mul, Div, Relu, Sigmoid, Tanh, Gelu, Sqrt, Identity, Dropout, Flatten, Reshape, Transpose, Slice, Concat, MatMul, Gemm, Conv, MaxPool, AveragePool, GlobalAveragePool, BatchNormalization, Softmax, LayerNormalization, Gather };
         const kind = std.meta.stringToEnum(Kind, node.op) orelse return null;
         return switch (kind) {
             .Add => try self.binary(a, values, node, .add),
             .Sub => try self.binary(a, values, node, .sub),
             .Mul => try self.binary(a, values, node, .mul),
+            .Div => try self.binary(a, values, node, .div),
+            .Sqrt => try self.sqrt(a, values, node),
+            .Slice => try self.slice(a, values, node),
+            .Concat => try self.concat(a, values, node),
             .Relu => try self.unary(a, values, node, null),
             .Sigmoid => try self.unary(a, values, node, .sigmoid),
             .Tanh => try self.unary(a, values, node, .tanh),
@@ -322,22 +335,40 @@ pub const Executor = struct {
         };
     }
 
-    const BinaryKind = enum { add, sub, mul };
+    const BinaryKind = enum { add, sub, mul, div };
 
-    // Add, Sub and Mul with broadcasting. NOTE: the elementwise kernel only adds or multiplies, so a difference is x + (-1) * y.
+    // Add, Sub, Mul and Div with broadcasting. NOTE: the elementwise kernel only adds or multiplies, so a difference is
+    // x + (-1) * y and a quotient is x * (1 / y).
     fn binary(self: *Executor, a: Allocator, values: *Values, node: Node, kind: BinaryKind) Error!?Value {
         const x = try self.devInput(values, node, 0);
         const y = try self.devInput(values, node, 1);
         const dims = (try broadcastDims(a, x.dims, y.dims)) orelse return null;
         const out = try self.newValue(a, dims);
-        if (kind != .sub) {
-            try self.gpu.elementwise(if (kind == .add) .add else .mul, x.dev.?, y.dev.?, out.dev.?, broadcastPlan(dims, x.dims, y.dims));
+        const plan = broadcastPlan(dims, x.dims, y.dims);
+        if (kind == .add or kind == .mul) {
+            try self.gpu.elementwise(if (kind == .add) .add else .mul, x.dev.?, y.dev.?, out.dev.?, plan);
             return out;
         }
-        const negated = try self.gpu.scratch(f32, y.len());
-        try self.gpu.elementwise(.mul, y.dev.?, self.minus_one, negated, broadcastPlan(y.dims, y.dims, &.{1}));
-        try self.gpu.elementwise(.add, x.dev.?, negated, out.dev.?, broadcastPlan(dims, x.dims, y.dims));
+        const operand = try self.gpu.scratch(f32, y.len());
+        if (kind == .sub) {
+            try self.gpu.elementwise(.mul, y.dev.?, self.minus_one, operand, broadcastPlan(y.dims, y.dims, &.{1}));
+        } else {
+            try self.gpu.pointwise(y.dev.?, operand, .reciprocal);
+        }
+        try self.gpu.elementwise(if (kind == .sub) .add else .mul, x.dev.?, operand, out.dev.?, plan);
         return out;
+    }
+
+    fn sqrt(self: *Executor, a: Allocator, values: *Values, node: Node) Error!?Value {
+        const x = try self.devInput(values, node, 0);
+        const out = try self.newValue(a, x.dims);
+        try self.gpu.pointwise(x.dev.?, out.dev.?, .sqrt);
+        return out;
+    }
+
+    // Copies src into the start of dst through the elementwise kernel (a product with a one of the same value).
+    fn copy(self: *Executor, src: []const f32, dst: []f32) Error!void {
+        try self.gpu.elementwise(.mul, src, self.one, dst, broadcastPlan(&.{src.len}, &.{src.len}, &.{1}));
     }
 
     fn unary(self: *Executor, a: Allocator, values: *Values, node: Node, kind: ?gpu_mod.Activation) Error!?Value {
@@ -388,6 +419,63 @@ pub const Executor = struct {
         const perm = try a.alloc(usize, x.dims.len);
         for (perm, 0..) |*p, i| p.* = if (given.len == x.dims.len) @intCast(given[i]) else x.dims.len - 1 - i;
         return self.permuted(a, x, perm);
+    }
+
+    // Cuts a range out of some axes. The bounds must be known on the host (initializers or constants). NOTE: the elementwise
+    // kernel reads x through the strides of the cut and starts at the offset of its first element, so no slice kernel is needed.
+    fn slice(self: *Executor, a: Allocator, values: *Values, node: Node) Error!?Value {
+        const x = try self.devInput(values, node, 0);
+        if (x.dims.len == 0 or x.dims.len > max_rank or node.inputs.len < 3) return null;
+        const starts = values.get(node.inputs[1]) orelse return error.MissingInput;
+        const ends = values.get(node.inputs[2]) orelse return error.MissingInput;
+        const axes: ?Value = if (hasInput(node, 3)) (values.get(node.inputs[3]) orelse return error.MissingInput) else null;
+        const steps: ?Value = if (hasInput(node, 4)) (values.get(node.inputs[4]) orelse return error.MissingInput) else null;
+        if (starts.ints.len == 0 or starts.ints.len != ends.ints.len) return null;
+        const cut = runtime.cutOf(x.dims, boundsOf(starts), boundsOf(ends), if (axes) |v| boundsOf(v) else null, if (steps) |v| boundsOf(v) else null) catch |err| return if (err == error.UnsupportedOp) null else err;
+        const rank = x.dims.len;
+        const dims = cut.dims[0..rank];
+        if (product(dims) == 0) return null;
+        const source = stridesOfFull(x.dims);
+        var strides: [max_rank]u32 = @splat(0);
+        var offset: usize = 0;
+        for (0..rank) |i| {
+            const slot = max_rank - rank + i;
+            strides[slot] = source[slot] * @as(u32, @intCast(cut.step[i]));
+            offset += cut.first[i] * source[slot];
+        }
+        const out = try self.newValue(a, dims);
+        try self.gpu.elementwise(.mul, x.dev.?[offset..], self.one, out.dev.?, .{ .dims = paddedDims(dims), .a_strides = strides, .b_strides = @splat(0) });
+        return out;
+    }
+
+    fn concat(self: *Executor, a: Allocator, values: *Values, node: Node) Error!?Value {
+        const first = try self.devInput(values, node, 0);
+        if (first.dims.len == 0) return null;
+        const axis = normalizeAxis(node.int("axis", 0), first.dims.len);
+        var total: usize = 0;
+        for (0..node.inputs.len) |i| {
+            const part = try self.devInput(values, node, i);
+            if (part.dims.len != first.dims.len) return null;
+            for (part.dims, first.dims, 0..) |have, want, d| {
+                if (d != axis and have != want) return null;
+            }
+            total += part.dims[axis];
+        }
+        const outer = product(first.dims[0..axis]);
+        const inner = product(first.dims[axis + 1 ..]);
+        if (total * inner * outer == 0 or outer * node.inputs.len > max_concat_copies) return null;
+        const dims = try a.dupe(usize, first.dims);
+        dims[axis] = total;
+        const out = try self.newValue(a, dims);
+        var offset: usize = 0;
+        for (0..node.inputs.len) |i| {
+            const part = try self.devInput(values, node, i);
+            const width = part.dims[axis] * inner;
+            offset += width;
+            if (width == 0) continue;
+            for (0..outer) |o| try self.copy(part.dev.?[o * width ..][0..width], out.dev.?[o * total * inner + offset - width ..][0..width]);
+        }
+        return out;
     }
 
     fn matmul(self: *Executor, a: Allocator, values: *Values, node: Node) Error!?Value {

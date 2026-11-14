@@ -42,6 +42,17 @@ pub inline fn derivative(kind: Kind, x: f32, y: f32) f32 {
     };
 }
 
+/// Elementwise functions that only the ONNX executor needs (no gradient is defined for them), kept apart from Kind so that the
+/// tape and the exporter do not have to handle them.
+pub const Pointwise = enum(u32) { sqrt, reciprocal };
+
+pub inline fn pointwise(kind: Pointwise, x: f32) f32 {
+    return switch (kind) {
+        .sqrt => @sqrt(x),
+        .reciprocal => 1 / x,
+    };
+}
+
 pub fn apply(x: []const f32, y: []f32, kind: Kind, lo: usize, hi: usize) void {
     for (x[lo..hi], y[lo..hi]) |v, *out| out.* = forward(kind, v);
 }

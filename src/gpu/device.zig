@@ -228,6 +228,7 @@ comptime {
     exportPair("softmaxBackward", softmaxBackwardKernel);
     exportPair("activation", activationKernel);
     exportPair("activationBackward", activationBackwardKernel);
+    exportPair("pointwise", pointwiseKernel);
     exportPair("addRelu", addReluKernel);
     exportPair("addReluBackward", addReluBackwardKernel);
     exportPair("addInPlace", addInPlaceKernel);
@@ -448,6 +449,15 @@ fn activationKernel(comptime E: type) type {
         fn run(x: [*]const E, out: [*]E, n: u32, kind: u32) callconv(.nvptx_kernel) void {
             const t = globalIndex();
             if (t < n) bf16.store(E, out, t, act.forward(@fromBackingInt(@intCast(kind)), bf16.load(E, x, t)));
+        }
+    };
+}
+
+fn pointwiseKernel(comptime E: type) type {
+    return struct {
+        fn run(x: [*]const E, out: [*]E, n: u32, kind: u32) callconv(.nvptx_kernel) void {
+            const t = globalIndex();
+            if (t < n) bf16.store(E, out, t, act.pointwise(@fromBackingInt(@intCast(kind)), bf16.load(E, x, t)));
         }
     };
 }

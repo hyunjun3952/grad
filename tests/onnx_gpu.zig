@@ -120,7 +120,7 @@ test "a causal transformer runs on the device with the same outputs as the cpu r
     try testing.expect(stats.device_nodes > stats.host_nodes);
 }
 
-test "a gru step runs on the device, with the ops that have no kernel taken by the host" {
+test "a gru step runs entirely on the device" {
     const gpu = try Gpu.forTest(16 << 20);
     defer gpu.deinit();
     const gpa = testing.allocator;
@@ -154,10 +154,11 @@ test "a gru step runs on the device, with the ops that have no kernel taken by t
     var model = try Model.parse(gpa, bytes);
     defer model.deinit();
 
-    _ = try expectSameOutputs(&model, gpu, &.{
+    const stats = try expectSameOutputs(&model, gpu, &.{
         .{ .name = "input0", .dims = &.{ 2, 3 }, .data = x.value.data },
         .{ .name = "input1", .dims = &.{ 2, 4 }, .data = h.value.data },
     }, 1e-5);
+    try testing.expectEqual(@as(usize, 0), stats.host_nodes);
 }
 
 test "a graph in the nchw layout of other exporters runs on the device" {
@@ -210,23 +211,68 @@ test "a graph in the nchw layout of other exporters runs on the device" {
     try testing.expectEqual(@as(usize, 9), stats.device_nodes);
 }
 
-test "an op without a device kernel runs on the host and its result goes back to the device" {
+// An integer initializer; the runtime keeps the integers next to the same values as floats.
+fn integers(a: std.mem.Allocator, values: []const i64) !Array {
+    const data = try a.alloc(f32, values.len);
+    for (data, values) |*d, v| d.* = @floatFromInt(v);
+    return .{ .dims = try a.dupe(usize, &.{values.len}), .data = data, .ints = try a.dupe(i64, values) };
+}
+
+test "slice, concat, div and sqrt run on the device with the same outputs as the cpu runtime" {
+    const gpu = try Gpu.forTest(4 << 20);
+    defer gpu.deinit();
+    const gpa = testing.allocator;
+    const arena = std.heap.ArenaAllocator.init(gpa);
+    var model: Model = .{ .arena = arena, .nodes = &.{}, .initializers = .init(gpa), .inputs = &.{"x"}, .outputs = &.{ "side", "stacked", "head", "quotient" } };
+    defer model.deinit();
+    const a = model.arena.allocator();
+    var prng = std.Random.DefaultPrng.init(41);
+    const rng = prng.random();
+    const denominator = try a.alloc(f32, 3);
+    for (denominator) |*v| v.* = @abs(rng.floatNorm(f32)) + 0.5;
+    try model.initializers.put("den", .{ .dims = try a.dupe(usize, &.{3}), .data = denominator });
+    // Columns 1, 3, 5 of x (a step), the last three columns (a negative start and an oversized end), and the first row.
+    try model.initializers.put("start_a", try integers(a, &.{1}));
+    try model.initializers.put("end_a", try integers(a, &.{100}));
+    try model.initializers.put("start_b", try integers(a, &.{-3}));
+    try model.initializers.put("start_c", try integers(a, &.{0}));
+    try model.initializers.put("end_c", try integers(a, &.{1}));
+    try model.initializers.put("axis_cols", try integers(a, &.{1}));
+    try model.initializers.put("axis_rows", try integers(a, &.{0}));
+    try model.initializers.put("step_two", try integers(a, &.{2}));
+    model.nodes = &.{
+        .{ .op = "Slice", .inputs = &.{ "x", "start_a", "end_a", "axis_cols", "step_two" }, .outputs = &.{"odd"} },
+        .{ .op = "Slice", .inputs = &.{ "x", "start_b", "end_a", "axis_cols" }, .outputs = &.{"tail"} },
+        .{ .op = "Slice", .inputs = &.{ "x", "start_c", "end_c", "axis_rows" }, .outputs = &.{"head"} },
+        .{ .op = "Concat", .inputs = &.{ "odd", "tail" }, .outputs = &.{"side"}, .attributes = &.{.{ .name = "axis", .int = 1 }} },
+        .{ .op = "Concat", .inputs = &.{ "odd", "tail" }, .outputs = &.{"stacked"}, .attributes = &.{.{ .name = "axis", .int = 0 }} },
+        .{ .op = "Relu", .inputs = &.{"tail"}, .outputs = &.{"positive"} },
+        .{ .op = "Sqrt", .inputs = &.{"positive"}, .outputs = &.{"root"} },
+        .{ .op = "Div", .inputs = &.{ "root", "den" }, .outputs = &.{"quotient"} },
+    };
+    var input: [12]f32 = undefined;
+    for (&input) |*v| v.* = rng.floatNorm(f32) * 2;
+    const stats = try expectSameOutputs(&model, gpu, &.{.{ .name = "x", .dims = &.{ 2, 6 }, .data = &input }}, 1e-5);
+    try testing.expectEqual(@as(usize, 0), stats.host_nodes);
+    try testing.expectEqual(@as(usize, 8), stats.device_nodes);
+}
+
+test "a concat with too many blocks for the device runs on the host and its result goes back to the device" {
     const gpu = try Gpu.forTest(4 << 20);
     defer gpu.deinit();
     const gpa = testing.allocator;
     const arena = std.heap.ArenaAllocator.init(gpa);
     var model: Model = .{ .arena = arena, .nodes = &.{}, .initializers = .init(gpa), .inputs = &.{"x"}, .outputs = &.{"y"} };
     defer model.deinit();
-    const a = model.arena.allocator();
-    try model.initializers.put("two", .{ .dims = &.{1}, .data = try a.dupe(f32, &.{2}) });
     model.nodes = &.{
         .{ .op = "Relu", .inputs = &.{"x"}, .outputs = &.{"r"} },
-        .{ .op = "Sqrt", .inputs = &.{"r"}, .outputs = &.{"q"} },
-        .{ .op = "Div", .inputs = &.{ "q", "two" }, .outputs = &.{"d"} },
-        .{ .op = "Mul", .inputs = &.{ "d", "d" }, .outputs = &.{"y"} },
+        .{ .op = "Concat", .inputs = &.{ "r", "x" }, .outputs = &.{"c"}, .attributes = &.{.{ .name = "axis", .int = 1 }} },
+        .{ .op = "Mul", .inputs = &.{ "c", "c" }, .outputs = &.{"y"} },
     };
-    const input = [_]f32{ -1, 4, 9, 16 };
-    const stats = try expectSameOutputs(&model, gpu, &.{.{ .name = "x", .dims = &.{4}, .data = @constCast(&input) }}, 1e-5);
-    try testing.expectEqual(@as(usize, 2), stats.host_nodes);
+    var prng = std.Random.DefaultPrng.init(8);
+    var input: [70 * 2]f32 = undefined;
+    for (&input) |*v| v.* = prng.random().floatNorm(f32);
+    const stats = try expectSameOutputs(&model, gpu, &.{.{ .name = "x", .dims = &.{ 70, 2 }, .data = &input }}, 1e-5);
+    try testing.expectEqual(@as(usize, 1), stats.host_nodes);
     try testing.expectEqual(@as(usize, 2), stats.device_nodes);
 }

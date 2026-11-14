@@ -17,6 +17,7 @@ pub const BinaryOp = enum { add, mul };
 
 pub const Augment = @import("math/augment.zig").Config;
 pub const Activation = @import("math/activation.zig").Kind;
+pub const Pointwise = @import("math/activation.zig").Pointwise;
 
 pub const MatmulOpts = struct { trans_a: bool = false, trans_b: bool = false, accumulate: bool = false };
 
@@ -118,6 +119,8 @@ const Kernel = enum {
     activationHalf,
     activationBackward,
     activationBackwardHalf,
+    pointwise,
+    pointwiseHalf,
     addRelu,
     addReluBackward,
     addInPlace,
@@ -1208,6 +1211,11 @@ pub const Gpu = struct {
 
     pub fn activation(self: *Gpu, x: anytype, out: anytype, kind: Activation) Error!void {
         try self.launchFlat(variant(.activation, out), x.len, .{ x, out, x.len, kind });
+    }
+
+    /// Applies sqrt or reciprocal element by element (see Pointwise).
+    pub fn pointwise(self: *Gpu, x: anytype, out: anytype, kind: Pointwise) Error!void {
+        try self.launchFlat(variant(.pointwise, out), x.len, .{ x, out, x.len, kind });
     }
 
     pub fn activationBackward(self: *Gpu, x: anytype, y: anytype, g_out: anytype, g_in: anytype, kind: Activation) Error!void {

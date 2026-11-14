@@ -1054,24 +1054,35 @@ fn layerNorm(a: Allocator, node: Node, x: Array, scale: Array, bias: ?Array) Err
     return out;
 }
 
-// Cuts a range out of some axes (default: the first ones) with the given steps; negative and oversized bounds are clamped as in ONNX.
-fn slice(a: Allocator, x: Array, starts: Array, ends: Array, axes: ?Array, steps: ?Array) Error!Array {
-    const rank = x.dims.len;
-    var first: [max_rank]usize = @splat(0);
-    var step: [max_rank]usize = @splat(1);
-    var dims: [max_rank]usize = undefined;
-    @memcpy(dims[0..rank], x.dims);
+/// What a Slice node cuts from each axis of a tensor: the first index, the step and the resulting size (the first rank entries count).
+pub const Cut = struct { first: [max_rank]usize, step: [max_rank]usize, dims: [max_rank]usize };
+
+/// Reads the bounds of a Slice node for a tensor of the given dims. The cut covers some axes (default: the first ones) with the
+/// given steps; negative and oversized bounds are clamped as in ONNX, and steps below one are unsupported.
+pub fn cutOf(x_dims: []const usize, starts: Array, ends: Array, axes: ?Array, steps: ?Array) Error!Cut {
+    const rank = x_dims.len;
+    var cut: Cut = .{ .first = @splat(0), .step = @splat(1), .dims = undefined };
+    @memcpy(cut.dims[0..rank], x_dims);
     for (0..starts.ints.len) |k| {
         const axis = if (axes) |given| normalizeAxis(given.ints[k], rank) else k;
         const stride: i64 = if (steps) |given| given.ints[k] else 1;
         if (stride < 1) return error.UnsupportedOp;
-        const size: i64 = @intCast(x.dims[axis]);
+        const size: i64 = @intCast(x_dims[axis]);
         const lo = std.math.clamp(if (starts.ints[k] < 0) starts.ints[k] + size else starts.ints[k], 0, size);
         const hi = std.math.clamp(if (ends.ints[k] < 0) ends.ints[k] + size else ends.ints[k], 0, size);
-        first[axis] = @intCast(lo);
-        step[axis] = @intCast(stride);
-        dims[axis] = if (hi > lo) @intCast(@divTrunc(hi - lo + stride - 1, stride)) else 0;
+        cut.first[axis] = @intCast(lo);
+        cut.step[axis] = @intCast(stride);
+        cut.dims[axis] = if (hi > lo) @intCast(@divTrunc(hi - lo + stride - 1, stride)) else 0;
     }
+    return cut;
+}
+
+fn slice(a: Allocator, x: Array, starts: Array, ends: Array, axes: ?Array, steps: ?Array) Error!Array {
+    const rank = x.dims.len;
+    const cut = try cutOf(x.dims, starts, ends, axes, steps);
+    const first = cut.first;
+    const step = cut.step;
+    const dims = cut.dims;
     const out = try make(a, dims[0..rank]);
     var source_strides: [max_rank]usize = undefined;
     var stride: usize = 1;
