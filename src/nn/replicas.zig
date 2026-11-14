@@ -68,11 +68,15 @@ pub const Replicas = struct {
 
         const len = self.host[0].len;
         const scale = 1 / @as(f32, @floatFromInt(self.count));
-        for (len * index / self.count..len * (index + 1) / self.count) |i| {
-            var sum: f32 = 0;
-            for (self.host) |h| sum += h[i];
-            self.host[0][i] = sum * scale;
+        const lo = len * index / self.count;
+        const hi = len * (index + 1) / self.count;
+        // NOTE: replica by replica over this slice, so every buffer is read along its length instead of hopping between buffers
+        // per element; the sum still runs in replica order.
+        const total = self.host[0][lo..hi];
+        for (self.host[1..]) |h| {
+            for (total, h[lo..hi]) |*sum, v| sum.* += v;
         }
+        for (total) |*v| v.* *= scale;
         try self.wait();
 
         at = 0;

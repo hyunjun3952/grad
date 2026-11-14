@@ -589,7 +589,7 @@ pub const Tape = struct {
                         cols,
                     );
                 }
-                if (c.gamma.needs_grad or c.beta.needs_grad) for (0..cols) |j| layernorm_math.parameterGradient(
+                if (c.gamma.needs_grad or c.beta.needs_grad) layernorm_math.parameterGradients(
                     f32,
                     c.x.value.data.ptr,
                     c.out.grad.data.ptr,
@@ -599,7 +599,6 @@ pub const Tape = struct {
                     if (c.beta.needs_grad) c.beta.grad.data.ptr else null,
                     rows,
                     cols,
-                    j,
                 );
             }
         }.run);
@@ -715,14 +714,14 @@ pub const Tape = struct {
         comptime if (!((X.Elem == f32 and To == u16) or (X.Elem == u16 and To == f32))) @compileError("cast converts between f32 and bf16 (stored as u16)");
         const dev = self.par.gpu orelse unreachable;
         const value = try self.newTensor(Tensor(To, X.shape));
-        if (To == u16) try dev.toHalf(x.value.data, value.data) else try dev.fromHalf(x.value.data, value.data);
+        if (To == u16) try dev.convertHalf(.toHalf, x.value.data, value.data) else try dev.convertHalf(.fromHalf, x.value.data, value.data);
         const out = try self.makeVar(value, x.needs_grad);
         try self.note(.cast, .{x}, out, .{});
         const Ctx = struct { x: @TypeOf(x), out: @TypeOf(out) };
         if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
                 const g = t.par.gpu.?;
-                if (To == u16) try g.addFromHalf(c.out.grad.data, c.x.grad.data) else try g.addToHalf(c.out.grad.data, c.x.grad.data);
+                if (To == u16) try g.convertHalf(.addFromHalf, c.out.grad.data, c.x.grad.data) else try g.convertHalf(.addToHalf, c.out.grad.data, c.x.grad.data);
             }
         }.run);
         return out;
@@ -916,7 +915,7 @@ pub const Tape = struct {
                     const rotated = try g.packRotatedWeights(c.w.value.data, k, c_in, c_out);
                     try g.convImplicitForward(c.out.grad.data, rotated, c.x.grad.data, reverse, true);
                 }
-                if (c.w.needs_grad) try g.convImplicitWeightGrad(c.out.grad.data, c.x.value.data, c.w.grad.data, geometry);
+                if (c.w.needs_grad) try g.convImplicitWeightGrad(c.out.grad.data, c.x.value.data, c.w.grad.data, geometry, null);
             }
         }.run);
         return out;
@@ -1049,7 +1048,7 @@ pub const Tape = struct {
                                 const rotated = try g.packRotatedWeights(c.w.value.data, k, c_in, c_out);
                                 try g.convImplicitForward(grad_half.data, rotated, c.x.grad.data, reverse, true);
                             }
-                            if (c.w.needs_grad) try g.convImplicitWeightGrad(grad_half.data, c.cache.x_half, c.w.grad.data, geometry);
+                            if (c.w.needs_grad) try g.convImplicitWeightGrad(grad_half.data, c.cache.x_half, c.w.grad.data, geometry, null);
                         },
                         .f32_implicit => {
                             const g = t.par.gpu.?;
@@ -1231,7 +1230,7 @@ pub const Tape = struct {
                         const rotated = try g.packRotatedWeights(k.w.value.data, ks, c_in, c_out);
                         try g.convImplicitForward(dconv.data, rotated, k.x.grad.data, reverse, true);
                     }
-                    if (k.w.needs_grad) try g.convImplicitWeightGrad(dconv.data, k.x.value.data, k.w.grad.data, geometry);
+                    if (k.w.needs_grad) try g.convImplicitWeightGrad(dconv.data, k.x.value.data, k.w.grad.data, geometry, null);
                 } else if (to_residual) {
                     try g.addReluBackward(k.out.value.data, k.out.grad.data, k.residual.grad.data, k.residual.grad.data, true, false);
                 }
@@ -1359,7 +1358,7 @@ pub const Tape = struct {
                     try g.convImplicitForwardDxStats(dconv2.data, rotated2, dy1.data, reverse2, k.conv1_out.data, k.affine1, sums1.data);
                 }
                 try g.batchNormGradFinish(sums1.data, k.gamma1.grad.data, k.beta1.grad.data);
-                if (k.w2.needs_grad) try g.convImplicitWeightGradAffine(dconv2.data, k.conv1_out.data, k.w2.grad.data, geometry2, k.aff);
+                if (k.w2.needs_grad) try g.convImplicitWeightGrad(dconv2.data, k.conv1_out.data, k.w2.grad.data, geometry2, k.aff);
                 const dconv1: Mid = .{ .data = try g.scratch(u16, Mid.len) };
                 const io1: norm.GradIo(u16) = .{
                     .x = k.conv1_out.data.ptr,
@@ -1375,7 +1374,7 @@ pub const Tape = struct {
                     const rotated1 = try g.packRotatedWeights(k.w1.value.data, ks1, c_in, c1);
                     try g.convImplicitForward(dconv1.data, rotated1, k.x.grad.data, reverse1, true);
                 }
-                if (k.w1.needs_grad) try g.convImplicitWeightGrad(dconv1.data, k.x.value.data, k.w1.grad.data, geometry1);
+                if (k.w1.needs_grad) try g.convImplicitWeightGrad(dconv1.data, k.x.value.data, k.w1.grad.data, geometry1, null);
             }
         }.run);
         return out;

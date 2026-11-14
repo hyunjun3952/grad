@@ -20,23 +20,6 @@ fn step(model: Net, tape: *Tape, x: Input, h: Var(State)) !struct { Var(State), 
     return .{ next, try out.forward(tape, next) };
 }
 
-fn sample(rng: std.Random, logits: []const f32, temperature: f32) u8 {
-    var largest: f32 = -std.math.inf(f32);
-    for (logits) |l| largest = @max(largest, l);
-    var weights: [vocab]f32 = undefined;
-    var total: f32 = 0;
-    for (logits, &weights) |l, *w| {
-        w.* = @exp((l - largest) / temperature);
-        total += w.*;
-    }
-    var pick = rng.float(f32) * total;
-    for (weights, 0..) |w, i| {
-        pick -= w;
-        if (pick <= 0) return @intCast(i);
-    }
-    return vocab - 1;
-}
-
 fn generate(par: grad.kernels.Parallel, gpa: std.mem.Allocator, model: Net, rng: std.Random, out: *std.Io.Writer, seed_text: []const u8, length: usize) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -70,7 +53,7 @@ fn generate(par: grad.kernels.Parallel, gpa: std.mem.Allocator, model: Net, rng:
             current = seed_text[at];
             at += 1;
         } else {
-            current = sample(rng, logits[0..vocab], 0.8);
+            current = @intCast(grad.trainer.sample(rng, logits[0..vocab], 0.8));
         }
         try out.writeByte(current);
     }

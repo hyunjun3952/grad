@@ -865,25 +865,47 @@ pub const Gpu = struct {
         return .{ .data = dst, .rows_padded = rows, .cols_padded = cols_padded };
     }
 
-    pub fn convImplicitForward(self: *Gpu, x_half: []const u16, w: Packed, out: anytype, geo: ga.ConvGeometry, accumulate: bool) Error!void {
-        const half_out = @typeInfo(@TypeOf(out)).pointer.child == u16;
+    // What every forward implicit GEMM over bf16 data shares: the GEMM shape, whether the wide tile is used, and the launch grid.
+    const ForwardPlan = struct { shape: ga.TensorShape, wide: bool, grid: [3]u32 };
+
+    fn forwardPlan(w: Packed, geo: ga.ConvGeometry, accumulate: bool, half_out: bool) ForwardPlan {
         const c_out: usize = geo.c_out;
         const m = @as(usize, geo.n) * geo.out_h * geo.out_w;
-        const kernel_shape = pack(ga.TensorShape, .{
-            .m = m,
-            .n = c_out,
-            .k_padded = w.rows_padded,
-            .n_padded = w.cols_padded,
-            .accumulate = accumulate,
-            .chunk = w.rows_padded,
-            .transpose_out = false,
-            .output_half = half_out,
-            .split_stride = 0,
-            .c_pitch = 0,
-            .c_offset = 0,
-        });
         const wide = c_out % 128 == 0 and ceilDiv(m, 128) * (c_out / 128) >= 96;
-        try self.launch(if (wide) .convGemmForwardWide else .convGemmForward, .{ ceilDiv(c_out, if (wide) 128 else 64), ceilDiv(m, 128), 1 }, .{ x_half, w.data, out, kernel_shape, geo });
+        return .{
+            .shape = pack(ga.TensorShape, .{
+                .m = m,
+                .n = c_out,
+                .k_padded = w.rows_padded,
+                .n_padded = w.cols_padded,
+                .accumulate = accumulate,
+                .chunk = w.rows_padded,
+                .transpose_out = false,
+                .output_half = half_out,
+                .split_stride = 0,
+                .c_pitch = 0,
+                .c_offset = 0,
+            }),
+            .wide = wide,
+            .grid = .{ ceilDiv(c_out, if (wide) 128 else 64), ceilDiv(m, 128), 1 },
+        };
+    }
+
+    // The buffer an epilogue-statistics GEMM adds its channel sums into: sums itself, or in a deterministic run one partial row
+    // per block row (taken from scratch, so call it inside a scratch scope) that combineStats adds up in order.
+    fn statsPartial(self: *Gpu, plan: ForwardPlan, c_out: usize, sums: []f32) Error![]f32 {
+        if (!self.deterministic) return sums;
+        return self.scratch(f32, @as(usize, plan.grid[1]) * 2 * c_out);
+    }
+
+    fn combineStats(self: *Gpu, plan: ForwardPlan, c_out: usize, partial: []const f32, sums: []f32) Error!void {
+        if (!self.deterministic) return;
+        try self.launchFlat(.columnCombine, 2 * c_out, .{ partial, sums, plan.grid[1], toU32(2 * c_out), toU32(2 * c_out) });
+    }
+
+    pub fn convImplicitForward(self: *Gpu, x_half: []const u16, w: Packed, out: anytype, geo: ga.ConvGeometry, accumulate: bool) Error!void {
+        const plan = forwardPlan(w, geo, accumulate, @typeInfo(@TypeOf(out)).pointer.child == u16);
+        try self.launch(if (plan.wide) .convGemmForwardWide else .convGemmForward, plan.grid, .{ x_half, w.data, out, plan.shape, geo });
     }
 
     /// Forward implicit GEMM whose epilogue also accumulates the per-channel sums a following batch norm needs:
@@ -892,28 +914,12 @@ pub const Gpu = struct {
     /// block totals go through a per-block-row partial buffer combined in order.
     pub fn convImplicitForwardStats(self: *Gpu, x_half: []const u16, w: Packed, out: []u16, geo: ga.ConvGeometry, shift: []const f32, sums: []f32) Error!void {
         const c_out: usize = geo.c_out;
-        const m = @as(usize, geo.n) * geo.out_h * geo.out_w;
-        const kernel_shape = pack(ga.TensorShape, .{
-            .m = m,
-            .n = c_out,
-            .k_padded = w.rows_padded,
-            .n_padded = w.cols_padded,
-            .accumulate = false,
-            .chunk = w.rows_padded,
-            .transpose_out = false,
-            .output_half = true,
-            .split_stride = 0,
-            .c_pitch = 0,
-            .c_offset = 0,
-        });
-        const wide = c_out % 128 == 0 and ceilDiv(m, 128) * (c_out / 128) >= 96;
-        const tile_cols: usize = if (wide) 128 else 64;
-        const grid: [3]u32 = .{ ceilDiv(c_out, tile_cols), ceilDiv(m, 128), 1 };
+        const plan = forwardPlan(w, geo, false, true);
         const scope = self.scratchScope();
         defer scope.restore();
-        const partial: []f32 = if (self.deterministic) try self.scratch(f32, @as(usize, grid[1]) * 2 * c_out) else sums;
-        try self.launch(if (wide) .convGemmForwardStatsWide else .convGemmForwardStats, grid, .{ x_half, w.data, out, shift, sums, partial, self.deterministic, kernel_shape, geo });
-        if (self.deterministic) try self.launchFlat(.columnCombine, 2 * c_out, .{ partial, sums, grid[1], toU32(2 * c_out), toU32(2 * c_out) });
+        const partial = try self.statsPartial(plan, c_out, sums);
+        try self.launch(if (plan.wide) .convGemmForwardStatsWide else .convGemmForwardStats, plan.grid, .{ x_half, w.data, out, shift, sums, partial, self.deterministic, plan.shape, geo });
+        try self.combineStats(plan, c_out, partial, sums);
     }
 
     /// Turns the sums of convImplicitForwardStats into batch statistics; shift is the f32 vector the sums were
@@ -944,28 +950,12 @@ pub const Gpu = struct {
     /// statistics of the following norm exactly as convImplicitForwardStats does.
     pub fn convImplicitForwardAffineStats(self: *Gpu, x_half: []const u16, w: Packed, out: []u16, geo: ga.ConvGeometry, aff: AffineExpanded, stats_shift: []const f32, sums: []f32) Error!void {
         const c_out: usize = geo.c_out;
-        const m = @as(usize, geo.n) * geo.out_h * geo.out_w;
-        const kernel_shape = pack(ga.TensorShape, .{
-            .m = m,
-            .n = c_out,
-            .k_padded = w.rows_padded,
-            .n_padded = w.cols_padded,
-            .accumulate = false,
-            .chunk = w.rows_padded,
-            .transpose_out = false,
-            .output_half = true,
-            .split_stride = 0,
-            .c_pitch = 0,
-            .c_offset = 0,
-        });
-        const wide = c_out % 128 == 0 and ceilDiv(m, 128) * (c_out / 128) >= 96;
-        const tile_cols: usize = if (wide) 128 else 64;
-        const grid: [3]u32 = .{ ceilDiv(c_out, tile_cols), ceilDiv(m, 128), 1 };
+        const plan = forwardPlan(w, geo, false, true);
         const scope = self.scratchScope();
         defer scope.restore();
-        const partial: []f32 = if (self.deterministic) try self.scratch(f32, @as(usize, grid[1]) * 2 * c_out) else sums;
-        try self.launch(if (wide) .convGemmForwardAffineStatsWide else .convGemmForwardAffineStats, grid, .{ x_half, w.data, out, aff.scale2, aff.shift2, stats_shift, sums, partial, self.deterministic, kernel_shape, geo });
-        if (self.deterministic) try self.launchFlat(.columnCombine, 2 * c_out, .{ partial, sums, grid[1], toU32(2 * c_out), toU32(2 * c_out) });
+        const partial = try self.statsPartial(plan, c_out, sums);
+        try self.launch(if (plan.wide) .convGemmForwardAffineStatsWide else .convGemmForwardAffineStats, plan.grid, .{ x_half, w.data, out, aff.scale2, aff.shift2, stats_shift, sums, partial, self.deterministic, plan.shape, geo });
+        try self.combineStats(plan, c_out, partial, sums);
     }
 
     /// Input-gradient implicit GEMM whose epilogue also accumulates the masked batch-norm gradient sums of a virtual
@@ -973,28 +963,12 @@ pub const Gpu = struct {
     /// and x_hat. The sums behave like those of batchNormGradSums, including the ordered combine when deterministic.
     pub fn convImplicitForwardDxStats(self: *Gpu, dy: []const u16, w: Packed, out: []u16, geo: ga.ConvGeometry, x_bn: []const u16, p: norm.Affine, sums: []f32) Error!void {
         const c_out: usize = geo.c_out;
-        const m = @as(usize, geo.n) * geo.out_h * geo.out_w;
-        const kernel_shape = pack(ga.TensorShape, .{
-            .m = m,
-            .n = c_out,
-            .k_padded = w.rows_padded,
-            .n_padded = w.cols_padded,
-            .accumulate = false,
-            .chunk = w.rows_padded,
-            .transpose_out = false,
-            .output_half = true,
-            .split_stride = 0,
-            .c_pitch = 0,
-            .c_offset = 0,
-        });
-        const wide = c_out % 128 == 0 and ceilDiv(m, 128) * (c_out / 128) >= 96;
-        const tile_cols: usize = if (wide) 128 else 64;
-        const grid: [3]u32 = .{ ceilDiv(c_out, tile_cols), ceilDiv(m, 128), 1 };
+        const plan = forwardPlan(w, geo, false, true);
         const scope = self.scratchScope();
         defer scope.restore();
-        const partial: []f32 = if (self.deterministic) try self.scratch(f32, @as(usize, grid[1]) * 2 * c_out) else sums;
-        try self.launch(if (wide) .convGemmForwardDxStatsWide else .convGemmForwardDxStats, grid, .{ dy, w.data, out, x_bn, p.mean[0..c_out], p.inv_std[0..c_out], p.gamma[0..c_out], p.beta[0..c_out], sums, partial, self.deterministic, kernel_shape, geo });
-        if (self.deterministic) try self.launchFlat(.columnCombine, 2 * c_out, .{ partial, sums, grid[1], toU32(2 * c_out), toU32(2 * c_out) });
+        const partial = try self.statsPartial(plan, c_out, sums);
+        try self.launch(if (plan.wide) .convGemmForwardDxStatsWide else .convGemmForwardDxStats, plan.grid, .{ dy, w.data, out, x_bn, p.mean[0..c_out], p.inv_std[0..c_out], p.gamma[0..c_out], p.beta[0..c_out], sums, partial, self.deterministic, plan.shape, geo });
+        try self.combineStats(plan, c_out, partial, sums);
     }
 
     /// Adds the masked batch-norm gradient sums of batchNormGradSums or convImplicitForwardDxStats to the parameter gradients.
@@ -1004,7 +978,9 @@ pub const Gpu = struct {
 
     /// Adds the weight gradient of an implicit-GEMM convolution to out (taps x c_out, f32). dy is the bf16 output gradient
     /// as stored, positions x c_out; the kernel reads it transposed itself, so no packed copy is made.
-    pub fn convImplicitWeightGrad(self: *Gpu, dy: []const u16, x_half: []const u16, out: []f32, geo: ga.ConvGeometry) Error!void {
+    /// With aff set the input is a virtual batch-norm-plus-ReLU map: the gathered right operand is transformed on load with
+    /// the packed scale and shift of affineExpand. Everything else, including the split-K accumulation, is the same.
+    pub fn convImplicitWeightGrad(self: *Gpu, dy: []const u16, x_half: []const u16, out: []f32, geo: ga.ConvGeometry, aff: ?AffineExpanded) Error!void {
         const c_out: usize = geo.c_out;
         std.debug.assert(c_out % 8 == 0 and dy.len == @as(usize, geo.positions) * c_out);
         const taps = @as(usize, geo.k) * geo.k * geo.c;
@@ -1030,12 +1006,18 @@ pub const Gpu = struct {
             .c_pitch = 0,
             .c_offset = 0,
         });
-        const kernel: Kernel = if (short) .convGemmWeightGradShort else if (wide) .convGemmWeightGradWide else .convGemmWeightGrad;
         const scope = self.scratchScope();
         defer scope.restore();
         const parts = ceilDiv(k_padded, chunk);
         const target, const shape = try self.orderedTarget(out, kernel_shape, parts);
-        try self.launch(kernel, .{ toU32(n_padded / tile_cols), ceilDiv(c_out, tile_rows), parts }, .{ dy, x_half, target, shape, geo });
+        const grid: [3]u32 = .{ toU32(n_padded / tile_cols), ceilDiv(c_out, tile_rows), parts };
+        if (aff) |a| {
+            const kernel: Kernel = if (short) .convGemmWeightGradAffineShort else if (wide) .convGemmWeightGradAffineWide else .convGemmWeightGradAffine;
+            try self.launch(kernel, grid, .{ dy, x_half, target, a.scalec, a.shiftc, shape, geo });
+        } else {
+            const kernel: Kernel = if (short) .convGemmWeightGradShort else if (wide) .convGemmWeightGradWide else .convGemmWeightGrad;
+            try self.launch(kernel, grid, .{ dy, x_half, target, shape, geo });
+        }
         try self.combineSplits(target, out, shape, parts, true);
     }
 
@@ -1044,44 +1026,6 @@ pub const Gpu = struct {
         var ordered = shape;
         ordered.split_stride = @intCast(out.len);
         return .{ try self.scratch(f32, @as(usize, parts) * out.len), ordered };
-    }
-
-    /// Weight gradient of an implicit-GEMM convolution over a virtual batch-norm-plus-ReLU input: the gathered
-    /// right operand is transformed on load with the packed scale and shift of affineExpand. Everything
-    /// else, including the split-K accumulation, matches convImplicitWeightGrad.
-    pub fn convImplicitWeightGradAffine(self: *Gpu, dy: []const u16, x_half: []const u16, out: []f32, geo: ga.ConvGeometry, aff: AffineExpanded) Error!void {
-        const c_out: usize = geo.c_out;
-        std.debug.assert(c_out % 8 == 0 and dy.len == @as(usize, geo.positions) * c_out);
-        const taps = @as(usize, geo.k) * geo.k * geo.c;
-        const k_padded = padTo(geo.positions, .depth);
-        const short = c_out <= 64;
-        const wide = c_out % 128 == 0;
-        const tile_rows: usize = if (short) 64 else 128;
-        const tile_cols: usize = if (short or wide) 128 else 64;
-        const n_padded = std.mem.alignForward(usize, taps, tile_cols);
-        const blocks = ceilDiv(c_out, tile_rows) * (n_padded / tile_cols);
-        const splits = @max(1, @min(k_padded / 256, (128 + blocks - 1) / blocks));
-        const chunk = padTo((k_padded + splits - 1) / splits, .depth);
-        const kernel_shape = pack(ga.TensorShape, .{
-            .m = c_out,
-            .n = taps,
-            .k_padded = k_padded,
-            .n_padded = n_padded,
-            .accumulate = true,
-            .chunk = chunk,
-            .transpose_out = true,
-            .output_half = false,
-            .split_stride = 0,
-            .c_pitch = 0,
-            .c_offset = 0,
-        });
-        const kernel: Kernel = if (short) .convGemmWeightGradAffineShort else if (wide) .convGemmWeightGradAffineWide else .convGemmWeightGradAffine;
-        const scope = self.scratchScope();
-        defer scope.restore();
-        const parts = ceilDiv(k_padded, chunk);
-        const target, const shape = try self.orderedTarget(out, kernel_shape, parts);
-        try self.launch(kernel, .{ toU32(n_padded / tile_cols), ceilDiv(c_out, tile_rows), parts }, .{ dy, x_half, target, aff.scalec, aff.shiftc, shape, geo });
-        try self.combineSplits(target, out, shape, parts, true);
     }
 
     fn combineSplits(self: *Gpu, workspace: []f32, out: []f32, shape: ga.TensorShape, parts: u32, accumulate: bool) Error!void {
@@ -1127,8 +1071,22 @@ pub const Gpu = struct {
         const b_packed = try self.packMatrix(b, shape.k, shape.n, .{ .rows_padded = k_padded, .cols_padded = padTo(shape.n, .columns), .transpose = opts.trans_b });
         try self.matmulPacked(a_packed, b_packed, out, shape, opts.accumulate, false);
     }
+    // True when both operands are read in the order of the output (equal shapes, or axes of size one), so the kernel can skip
+    // decoding the index into coordinates.
+    fn isFlat(plan: BroadcastPlan) bool {
+        var expected: u32 = 1;
+        var axis: usize = ga.max_rank;
+        while (axis > 0) {
+            axis -= 1;
+            const d = plan.dims[axis];
+            if (d != 1 and (plan.a_strides[axis] != expected or plan.b_strides[axis] != expected)) return false;
+            expected *= d;
+        }
+        return true;
+    }
+
     pub fn elementwise(self: *Gpu, op: BinaryOp, a: anytype, b: anytype, out: anytype, plan: BroadcastPlan) Error!void {
-        const args = pack(ga.ElementwiseArgs, .{ .len = out.len, .multiply = op == .mul, .dims = plan.dims, .a_strides = plan.a_strides, .b_strides = plan.b_strides });
+        const args = pack(ga.ElementwiseArgs, .{ .len = out.len, .multiply = op == .mul, .flat = isFlat(plan), .dims = plan.dims, .a_strides = plan.a_strides, .b_strides = plan.b_strides });
         try self.launchFlat(variant(.elementwise, out), out.len, .{ a, b, out, args });
     }
 
@@ -1202,24 +1160,15 @@ pub const Gpu = struct {
         try self.launchFlat(variant(.softmaxBackward, dx), 32 * (y.len / cols), .{ y, dy, dx, y.len / cols, cols, scale });
     }
 
-    fn launchHalfConversion(self: *Gpu, comptime kernel: Kernel, x: anytype, y: anytype) Error!void {
-        try self.launchFlat(kernel, x.len, .{ x, y, x.len });
-    }
+    /// The conversions between f32 and bf16: to or from the other type, either storing (toHalf, fromHalf) or adding the
+    /// converted values to y (addToHalf, addFromHalf). A to-half kind reads f32 and writes bf16, the others the reverse.
+    pub const HalfConversion = enum { toHalf, fromHalf, addToHalf, addFromHalf };
 
-    pub fn toHalf(self: *Gpu, x: []const f32, y: []u16) Error!void {
-        try self.launchHalfConversion(.toHalf, x, y);
-    }
-
-    pub fn fromHalf(self: *Gpu, x: []const u16, y: []f32) Error!void {
-        try self.launchHalfConversion(.fromHalf, x, y);
-    }
-
-    pub fn addFromHalf(self: *Gpu, x: []const u16, y: []f32) Error!void {
-        try self.launchHalfConversion(.addFromHalf, x, y);
-    }
-
-    pub fn addToHalf(self: *Gpu, x: []const f32, y: []u16) Error!void {
-        try self.launchHalfConversion(.addToHalf, x, y);
+    pub fn convertHalf(self: *Gpu, comptime kind: HalfConversion, x: anytype, y: anytype) Error!void {
+        const to_half = kind == .toHalf or kind == .addToHalf;
+        comptime if (@typeInfo(@TypeOf(x)).pointer.child != (if (to_half) f32 else u16) or @typeInfo(@TypeOf(y)).pointer.child != (if (to_half) u16 else f32))
+            @compileError("convertHalf: a to-half conversion takes f32 into bf16, the others bf16 into f32");
+        try self.launchFlat(@field(Kernel, @tagName(kind)), x.len, .{ x, y, x.len });
     }
 
     pub fn activation(self: *Gpu, x: anytype, out: anytype, kind: Activation) Error!void {
@@ -1237,11 +1186,9 @@ pub const Gpu = struct {
 
     fn addReluPlan(out: anytype, comptime backward: bool) struct { kernel: Kernel, len: usize } {
         const E = @typeInfo(@TypeOf(out)).pointer.child;
-        if (E == u16 and out.len % 4 == 0) return .{ .kernel = if (backward) .addReluBackwardQuad else .addReluQuad, .len = out.len / 4 };
-        return .{ .kernel = if (backward)
-            (if (E == u16) .addReluBackwardHalf else .addReluBackward)
-        else
-            (if (E == u16) .addReluHalf else .addRelu), .len = out.len };
+        if (E != u16) return .{ .kernel = if (backward) .addReluBackward else .addRelu, .len = out.len };
+        if (out.len % 4 != 0) return .{ .kernel = if (backward) .addReluBackwardHalf else .addReluHalf, .len = out.len };
+        return .{ .kernel = if (backward) .addReluBackwardQuad else .addReluQuad, .len = out.len / 4 };
     }
 
     pub fn addRelu(self: *Gpu, a: anytype, b: anytype, out: anytype) Error!void {
@@ -1376,24 +1323,13 @@ pub const Gpu = struct {
         try self.launch(kernel, .{ blocks, 1, 1 }, .{launched} ++ args);
     }
 
-    pub fn zeroGrads(self: *Gpu, table: ga.TensorTable) Error!void {
-        try self.launchTable(.zeroGrads, table, .{});
-    }
+    /// The kernels that update a whole table of tensors in one launch: zero the gradients, plain SGD (args: lr), the moving
+    /// average of the weights (args: decay), the exchange of weights and shadow, and Adam (args: ga.AdamArgs).
+    pub const TableOp = enum { zeroGrads, sgd, ema, swapWeights, adam };
 
-    pub fn sgd(self: *Gpu, table: ga.TensorTable, lr: f32) Error!void {
-        try self.launchTable(.sgd, table, .{lr});
-    }
-
-    pub fn ema(self: *Gpu, table: ga.TensorTable, decay: f32) Error!void {
-        try self.launchTable(.ema, table, .{decay});
-    }
-
-    pub fn swapWeights(self: *Gpu, table: ga.TensorTable) Error!void {
-        try self.launchTable(.swapWeights, table, .{});
-    }
-
-    pub fn adam(self: *Gpu, table: ga.TensorTable, hp: ga.AdamArgs) Error!void {
-        try self.launchTable(.adam, table, .{hp});
+    /// Runs op over every tensor of table; args are the scalar arguments of that op, as a tuple.
+    pub fn updateTable(self: *Gpu, comptime op: TableOp, table: ga.TensorTable, args: anytype) Error!void {
+        try self.launchTable(@field(Kernel, @tagName(op)), table, args);
     }
 
     pub const GatherFrom = struct { images: []const f32, labels: []const u8, order: []const u32 };

@@ -37,6 +37,21 @@ test "layer tuples initialise, concatenate parameters and state in order, and fr
     try testing.expectEqual(@as(usize, 2 * 3), all_state[0].len);
 }
 
+test "a convolution with batch norm owns its weights and the norm, and no bias" {
+    const Layer = ConvBn(2, 3, 3, .{});
+    var prng = std.Random.DefaultPrng.init(3);
+    var counting = testing.FailingAllocator.init(testing.allocator, .{});
+    const gpa = counting.allocator();
+    const layer = try Layer.init(gpa, prng.random());
+    defer layer.deinit(gpa);
+
+    try testing.expectEqual(@as(usize, 3), layer.params().len);
+    try testing.expectEqual(@as(usize, 5), layer.state().len);
+    try testing.expectEqual(@as(usize, 3 * 3 * 2 * 3), layer.state()[0].len);
+    // Weights and their gradient (54 floats each), gamma and beta with gradients (3 floats each), mean and variance (3 each).
+    try testing.expectEqual(@as(usize, 4 * (2 * 54 + 4 * 3 + 2 * 3)), counting.allocated_bytes);
+}
+
 test "a gru with zero weights halves the state, and its gradients match finite differences and the gpu" {
     const gpa = testing.allocator;
     const Cell = Gru(3, 4);

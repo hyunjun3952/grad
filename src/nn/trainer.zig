@@ -33,6 +33,28 @@ fn printProgress(out: *Io.Writer, p: Progress) !void {
     try out.flush();
 }
 
+/// Returns the index of the largest value of row; the first one wins a tie.
+pub fn argmax(row: []const f32) usize {
+    var best: usize = 0;
+    for (row, 0..) |s, j| {
+        if (s > row[best]) best = j;
+    }
+    return best;
+}
+
+/// Draws an index with probability proportional to exp(logit / temperature), the way a character model picks its next character.
+pub fn sample(rng: std.Random, logits: []const f32, temperature: f32) usize {
+    const largest = logits[argmax(logits)];
+    var total: f32 = 0;
+    for (logits) |l| total += @exp((l - largest) / temperature);
+    var pick = rng.float(f32) * total;
+    for (logits, 0..) |l, i| {
+        pick -= @exp((l - largest) / temperature);
+        if (pick <= 0) return i;
+    }
+    return logits.len - 1;
+}
+
 const Mix = struct { box: augment_math.Box = .{}, kept: f32 = 1 };
 
 // Draws a CutMix box covering a random share of the image, or an empty box with probability 1 - probability.
@@ -203,12 +225,7 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
                 }
 
                 for (0..Spec.eval_batch) |row| {
-                    const row_scores = host_logits[row * Spec.classes ..][0..Spec.classes];
-                    var best: usize = 0;
-                    for (row_scores, 0..) |s, j| {
-                        if (s > row_scores[best]) best = j;
-                    }
-                    correct += @intFromBool(best == host_labels[start + row]);
+                    correct += @intFromBool(argmax(host_logits[row * Spec.classes ..][0..Spec.classes]) == host_labels[start + row]);
                 }
             }
             const seen = data.count() / Spec.eval_batch * Spec.eval_batch;
@@ -229,11 +246,8 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
                 const x: Tensor(f32, &.{ 1, pixels }) = .{ .data = data.images[i * pixels ..][0..pixels] };
                 const logits = try Spec.forward(model, &tape, try tape.constant(x));
                 try par.download(&row, logits.value.data);
-                var best: usize = 0;
+                const best = argmax(&row);
                 var total: f32 = 0;
-                for (row, 0..) |s, j| {
-                    if (s > row[best]) best = j;
-                }
                 for (row) |s| total += @exp(s - row[best]);
                 try out.print("image {d}: label {d}, predicted {d} ({d:.1}%)\n", .{ i, labels[i], best, 100 / total });
                 if (i == 0) {
@@ -315,6 +329,7 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
                     augment,
                 );
                 const rows = self.order[slice * batch_size ..][0..batch_size];
+                const active = augment.active();
                 for (rows, 0..) |idx, row| {
                     const partner = (row + 1) % batch_size;
                     const own = augment_math.transformOf(slice * batch_size + row, augment);
@@ -322,7 +337,7 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
                     for (self.batch.data[row * pixels ..][0..pixels], 0..) |*v, p| {
                         const pasted = augment.box.contains(p, Spec.side, Spec.channels);
                         const source = self.host.images[(if (pasted) rows[partner] else idx) * pixels ..];
-                        v.* = if (augment.active()) augment_math.pixel(source.ptr, p, Spec.side, Spec.channels, if (pasted) other else own) else source[p];
+                        v.* = if (active) augment_math.pixel(source.ptr, p, Spec.side, Spec.channels, if (pasted) other else own) else source[p];
                     }
                     self.labels[row] = self.host.labels[idx];
                     self.other_labels[row] = self.host.labels[rows[partner]];
@@ -442,6 +457,20 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
 
             const StepInput = struct { global_step: usize, feed_slice: usize, augment: augment_math.Config, kept: f32 };
 
+            fn stepsPerEpoch(self: *const Loop) usize {
+                return self.shared.train.count() / (batch_size * self.shared.opts.replicas);
+            }
+
+            // The test accuracy of the averaged weights, which are swapped in for the measurement and back out afterwards.
+            fn averagedAccuracy(self: *Loop, mirrored: bool) !f64 {
+                const state = self.state;
+                try state.average.swap(self.par);
+                errdefer state.average.swap(self.par) catch {};
+                const percent = try accuracy(self.shared.gpa, self.par, state.model, self.test_data, mirrored);
+                try state.average.swap(self.par);
+                return percent;
+            }
+
             fn trainStep(self: *Loop, input: StepInput) !void {
                 const shared = self.shared;
                 const opts = shared.opts;
@@ -449,7 +478,7 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
                 const params = nn.params(state.model);
                 try self.feed.fill(input.feed_slice, input.augment);
 
-                const steps = shared.train.count() / (batch_size * opts.replicas);
+                const steps = self.stepsPerEpoch();
                 state.adam.lr = optim.cosineLr(state.learning_rate, input.global_step, opts.epochs * steps, opts.warmup_epochs * steps);
                 // NOTE: dropout seeds are (global_step * replicas + index) * 8 plus the op number; a recorded step keeps
                 // index * 8 on the tape and takes the step part from the device, which gives the same masks.
@@ -489,13 +518,9 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
                 const seconds = @as(f64, @floatFromInt(Io.Clock.awake.now(self.shared.io).nanoseconds - started_ns)) / 1e9;
                 const acc = try accuracy(self.shared.gpa, self.par, state.model, self.test_data, false);
                 if (live) try out.writeAll("\r\x1b[2K");
-                const steps = self.shared.train.count() / (batch_size * opts.replicas);
+                const steps = self.stepsPerEpoch();
                 try out.print("epoch {d}/{d}  train loss {d:.4}  test accuracy {d:.2}%", .{ epoch + 1, opts.epochs, self.loss_sum / @as(f64, @floatFromInt(steps)), acc });
-                if (opts.ema_decay > 0) {
-                    try state.average.swap(self.par);
-                    try out.print("  ema {d:.2}%", .{try accuracy(self.shared.gpa, self.par, state.model, self.test_data, false)});
-                    try state.average.swap(self.par);
-                }
+                if (opts.ema_decay > 0) try out.print("  ema {d:.2}%", .{try self.averagedAccuracy(false)});
                 try out.print("  ({d:.2} s)\n", .{seconds});
                 try out.flush();
             }
@@ -504,7 +529,7 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
                 const shared = self.shared;
                 const opts = shared.opts;
                 const epochs = opts.epochs;
-                const steps = shared.train.count() / (batch_size * opts.replicas);
+                const steps = self.stepsPerEpoch();
                 const stop_epoch = @min(opts.until orelse epochs, epochs);
                 const live = self.index == 0 and (opts.progress or try Io.File.stdout().isTty(shared.io));
                 if (live) Io.File.stdout().enableAnsiEscapeCodes(shared.io) catch {};
@@ -550,11 +575,7 @@ fn Runner(comptime Spec: type, comptime batch_size: usize) type {
                 if (self.index != 0) return;
                 if (opts.mirrored) {
                     try out.print("final test accuracy {d:.2}%, with mirrored inputs averaged {d:.2}%\n", .{ try accuracy(shared.gpa, self.par, state.model, self.test_data, false), try accuracy(shared.gpa, self.par, state.model, self.test_data, true) });
-                    if (opts.ema_decay > 0) {
-                        try state.average.swap(self.par);
-                        try out.print("ema   test accuracy {d:.2}%, with mirrored inputs averaged {d:.2}%\n", .{ try accuracy(shared.gpa, self.par, state.model, self.test_data, false), try accuracy(shared.gpa, self.par, state.model, self.test_data, true) });
-                        try state.average.swap(self.par);
-                    }
+                    if (opts.ema_decay > 0) try out.print("ema   test accuracy {d:.2}%, with mirrored inputs averaged {d:.2}%\n", .{ try self.averagedAccuracy(false), try self.averagedAccuracy(true) });
                 }
                 if (opts.predict > 0) try predict(shared.gpa, self.par, state.model, self.test_data, opts.predict, out);
                 if (opts.onnx_path) |path| {

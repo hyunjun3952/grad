@@ -96,6 +96,14 @@ fn directState(self: anytype) DirectState(@TypeOf(self)) {
     return out;
 }
 
+// He-normal weights for a layer whose output sums fan_in products.
+fn heNormal(comptime W: type, gpa: Allocator, rng: std.Random, comptime fan_in: usize) Allocator.Error!W {
+    const values = try W.empty(gpa);
+    const std_dev = @sqrt(2.0 / @as(f32, fan_in));
+    for (values.data) |*v| v.* = rng.floatNorm(f32) * std_dev;
+    return values;
+}
+
 /// A fully connected layer, y = x * w + b, with He-normal weights and zero bias.
 /// x has shape (rows, n_in) and the result has shape (rows, n_out).
 pub fn Linear(comptime n_in: usize, comptime n_out: usize) type {
@@ -109,10 +117,7 @@ pub fn Linear(comptime n_in: usize, comptime n_out: usize) type {
         b: Var(B),
 
         pub fn init(gpa: Allocator, rng: std.Random) Allocator.Error!Self {
-            const values = try W.empty(gpa);
-            const std_dev = @sqrt(2.0 / @as(f32, n_in));
-            for (values.data) |*v| v.* = rng.floatNorm(f32) * std_dev;
-            const w = try newParam(W, gpa, values);
+            const w = try newParam(W, gpa, try heNormal(W, gpa, rng, n_in));
             errdefer freeParam(w, gpa);
             return .{ .w = w, .b = try newParam(B, gpa, try B.zeros(gpa)) };
         }
@@ -200,7 +205,7 @@ pub fn BatchNorm(comptime c: usize) type {
     };
 }
 
-/// A bias-free convolution of an NHWC input with a k x k kernel; opts sets stride, padding, dilation and groups.
+/// A convolution of an NHWC input with a k x k kernel plus a per-channel bias; opts sets stride, padding, dilation and groups.
 pub fn Conv2d(comptime c_in: usize, comptime c_out: usize, comptime k: usize, comptime opts: autograd.ConvOpts) type {
     const Inner = Linear(k * k * c_in / opts.groups, c_out);
 
@@ -236,21 +241,22 @@ pub fn Conv2d(comptime c_in: usize, comptime c_out: usize, comptime k: usize, co
     };
 }
 
-/// A convolution followed by batch normalization, the usual building block of the residual networks.
+/// A bias-free convolution followed by batch normalization, the usual building block of the residual networks.
+/// NOTE: the norm's shift replaces the bias, so this layer owns the weights only.
 pub fn ConvBn(comptime c_in: usize, comptime c_out: usize, comptime k: usize, comptime opts: autograd.ConvOpts) type {
-    const Conv = Conv2d(c_in, c_out, k, opts);
+    const W = Tensor(f32, &.{ k * k * c_in / opts.groups, c_out });
     const Norm = BatchNorm(c_out);
 
     return struct {
         const Self = @This();
 
-        conv: Conv,
+        w: Var(W),
         norm: Norm,
 
         pub fn init(gpa: Allocator, rng: std.Random) Allocator.Error!Self {
-            const conv = try Conv.init(gpa, rng);
-            errdefer conv.deinit(gpa);
-            return .{ .conv = conv, .norm = try Norm.init(gpa, rng) };
+            const w = try newParam(W, gpa, try heNormal(W, gpa, rng, k * k * c_in / opts.groups));
+            errdefer freeParam(w, gpa);
+            return .{ .w = w, .norm = try Norm.init(gpa, rng) };
         }
 
         pub fn deinit(self: Self, gpa: Allocator) void {
@@ -261,32 +267,32 @@ pub fn ConvBn(comptime c_in: usize, comptime c_out: usize, comptime k: usize, co
             return toGpuFields(self, gpu);
         }
 
-        pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(autograd.ConvOut(@TypeOf(x.value), Conv.Weights, opts)) {
-            return tape.convBatchNorm(x, self.conv.inner.w, self.norm.gamma, self.norm.beta, self.norm.stats(), opts);
+        pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(autograd.ConvOut(@TypeOf(x.value), W, opts)) {
+            return tape.convBatchNorm(x, self.w, self.norm.gamma, self.norm.beta, self.norm.stats(), opts);
         }
 
-        pub fn forwardRelu(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(autograd.ConvOut(@TypeOf(x.value), Conv.Weights, opts)) {
-            return tape.convBatchNormRelu(x, self.conv.inner.w, self.norm.gamma, self.norm.beta, self.norm.stats(), opts);
+        pub fn forwardRelu(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(autograd.ConvOut(@TypeOf(x.value), W, opts)) {
+            return tape.convBatchNormRelu(x, self.w, self.norm.gamma, self.norm.beta, self.norm.stats(), opts);
         }
 
         /// Convolution, batch norm, addition of residual and ReLU; the last three run as one kernel, and on the
         /// bf16 GPU path the batch statistics come from the convolution's epilogue.
-        pub fn forwardAddRelu(self: Self, tape: *Tape, x: anytype, residual: anytype) autograd.Error!Var(autograd.ConvOut(@TypeOf(x.value), Conv.Weights, opts)) {
-            return tape.convBatchNormAddRelu(x, self.conv.inner.w, residual, self.norm.gamma, self.norm.beta, self.norm.stats(), opts);
+        pub fn forwardAddRelu(self: Self, tape: *Tape, x: anytype, residual: anytype) autograd.Error!Var(autograd.ConvOut(@TypeOf(x.value), W, opts)) {
+            return tape.convBatchNormAddRelu(x, self.w, residual, self.norm.gamma, self.norm.beta, self.norm.stats(), opts);
         }
 
         /// A residual block of this convolution fused with a preceding one around a virtual middle map: the
         /// first convolution's batch norm and ReLU are never written to memory. first must use the same opts.
-        pub fn forwardChain(self: Self, tape: *Tape, first: anytype, x: anytype, residual: anytype) autograd.Error!Var(autograd.ConvOut(autograd.ConvOut(@TypeOf(x.value), @TypeOf(first.conv.inner.w.value), opts), Conv.Weights, opts)) {
-            return tape.convBnChain(x, first.conv.inner.w, first.norm.gamma, first.norm.beta, first.norm.stats(), self.conv.inner.w, residual, self.norm.gamma, self.norm.beta, self.norm.stats(), opts);
+        pub fn forwardChain(self: Self, tape: *Tape, first: anytype, x: anytype, residual: anytype) autograd.Error!Var(autograd.ConvOut(autograd.ConvOut(@TypeOf(x.value), @TypeOf(first.w.value), opts), W, opts)) {
+            return tape.convBnChain(x, first.w, first.norm.gamma, first.norm.beta, first.norm.stats(), self.w, residual, self.norm.gamma, self.norm.beta, self.norm.stats(), opts);
         }
 
-        pub fn params(self: Self) @TypeOf(.{self.conv.inner.w} ++ self.norm.params()) {
-            return .{self.conv.inner.w} ++ self.norm.params();
+        pub fn params(self: Self) @TypeOf(.{self.w} ++ self.norm.params()) {
+            return .{self.w} ++ self.norm.params();
         }
 
-        pub fn state(self: Self) @TypeOf(.{self.conv.inner.w.value.data} ++ self.norm.state()) {
-            return .{self.conv.inner.w.value.data} ++ self.norm.state();
+        pub fn state(self: Self) @TypeOf(.{self.w.value.data} ++ self.norm.state()) {
+            return .{self.w.value.data} ++ self.norm.state();
         }
     };
 }

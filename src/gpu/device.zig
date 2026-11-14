@@ -256,15 +256,19 @@ fn elementwiseKernel(comptime E: type) type {
         fn run(a: [*]const E, b: [*]const E, out: [*]E, args: ga.ElementwiseArgs) callconv(.nvptx_kernel) void {
             const t = globalIndex();
             if (t >= args.len) return;
-            var rest = t;
-            var from_a: usize = 0;
-            var from_b: usize = 0;
-            inline for (0..ga.max_rank) |step| {
-                const axis = ga.max_rank - 1 - step;
-                const position = rest % args.dims[axis];
-                rest /= args.dims[axis];
-                from_a += position * args.a_strides[axis];
-                from_b += position * args.b_strides[axis];
+            var from_a: usize = t;
+            var from_b: usize = t;
+            if (args.flat == 0) {
+                var rest = t;
+                from_a = 0;
+                from_b = 0;
+                inline for (0..ga.max_rank) |step| {
+                    const axis = ga.max_rank - 1 - step;
+                    const position = rest % args.dims[axis];
+                    rest /= args.dims[axis];
+                    from_a += position * args.a_strides[axis];
+                    from_b += position * args.b_strides[axis];
+                }
             }
             const lhs = bf16.load(E, a, from_a);
             const rhs = bf16.load(E, b, from_b);
@@ -1084,14 +1088,19 @@ export fn im2colHalf(x: [*]const f32, dst: [*]u16, d: cv.Dims, cols_padded: u32,
     packed_quad.* = @as(u64, bf16.encode(values[0])) | @as(u64, bf16.encode(values[1])) << 16 | @as(u64, bf16.encode(values[2])) << 32 | @as(u64, bf16.encode(values[3])) << 48;
 }
 export fn packHalfTransposed(src: [*]const f32, dst: [*]u16, args: ga.PackArgs) callconv(.nvptx_kernel) void {
-    packTransposedOf(f32, src, dst, args);
+    transposeOf(f32, u16, src, dst, args);
 }
 
 export fn transposeHalf(src: [*]const u16, dst: [*]u16, args: ga.PackArgs) callconv(.nvptx_kernel) void {
-    packTransposedOf(u16, src, dst, args);
+    transposeOf(u16, u16, src, dst, args);
 }
 
-inline fn packTransposedOf(comptime E: type, src: [*]const E, dst: [*]u16, args: ga.PackArgs) void {
+export fn transposeF32(src: [*]const f32, dst: [*]f32, args: ga.PackArgs) callconv(.nvptx_kernel) void {
+    transposeOf(f32, f32, src, dst, args);
+}
+
+// Transposes through a 32 x 32 shared tile into a zero-padded matrix; Src and Dst may each be f32 or bf16 (u16).
+inline fn transposeOf(comptime Src: type, comptime Dst: type, src: [*]const Src, dst: [*]Dst, args: ga.PackArgs) void {
     const tid: usize = @workItemId(0);
     const lane = tid % 32;
     const group = tid / 32;
@@ -1100,12 +1109,12 @@ inline fn packTransposedOf(comptime E: type, src: [*]const E, dst: [*]u16, args:
     inline for (0..4) |step| {
         const j = col_base + group + 8 * step;
         const i = row_base + lane;
-        transpose_tile.values[(group + 8 * step) * 33 + lane] = if (i < args.rows and j < args.cols) bf16.load(E, src, j * args.src_stride + i) else 0;
+        transpose_tile.values[(group + 8 * step) * 33 + lane] = if (i < args.rows and j < args.cols) bf16.load(Src, src, j * args.src_stride + i) else 0;
     }
     barrier();
     inline for (0..4) |step| {
         const i = row_base + group + 8 * step;
-        dst[i * args.cols_padded + col_base + lane] = bf16.encode(transpose_tile.values[lane * 33 + group + 8 * step]);
+        bf16.store(Dst, dst, i * args.cols_padded + col_base + lane, transpose_tile.values[lane * 33 + group + 8 * step]);
     }
 }
 
@@ -1804,6 +1813,16 @@ export fn convGemmWeightGradShort(dy_t: [*]const u16, x: [*]const u16, c: [*]f32
 }
 
 export fn packWeightsRotated(src: [*]const f32, dst: [*]u16, args: ga.RotateArgs) callconv(.nvptx_kernel) void {
+    rotateOf(u16, src, dst, args);
+}
+
+export fn rotateWeightsF32(src: [*]const f32, dst: [*]f32, args: ga.RotateArgs) callconv(.nvptx_kernel) void {
+    rotateOf(f32, src, dst, args);
+}
+
+// Rotates (k, k, c_in, c_out) weights by 180 degrees, swaps the channel roles and zero-pads; the source may be one group's
+// columns of a wider matrix (src_pitch and src_offset), and the destination f32 or bf16.
+inline fn rotateOf(comptime Dst: type, src: [*]const f32, dst: [*]Dst, args: ga.RotateArgs) void {
     const t = globalIndex();
     if (t >= @as(usize, args.rows_padded) * args.cols_padded) return;
     const i: u32 = @intCast(t / args.cols_padded);
@@ -1811,7 +1830,8 @@ export fn packWeightsRotated(src: [*]const f32, dst: [*]u16, args: ga.RotateArgs
     const tap = i / args.c_out;
     const co = i % args.c_out;
     const source_tap = (args.k - 1 - tap / args.k) * args.k + (args.k - 1 - tap % args.k);
-    dst[t] = if (j < args.c_in) bf16.encode(src[(source_tap * args.c_in + j) * args.c_out + co]) else 0;
+    const pitch = if (args.src_pitch != 0) args.src_pitch else args.c_out;
+    bf16.store(Dst, dst, t, if (j < args.c_in) src[args.src_offset + (source_tap * args.c_in + j) * pitch + co] else 0);
 }
 
 export fn weightsToKrsc(src: [*]const f32, dst: [*]f32, args: ga.LayoutArgs) callconv(.nvptx_kernel) void {
@@ -1932,34 +1952,4 @@ export fn convExactWeightGrad(dy_t: [*]const f32, x: [*]const f32, c: [*]f32, sh
 
 export fn convExactWeightGradShort(dy_t: [*]const f32, x: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
     tileGemm(.{ .tf32 = true, .exact = true, .rows = 64, .cols = 128, .mode = .gather_b }, dy_t, x, c, .{}, shape, geo);
-}
-
-export fn rotateWeightsF32(src: [*]const f32, dst: [*]f32, args: ga.RotateArgs) callconv(.nvptx_kernel) void {
-    const t = globalIndex();
-    if (t >= @as(usize, args.rows_padded) * args.cols_padded) return;
-    const i: u32 = @intCast(t / args.cols_padded);
-    const j: u32 = @intCast(t % args.cols_padded);
-    const tap = i / args.c_out;
-    const co = i % args.c_out;
-    const source_tap = (args.k - 1 - tap / args.k) * args.k + (args.k - 1 - tap % args.k);
-    const pitch = if (args.src_pitch != 0) args.src_pitch else args.c_out;
-    dst[t] = if (j < args.c_in) src[args.src_offset + (source_tap * args.c_in + j) * pitch + co] else 0;
-}
-
-export fn transposeF32(src: [*]const f32, dst: [*]f32, args: ga.PackArgs) callconv(.nvptx_kernel) void {
-    const tid: usize = @workItemId(0);
-    const lane = tid % 32;
-    const group = tid / 32;
-    const row_base = @as(usize, @workGroupId(1)) * 32;
-    const col_base = @as(usize, @workGroupId(0)) * 32;
-    inline for (0..4) |step| {
-        const j = col_base + group + 8 * step;
-        const i = row_base + lane;
-        transpose_tile.values[(group + 8 * step) * 33 + lane] = if (i < args.rows and j < args.cols) src[j * args.src_stride + i] else 0;
-    }
-    barrier();
-    inline for (0..4) |step| {
-        const i = row_base + group + 8 * step;
-        dst[i * args.cols_padded + col_base + lane] = transpose_tile.values[lane * 33 + group + 8 * step];
-    }
 }

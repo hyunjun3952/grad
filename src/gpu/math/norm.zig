@@ -1,4 +1,3 @@
-const std = @import("std");
 const bf16 = @import("bf16.zig");
 
 pub const eps: f32 = 1e-5;
@@ -68,36 +67,4 @@ pub inline fn gradInputQuad(comptime E: type, t: usize, io: GradIo(E), p: Affine
     if (l.flag & residual_flag != 0) bf16.storeQuad(E, io.dr, t, bf16.loadQuad(E, io.dr, t) + g);
     const dx = gamma * inv_std / n * (n * g - sum_dy - x_hat * sum_dyx);
     bf16.storeQuad(E, io.dx, t, if (l.flag & store_flag != 0) dx else bf16.loadQuad(E, io.dx, t) + dx);
-}
-
-pub fn stats(x: []const f32, st: Stats, c: usize, training: bool) void {
-    std.debug.assert(c <= max_channels);
-    if (!training) {
-        for (0..c) |ch| {
-            st.mean[ch] = st.running_mean[ch];
-            st.inv_std[ch] = 1 / @sqrt(st.running_var[ch] + eps);
-        }
-        return;
-    }
-    const rows = x.len / c;
-    const count: f64 = @floatFromInt(rows);
-    var sum: [max_channels]f64 = @splat(0);
-    for (0..rows) |r| {
-        for (0..c) |ch| sum[ch] += x[r * c + ch];
-    }
-    var square: [max_channels]f64 = @splat(0);
-    for (0..rows) |r| {
-        for (0..c) |ch| {
-            const d = x[r * c + ch] - sum[ch] / count;
-            square[ch] += d * d;
-        }
-    }
-    for (0..c) |ch| {
-        const mu: f32 = @floatCast(sum[ch] / count);
-        const variance: f32 = @floatCast(square[ch] / count);
-        st.mean[ch] = mu;
-        st.inv_std[ch] = 1 / @sqrt(variance + eps);
-        st.running_mean[ch] += momentum * (mu - st.running_mean[ch]);
-        st.running_var[ch] += momentum * (variance - st.running_var[ch]);
-    }
 }

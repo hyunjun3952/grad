@@ -31,13 +31,14 @@ pub inline fn backwardRow(comptime E: type, x: [*]const E, dy: [*]const E, dx: [
     }
 }
 
-pub inline fn parameterGradient(comptime E: type, x: [*]const E, dy: [*]const E, mean: [*]const f32, inv_std: [*]const f32, dgamma: ?[*]f32, dbeta: ?[*]f32, rows: usize, cols: usize, j: usize) void {
-    var g: f32 = 0;
-    var b: f32 = 0;
+// Adds the gradients of gamma and beta, summed over the rows. NOTE: rows are the outer loop so that x and dy are read
+// along their rows, which are contiguous; a column-by-column sum strides through memory by cols for every element.
+pub inline fn parameterGradients(comptime E: type, x: [*]const E, dy: [*]const E, mean: [*]const f32, inv_std: [*]const f32, dgamma: ?[*]f32, dbeta: ?[*]f32, rows: usize, cols: usize) void {
     for (0..rows) |r| {
-        g += bf16.load(E, dy, r * cols + j) * (bf16.load(E, x, r * cols + j) - mean[r]) * inv_std[r];
-        b += bf16.load(E, dy, r * cols + j);
+        for (0..cols) |j| {
+            const g = bf16.load(E, dy, r * cols + j);
+            if (dgamma) |out| out[j] += g * (bf16.load(E, x, r * cols + j) - mean[r]) * inv_std[r];
+            if (dbeta) |out| out[j] += g;
+        }
     }
-    if (dgamma) |out| out[j] += g;
-    if (dbeta) |out| out[j] += b;
 }

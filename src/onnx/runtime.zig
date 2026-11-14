@@ -106,32 +106,27 @@ pub const Node = struct {
     outputs: []const []const u8 = &.{},
     attributes: []const Attribute = &.{},
 
-    pub fn int(self: Node, name: []const u8, default: i64) i64 {
-        for (self.attributes) |a| {
-            if (std.mem.eql(u8, a.name, name)) return a.int;
+    fn attribute(self: Node, name: []const u8) ?*const Attribute {
+        for (self.attributes) |*a| {
+            if (std.mem.eql(u8, a.name, name)) return a;
         }
-        return default;
+        return null;
+    }
+
+    pub fn int(self: Node, name: []const u8, default: i64) i64 {
+        return (self.attribute(name) orelse return default).int;
     }
 
     pub fn float(self: Node, name: []const u8, default: f32) f32 {
-        for (self.attributes) |a| {
-            if (std.mem.eql(u8, a.name, name)) return a.float;
-        }
-        return default;
+        return (self.attribute(name) orelse return default).float;
     }
 
     pub fn text(self: Node, name: []const u8, default: []const u8) []const u8 {
-        for (self.attributes) |a| {
-            if (std.mem.eql(u8, a.name, name)) return a.text;
-        }
-        return default;
+        return (self.attribute(name) orelse return default).text;
     }
 
     pub fn ints(self: Node, name: []const u8) []const i64 {
-        for (self.attributes) |a| {
-            if (std.mem.eql(u8, a.name, name)) return a.ints;
-        }
-        return &.{};
+        return (self.attribute(name) orelse return &.{}).ints;
     }
 };
 
@@ -477,15 +472,20 @@ pub fn broadcast(a: Allocator, par: kernels.Parallel, x: Array, y: Array, compti
             oy += index[d] * sy[d];
         }
         v.* = f(x.data[ox], y.data[oy]);
-        var d = rank;
-        while (d > 0) {
-            d -= 1;
-            index[d] += 1;
-            if (index[d] < dims[d]) break;
-            index[d] = 0;
-        }
+        advance(index[0..rank], dims[0..rank]);
     }
     return out;
+}
+
+// Steps a row-major index over dims to the next position; after the last one it wraps to all zeros.
+fn advance(index: []usize, dims: []const usize) void {
+    var d = index.len;
+    while (d > 0) {
+        d -= 1;
+        index[d] += 1;
+        if (index[d] < dims[d]) return;
+        index[d] = 0;
+    }
 }
 
 pub fn plus(x: f32, y: f32) f32 {
@@ -597,7 +597,7 @@ pub fn execute(a: Allocator, par: kernels.Parallel, node: Node, values: *std.Str
         .Gelu => try map(a, par, try input(values, node, 0), geluTanh),
         .Sqrt => try map(a, par, try input(values, node, 0), sqrtf),
         .Identity, .Dropout => try input(values, node, 0),
-        .MatMul => try matmul(a, try input(values, node, 0), try input(values, node, 1)),
+        .MatMul => try matmul(a, par, try input(values, node, 0), try input(values, node, 1)),
         .Gemm => try gemm(a, par, node, try input(values, node, 0), try input(values, node, 1), maybeInput(values, node, 2)),
         .Conv => try convolve(a, par, node, try input(values, node, 0), try input(values, node, 1), maybeInput(values, node, 2)),
         .MaxPool, .AveragePool => try pool(a, par, node, try input(values, node, 0), kind == .MaxPool),
@@ -618,7 +618,7 @@ pub fn execute(a: Allocator, par: kernels.Parallel, node: Node, values: *std.Str
     return out;
 }
 
-fn matmul(a: Allocator, x: Array, y: Array) Error!Array {
+fn matmul(a: Allocator, par: kernels.Parallel, x: Array, y: Array) Error!Array {
     if (x.dims.len < 2 or y.dims.len < 2) return error.ShapeMismatch;
     const m = x.dims[x.dims.len - 2];
     const k = x.dims[x.dims.len - 1];
@@ -631,9 +631,13 @@ fn matmul(a: Allocator, x: Array, y: Array) Error!Array {
     @memcpy(dims[0 .. x.dims.len - 1], x.dims[0 .. x.dims.len - 1]);
     dims[x.dims.len - 1] = n;
     const out = try make(a, dims[0..x.dims.len]);
+    // NOTE: the tiled kernel splits the work over the pool but cannot take an empty product, which the vector kernel zero-fills.
+    const tiled = m != 0 and k != 0 and n != 0;
+    const work = try a.alloc(f32, if (tiled) kernels.matmulTiledWorkLen(f32, .{}, par, m, k, n) else 0);
     for (0..batch) |b| {
         const w = y.data[(if (weight_batch == 1) 0 else b) * k * n ..][0 .. k * n];
-        kernels.matmulVector(f32, .{ .m = m, .k = k, .n = n, .a = x.data[b * m * k ..][0 .. m * k], .b = w, .out = out.data[b * m * n ..][0 .. m * n] });
+        const problem: kernels.Problem(f32) = .{ .m = m, .k = k, .n = n, .a = x.data[b * m * k ..][0 .. m * k], .b = w, .out = out.data[b * m * n ..][0 .. m * n] };
+        if (tiled) kernels.matmulTiled(f32, .{}, par, problem, work) else kernels.matmulVector(f32, problem);
     }
     return out;
 }
@@ -649,7 +653,7 @@ fn gemm(a: Allocator, par: kernels.Parallel, node: Node, x: Array, y: Array, c: 
     const n = if (trans_b) y.dims[0] else y.dims[1];
     const lhs = if (trans_a) try transposed2d(a, x) else x;
     const rhs = if (trans_b) try transposed2d(a, y) else y;
-    const out = try matmul(a, .{ .dims = &.{ m, k }, .data = lhs.data }, .{ .dims = &.{ k, n }, .data = rhs.data });
+    const out = try matmul(a, par, .{ .dims = &.{ m, k }, .data = lhs.data }, .{ .dims = &.{ k, n }, .data = rhs.data });
     for (out.data) |*v| v.* *= alpha;
     if (c) |bias| {
         const scaled = try make(a, bias.dims);
@@ -1088,13 +1092,7 @@ pub fn transpose(a: Allocator, par: kernels.Parallel, node: Node, x: Array) Erro
         var offset: usize = 0;
         for (0..rank) |d| offset += index[d] * source_strides[perm[d]];
         v.* = x.data[offset];
-        var d = rank;
-        while (d > 0) {
-            d -= 1;
-            index[d] += 1;
-            if (index[d] < dims[d]) break;
-            index[d] = 0;
-        }
+        advance(index[0..rank], dims[0..rank]);
     }
     return out;
 }
@@ -1255,13 +1253,7 @@ fn slice(a: Allocator, x: Array, starts: Array, ends: Array, axes: ?Array, steps
         var offset: usize = 0;
         for (0..rank) |d| offset += (first[d] + index[d] * step[d]) * source_strides[d];
         v.* = x.data[offset];
-        var d = rank;
-        while (d > 0) {
-            d -= 1;
-            index[d] += 1;
-            if (index[d] < dims[d]) break;
-            index[d] = 0;
-        }
+        advance(index[0..rank], dims[0..rank]);
     }
     return out;
 }

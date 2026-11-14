@@ -43,7 +43,8 @@ pub const ColumnArgs = extern struct {
     scale: f32,
 };
 
-pub const ElementwiseArgs = extern struct { len: u32, multiply: u32, dims: [max_rank]u32, a_strides: [max_rank]u32, b_strides: [max_rank]u32 };
+/// Arguments of the elementwise kernel. A non-zero flat says that both operands are read in output order, which skips the index decoding.
+pub const ElementwiseArgs = extern struct { len: u32, multiply: u32, flat: u32, dims: [max_rank]u32, a_strides: [max_rank]u32, b_strides: [max_rank]u32 };
 
 pub const SumArgs = extern struct { out_len: u32, reduce_count: u32, mask: u32, accumulate: u32, dims: [max_rank]u32, strides: [max_rank]u32 };
 

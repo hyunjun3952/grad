@@ -34,7 +34,7 @@ fn tensorTable(params: anytype, comptime chunk: usize) ga.TensorTable {
 /// Sets the gradient of every parameter to zero.
 pub fn zeroGrad(par: kernels.Parallel, params: anytype) !void {
     if (par.gpu) |dev| {
-        inline for (0..comptime chunkCount(@TypeOf(params))) |chunk| try dev.zeroGrads(tensorTable(params, chunk));
+        inline for (0..comptime chunkCount(@TypeOf(params))) |chunk| try dev.updateTable(.zeroGrads, tensorTable(params, chunk), .{});
         return;
     }
     inline for (params) |p| {
@@ -51,7 +51,7 @@ pub fn zeroGrad(par: kernels.Parallel, params: anytype) !void {
 /// Takes one plain gradient descent step, w -= lr * grad, on every parameter.
 pub fn sgd(par: kernels.Parallel, lr: f32, params: anytype) !void {
     if (par.gpu) |dev| {
-        inline for (0..comptime chunkCount(@TypeOf(params))) |chunk| try dev.sgd(tensorTable(params, chunk), lr);
+        inline for (0..comptime chunkCount(@TypeOf(params))) |chunk| try dev.updateTable(.sgd, tensorTable(params, chunk), .{lr});
         return;
     }
     inline for (params) |p| {
@@ -145,7 +145,7 @@ pub const Adam = struct {
                     }
                     at += p.value.data.len;
                 }
-                try dev.adam(table, hyper);
+                try dev.updateTable(.adam, table, .{hyper});
             }
             return;
         }
@@ -275,7 +275,7 @@ pub const Ema = struct {
                     table.w[i] = @intFromPtr(self.live[first + i].ptr);
                     table.g[i] = @intFromPtr(self.shadow[first + i].ptr);
                 }
-                if (op == .average) try dev.ema(table, decay) else try dev.swapWeights(table);
+                if (op == .average) try dev.updateTable(.ema, table, .{decay}) else try dev.updateTable(.swapWeights, table, .{});
             }
             return;
         }

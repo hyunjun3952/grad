@@ -33,6 +33,47 @@ test "device memory round trip, fill, and the step arena" {
     try testing.expectError(error.OutOfMemory, gpu.scratch(u8, 1 << 30));
 }
 
+test "elementwise gives the same result on the flat path (equal shapes) and the strided path (broadcast, permuted)" {
+    const gpu = try Gpu.forTest(1 << 20);
+    defer gpu.deinit();
+    const rows = 5;
+    const cols = 7;
+    var a: [rows * cols]f32 = undefined;
+    var b: [rows * cols]f32 = undefined;
+    for (&a, &b, 0..) |*x, *y, i| {
+        x.* = @floatFromInt(i + 1);
+        y.* = @as(f32, @floatFromInt(i % 5)) * 0.5 - 1;
+    }
+    const da = try gpu.alloc(f32, a.len);
+    const db = try gpu.alloc(f32, b.len);
+    const dout = try gpu.alloc(f32, a.len);
+    try gpu.upload(da, &a);
+    try gpu.upload(db, &b);
+    var got: [rows * cols]f32 = undefined;
+
+    const dims: [6]u32 = .{ 1, 1, 1, 1, rows, cols };
+    const same: [6]u32 = .{ 0, 0, 0, 0, cols, 1 };
+    try gpu.elementwise(.add, da, db, dout, .{ .dims = dims, .a_strides = same, .b_strides = same });
+    try gpu.download(&got, dout);
+    for (got, a, b) |g, x, y| try testing.expectEqual(x + y, g);
+    try gpu.elementwise(.mul, da, db, dout, .{ .dims = dims, .a_strides = same, .b_strides = same });
+    try gpu.download(&got, dout);
+    for (got, a, b) |g, x, y| try testing.expectEqual(x * y, g);
+
+    // The second operand is a row vector repeated down the rows, the first is read column by column (a transposed view).
+    const row: [6]u32 = .{ 0, 0, 0, 0, 0, 1 };
+    try gpu.elementwise(.add, da, db, dout, .{ .dims = dims, .a_strides = same, .b_strides = row });
+    try gpu.download(&got, dout);
+    for (0..rows) |r| {
+        for (0..cols) |c| try testing.expectEqual(a[r * cols + c] + b[c], got[r * cols + c]);
+    }
+    try gpu.elementwise(.add, da, db, dout, .{ .dims = .{ 1, 1, 1, 1, cols, rows }, .a_strides = .{ 0, 0, 0, 0, 1, cols }, .b_strides = .{ 0, 0, 0, 0, rows, 1 } });
+    try gpu.download(&got, dout);
+    for (0..cols) |c| {
+        for (0..rows) |r| try testing.expectEqual(a[r * cols + c] + b[c * rows + r], got[c * rows + r]);
+    }
+}
+
 test "creating and destroying a Gpu returns all the device memory it took, including the kernel module" {
     // The probe keeps the primary context alive and measures the free memory; its own share stays constant.
     const probe = try Gpu.forTest(1 << 20);

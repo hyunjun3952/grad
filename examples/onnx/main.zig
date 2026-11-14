@@ -68,12 +68,7 @@ fn run(init: std.process.Init) !void {
         const scores = result.outputs[0].data;
         const classes = scores.len / n;
         for (0..n) |row| {
-            const row_scores = scores[row * classes ..][0..classes];
-            var best: usize = 0;
-            for (row_scores, 0..) |s, j| {
-                if (s > row_scores[best]) best = j;
-            }
-            correct += @intFromBool(best == data.labels[done + row]);
+            correct += @intFromBool(grad.trainer.argmax(scores[row * classes ..][0..classes]) == data.labels[done + row]);
         }
         if (done == 0) {
             try out.writeAll("logits of image 0:");

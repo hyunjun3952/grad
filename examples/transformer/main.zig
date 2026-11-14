@@ -37,23 +37,6 @@ fn forward(model: Net, tape: *Tape, comptime n: usize, tokens: []const u32, posi
     return head.forward(tape, try final_norm.forward(tape, mixed));
 }
 
-fn sample(rng: std.Random, logits: []const f32, temperature: f32) u8 {
-    var largest: f32 = -std.math.inf(f32);
-    for (logits) |l| largest = @max(largest, l);
-    var weights: [vocab]f32 = undefined;
-    var total: f32 = 0;
-    for (logits, &weights) |l, *w| {
-        w.* = @exp((l - largest) / temperature);
-        total += w.*;
-    }
-    var pick = rng.float(f32) * total;
-    for (weights, 0..) |w, i| {
-        pick -= w;
-        if (pick <= 0) return @intCast(i);
-    }
-    return vocab - 1;
-}
-
 // Writes length characters after seed_text. Every batch row holds the same window, because the model works on whole batches.
 // NOTE: attention is causal, so the scores at the last filled position do not depend on the padding after it.
 fn generate(par: grad.kernels.Parallel, gpa: std.mem.Allocator, model: Net, rng: std.Random, out: *std.Io.Writer, seed_text: []const u8, length: usize) !void {
@@ -93,7 +76,7 @@ fn generate(par: grad.kernels.Parallel, gpa: std.mem.Allocator, model: Net, rng:
         var tape: Tape = .{ .gpa = arena.allocator(), .par = par };
         const scores = try tape.cast(try forward(model, &tape, rows, tokens, positions), f32);
         try par.download(logits, scores.value.data);
-        const next = sample(rng, logits[(filled - 1) * vocab ..][0..vocab], 0.8);
+        const next: u8 = @intCast(grad.trainer.sample(rng, logits[(filled - 1) * vocab ..][0..vocab], 0.8));
         try out.writeByte(next);
         if (filled == context) {
             std.mem.copyForwards(u8, window[0 .. context - 1], window[1..]);

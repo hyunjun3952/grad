@@ -473,7 +473,7 @@ fn implicitGemm(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
             const ns = if (variant == 0)
                 try measureGpu(io, dev, grad.gpu.Gpu.convImplicitForward, .{ dev, x_half, w_half, y, geo, false })
             else
-                try measureGpu(io, dev, grad.gpu.Gpu.convImplicitWeightGrad, .{ dev, dy_half, x_half, dw, geo });
+                try measureGpu(io, dev, grad.gpu.Gpu.convImplicitWeightGrad, .{ dev, dy_half, x_half, dw, geo, null });
             tflops[variant] = flops * 20 / ns / 1000;
         }
         const positions_padded = grad.gpu.padTo(rows, .depth);
