@@ -313,6 +313,11 @@ pub const Gpu = struct {
         self.capturing = false;
         self.cu = try cuda.Cuda.open(config.device);
         errdefer self.cu.close();
+        // NOTE: declared after the close errdefer, so on a failure the allocations are freed while the module is still loaded.
+        errdefer {
+            for (self.owned.items) |ptr| self.cu.free(ptr);
+            self.owned.deinit(gpa);
+        }
         self.multiprocessors = try self.cu.multiprocessorCount();
 
         const module = try self.cu.loadModule(gpa, ptx);
@@ -320,10 +325,12 @@ pub const Gpu = struct {
             self.fns[i] = try self.cu.getFunction(module, @tagName(@as(Kernel, @fromBackingInt(@intCast(i)))));
         }
         self.step_base = try self.cu.alloc(step_bytes);
+        errdefer self.cu.free(self.step_base);
         self.step_size = step_bytes;
         self.step_used = 0;
         self.zero_size = std.mem.alignForward(usize, config.zero_bytes orelse step_bytes / 4, 256);
         self.zero_base = try self.cu.alloc(self.zero_size);
+        errdefer self.cu.free(self.zero_base);
         self.zero_used = 0;
         self.step_peak = 0;
         self.zero_peak = 0;
@@ -350,6 +357,11 @@ pub const Gpu = struct {
     /// Returns how many CUDA devices are installed (zero without a driver).
     pub fn deviceCount() usize {
         return cuda.Cuda.deviceCount();
+    }
+
+    /// Returns how many bytes of device memory are free right now, counting every process on the device.
+    pub fn freeDeviceBytes(self: *Gpu) Error!usize {
+        return self.cu.freeBytes();
     }
 
     /// Makes this device current on the calling thread, which a thread must do once before it uses a Gpu created elsewhere.

@@ -33,6 +33,21 @@ test "device memory round trip, fill, and the step arena" {
     try testing.expectError(error.OutOfMemory, gpu.scratch(u8, 1 << 30));
 }
 
+test "creating and destroying a Gpu returns all the device memory it took, including the kernel module" {
+    // The probe keeps the primary context alive and measures the free memory; its own share stays constant.
+    const probe = try Gpu.forTest(1 << 20);
+    defer probe.deinit();
+    // One cycle first: the driver may create internal buffers lazily on the first module load and keep them.
+    (try Gpu.forTest(1 << 20)).deinit();
+    const before = try probe.freeDeviceBytes();
+    const cycles = 8;
+    for (0..cycles) |_| (try Gpu.forTest(1 << 20)).deinit();
+    const after = try probe.freeDeviceBytes();
+    // NOTE: other processes share the device, so a small drop is tolerated; a module left behind per cycle adds up to more.
+    const tolerance = 4 << 20;
+    try testing.expect(before -| after <= tolerance);
+}
+
 test "deterministic mode gives bit-identical results on every run, for split-K products and batch-norm statistics" {
     const gpu = try Gpu.forTest(16 << 20);
     defer gpu.deinit();
