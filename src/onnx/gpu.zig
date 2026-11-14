@@ -34,11 +34,7 @@ const Value = struct {
 
 const Values = std.StringHashMap(Value);
 
-fn product(dims: []const usize) usize {
-    var n: usize = 1;
-    for (dims) |d| n *= d;
-    return n;
-}
+const product = runtime.product;
 
 // ***** shapes and strides *****
 
@@ -116,9 +112,12 @@ fn convParams(node: Node, weights: []const usize) ?ConvParams {
     if (runtime.pair(strides, 0, 1) != runtime.pair(strides, 1, 1)) return null;
     if (runtime.pair(dilations, 0, 1) != runtime.pair(dilations, 1, 1)) return null;
     if (!runtime.padsAreUniform(node)) return null;
-    const groups: usize = @intCast(node.int("group", 1));
+    const groups = std.math.cast(usize, node.int("group", 1)) orelse return null;
     if (groups == 0 or weights[0] % groups != 0) return null;
-    return .{ .k = weights[2], .stride = runtime.pair(strides, 0, 1), .pad = runtime.pair(node.ints("pads"), 0, 0), .dilation = runtime.pair(dilations, 0, 1), .groups = groups };
+    const p: ConvParams = .{ .k = weights[2], .stride = runtime.pair(strides, 0, 1), .pad = runtime.pair(node.ints("pads"), 0, 0), .dilation = runtime.pair(dilations, 0, 1), .groups = groups };
+    // A zero kernel, stride or dilation is a malformed model; the host path reports it.
+    if (p.k == 0 or p.stride == 0 or p.dilation == 0) return null;
+    return p;
 }
 
 const PoolParams = struct { k: usize, stride: usize, pad: usize };
@@ -129,11 +128,9 @@ fn poolParams(node: Node) ?PoolParams {
     const strides = node.ints("strides");
     if (runtime.pair(strides, 0, 1) != runtime.pair(strides, 1, 1)) return null;
     if (!runtime.padsAreUniform(node) or node.int("ceil_mode", 0) != 0) return null;
-    return .{ .k = @intCast(kernel[0]), .stride = runtime.pair(strides, 0, 1), .pad = runtime.pair(node.ints("pads"), 0, 0) };
-}
-
-fn normalizeAxis(axis: i64, rank: usize) usize {
-    return @intCast(if (axis < 0) axis + @as(i64, @intCast(rank)) else axis);
+    const p: PoolParams = .{ .k = runtime.pair(kernel, 0, 1), .stride = runtime.pair(strides, 0, 1), .pad = runtime.pair(node.ints("pads"), 0, 0) };
+    if (p.k == 0 or p.stride == 0) return null;
+    return p;
 }
 
 // ***** executor *****
@@ -187,6 +184,7 @@ pub const Executor = struct {
             const array = entry.value_ptr.*;
             try values.put(entry.key_ptr.*, .{ .dims = array.dims, .host = array.data, .ints = array.ints, .constant = entry.key_ptr.* });
         }
+        try runtime.checkFeeds(feeds);
         for (feeds) |feed| try values.put(feed.name, .{ .dims = feed.dims, .host = @constCast(feed.data) });
         for (self.model.inputs) |name| {
             if (!values.contains(name)) return error.MissingInput;
@@ -381,8 +379,7 @@ pub const Executor = struct {
     fn flatten(self: *Executor, a: Allocator, values: *Values, node: Node) Error!?Value {
         _ = self;
         var x = values.get(node.inputs[0]) orelse return error.MissingInput;
-        const axis = normalizeAxis(node.int("axis", 1), x.dims.len);
-        x.dims = try a.dupe(usize, &.{ product(x.dims[0..axis]), product(x.dims[axis..]) });
+        x.dims = try a.dupe(usize, &(try runtime.flattenDims(x.dims, node.int("axis", 1))));
         return x;
     }
 
@@ -415,9 +412,8 @@ pub const Executor = struct {
 
     fn transpose(self: *Executor, a: Allocator, values: *Values, node: Node) Error!?Value {
         const x = try self.devInput(values, node, 0);
-        const given = node.ints("perm");
         const perm = try a.alloc(usize, x.dims.len);
-        for (perm, 0..) |*p, i| p.* = if (given.len == x.dims.len) @intCast(given[i]) else x.dims.len - 1 - i;
+        try runtime.permutationOf(node, perm);
         return self.permuted(a, x, perm);
     }
 
@@ -451,7 +447,7 @@ pub const Executor = struct {
     fn concat(self: *Executor, a: Allocator, values: *Values, node: Node) Error!?Value {
         const first = try self.devInput(values, node, 0);
         if (first.dims.len == 0) return null;
-        const axis = normalizeAxis(node.int("axis", 0), first.dims.len);
+        const axis = try runtime.normalizeAxis(node.int("axis", 0), first.dims.len);
         var total: usize = 0;
         for (0..node.inputs.len) |i| {
             const part = try self.devInput(values, node, i);
@@ -653,7 +649,7 @@ pub const Executor = struct {
 
     fn softmax(self: *Executor, a: Allocator, values: *Values, node: Node) Error!?Value {
         const x = try self.devInput(values, node, 0);
-        if (x.dims.len == 0 or normalizeAxis(node.int("axis", -1), x.dims.len) != x.dims.len - 1) return null;
+        if (x.dims.len == 0 or (runtime.normalizeAxis(node.int("axis", -1), x.dims.len) catch return null) != x.dims.len - 1) return null;
         const out = try self.newValue(a, x.dims);
         try self.gpu.softmax(x.dev.?, out.dev.?, x.dims[x.dims.len - 1], 0, 1);
         return out;
@@ -661,10 +657,11 @@ pub const Executor = struct {
 
     fn layerNorm(self: *Executor, a: Allocator, values: *Values, node: Node) Error!?Value {
         const x = try self.devInput(values, node, 0);
-        if (x.dims.len == 0 or normalizeAxis(node.int("axis", -1), x.dims.len) != x.dims.len - 1) return null;
+        if (x.dims.len == 0 or (runtime.normalizeAxis(node.int("axis", -1), x.dims.len) catch return null) != x.dims.len - 1) return null;
         // NOTE: the device kernel has the engine's epsilon built in.
         if (@abs(node.float("epsilon", 1e-5) - 1e-5) > 1e-9) return null;
         const cols = x.dims[x.dims.len - 1];
+        if (cols == 0) return null;
         const scale = try self.devInput(values, node, 1);
         if (scale.len() != cols) return null;
         const beta = if (hasInput(node, 2)) (try self.devInput(values, node, 2)).dev.? else try self.zeros(node.outputs[0], cols);

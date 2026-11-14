@@ -520,3 +520,186 @@ test "Gather accepts negative indices and a malformed model is rejected instead 
     huge_length[10] = 0x01;
     try testing.expectError(error.BadModel, Model.parse(gpa, &huge_length));
 }
+
+// ***** malformed models *****
+
+const Bytes = std.ArrayList(u8);
+
+fn putVarint(list: *Bytes, gpa: std.mem.Allocator, value: u64) !void {
+    var v = value;
+    while (v >= 0x80) : (v >>= 7) try list.append(gpa, @as(u8, @truncate(v)) | 0x80);
+    try list.append(gpa, @truncate(v));
+}
+
+fn putInt(list: *Bytes, gpa: std.mem.Allocator, number: u64, value: u64) !void {
+    try putVarint(list, gpa, number << 3);
+    try putVarint(list, gpa, value);
+}
+
+fn putBytes(list: *Bytes, gpa: std.mem.Allocator, number: u64, payload: []const u8) !void {
+    try putVarint(list, gpa, number << 3 | 2);
+    try putVarint(list, gpa, payload.len);
+    try list.appendSlice(gpa, payload);
+}
+
+// A model with one Relu node and one float initializer named w with the given dims and raw_len bytes of data.
+fn modelWithInitializer(gpa: std.mem.Allocator, dims: []const u64, raw_len: usize) ![]u8 {
+    var tensor: Bytes = .empty;
+    defer tensor.deinit(gpa);
+    for (dims) |d| try putInt(&tensor, gpa, 1, d);
+    try putInt(&tensor, gpa, 2, 1);
+    try putBytes(&tensor, gpa, 8, "w");
+    const blank: [64]u8 = @splat(0);
+    try putBytes(&tensor, gpa, 9, blank[0..raw_len]);
+
+    var node: Bytes = .empty;
+    defer node.deinit(gpa);
+    try putBytes(&node, gpa, 1, "x");
+    try putBytes(&node, gpa, 2, "y");
+    try putBytes(&node, gpa, 4, "Relu");
+
+    var graph: Bytes = .empty;
+    defer graph.deinit(gpa);
+    try putBytes(&graph, gpa, 1, node.items);
+    try putBytes(&graph, gpa, 5, tensor.items);
+
+    var model: Bytes = .empty;
+    errdefer model.deinit(gpa);
+    try putBytes(&model, gpa, 7, graph.items);
+    return model.toOwnedSlice(gpa);
+}
+
+fn expectBadInitializer(dims: []const u64, raw_len: usize) !void {
+    const gpa = testing.allocator;
+    const bytes = try modelWithInitializer(gpa, dims, raw_len);
+    defer gpa.free(bytes);
+    try testing.expectError(error.BadModel, Model.parse(gpa, bytes));
+}
+
+test "a model with a malformed initializer is rejected, and the same model with valid dims loads" {
+    const gpa = testing.allocator;
+    // The control: without it every rejection below could come from a broken encoder.
+    const good = try modelWithInitializer(gpa, &.{2}, 8);
+    defer gpa.free(good);
+    var model = try Model.parse(gpa, good);
+    defer model.deinit();
+    try testing.expectEqualSlices(usize, &.{2}, model.initializers.get("w").?.dims);
+
+    try expectBadInitializer(&.{std.math.maxInt(u64)}, 8);
+    try expectBadInitializer(&.{ 1 << 40, 1 << 40 }, 8);
+    try expectBadInitializer(&.{ 1, 1, 1, 1, 1, 1, 1, 1, 1 }, 4);
+    try expectBadInitializer(&.{1 << 30}, 0);
+}
+
+test "a field number that does not fit 32 bits is rejected" {
+    var bytes: Bytes = .empty;
+    defer bytes.deinit(testing.allocator);
+    try putInt(&bytes, testing.allocator, 1 << 40, 0);
+    try testing.expectError(error.BadModel, Model.parse(testing.allocator, bytes.items));
+}
+
+var scratch_values: [64]f32 = @splat(0);
+
+fn expectNodeError(expected: anyerror, node: lib.onnx_runtime.Node, operands: []const Array) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var values = std.StringHashMap(Array).init(a);
+    const names = [_][]const u8{ "i0", "i1", "i2", "i3", "i4" };
+    for (operands, 0..) |operand, i| try values.put(names[i], operand);
+    try testing.expectError(expected, lib.onnx_runtime.execute(a, .{}, node, &values));
+}
+
+fn zeros(dims: []const usize) Array {
+    var n: usize = 1;
+    for (dims) |d| n *= d;
+    return .{ .dims = dims, .data = scratch_values[0..n] };
+}
+
+fn shapeOf(ints: []const i64) Array {
+    return .{ .dims = &.{ints.len}, .data = scratch_values[0..ints.len], .ints = ints };
+}
+
+const names_2 = [_][]const u8{ "i0", "i1" };
+const names_5 = [_][]const u8{ "i0", "i1", "i2", "i3", "i4" };
+
+test "operators reject shapes and attributes that would read out of bounds" {
+    const mismatch = error.ShapeMismatch;
+    const one_nine = [_]usize{ 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+    try expectNodeError(mismatch, .{ .op = "Gemm", .inputs = names_2[0..2] }, &.{ zeros(&.{4}), zeros(&.{ 4, 2 }) });
+    try expectNodeError(mismatch, .{ .op = "BatchNormalization", .inputs = names_5[0..5] }, &.{ zeros(&.{ 1, 3, 2 }), zeros(&.{1}), zeros(&.{3}), zeros(&.{3}), zeros(&.{3}) });
+    try expectNodeError(mismatch, .{ .op = "BatchNormalization", .inputs = names_5[0..5] }, &.{ zeros(&.{4}), zeros(&.{1}), zeros(&.{1}), zeros(&.{1}), zeros(&.{1}) });
+    try expectNodeError(mismatch, .{ .op = "GlobalAveragePool", .inputs = names_2[0..1] }, &.{zeros(&.{4})});
+    try expectNodeError(mismatch, .{ .op = "Concat", .inputs = names_2[0..2], .attributes = &.{.{ .name = "axis", .int = 0 }} }, &.{ zeros(&.{ 2, 3 }), zeros(&.{ 2, 4 }) });
+    try expectNodeError(mismatch, .{ .op = "Concat", .inputs = names_2[0..2], .attributes = &.{.{ .name = "axis", .int = 0 }} }, &.{ zeros(&.{ 2, 3 }), zeros(&.{3}) });
+    try expectNodeError(mismatch, .{ .op = "Softmax", .inputs = names_2[0..1], .attributes = &.{.{ .name = "axis", .int = 5 }} }, &.{zeros(&.{ 2, 3 })});
+    try expectNodeError(mismatch, .{ .op = "Flatten", .inputs = names_2[0..1], .attributes = &.{.{ .name = "axis", .int = 5 }} }, &.{zeros(&.{ 2, 3 })});
+    try expectNodeError(mismatch, .{ .op = "Reshape", .inputs = names_2[0..2] }, &.{ zeros(&.{ 2, 3 }), shapeOf(&.{ 0, 0, 0 }) });
+    try expectNodeError(mismatch, .{ .op = "Reshape", .inputs = names_2[0..2] }, &.{ zeros(&.{ 2, 3 }), shapeOf(&.{ -1, -1 }) });
+    try expectNodeError(mismatch, .{ .op = "Reshape", .inputs = names_2[0..2] }, &.{ zeros(&.{ 2, 3 }), shapeOf(&.{ -2, 3 }) });
+    try expectNodeError(mismatch, .{ .op = "Reshape", .inputs = names_2[0..2] }, &.{ zeros(&.{ 2, 3 }), shapeOf(&.{ 0, -1, 0 }) });
+    try expectNodeError(mismatch, .{ .op = "Transpose", .inputs = names_2[0..1], .attributes = &.{.{ .name = "perm", .ints = &.{ 0, 0 } }} }, &.{zeros(&.{ 2, 3 })});
+    try expectNodeError(mismatch, .{ .op = "Transpose", .inputs = names_2[0..1], .attributes = &.{.{ .name = "perm", .ints = &.{ -1, 0 } }} }, &.{zeros(&.{ 2, 3 })});
+    try expectNodeError(mismatch, .{ .op = "Transpose", .inputs = names_2[0..1], .attributes = &.{.{ .name = "perm", .ints = &.{0} }} }, &.{zeros(&.{ 2, 3 })});
+    try expectNodeError(mismatch, .{ .op = "Conv", .inputs = names_2[0..2], .attributes = &.{.{ .name = "group", .int = 0 }} }, &.{ zeros(&.{ 1, 1, 3, 3 }), zeros(&.{ 1, 1, 1, 1 }) });
+    try expectNodeError(mismatch, .{ .op = "Conv", .inputs = names_2[0..2], .attributes = &.{.{ .name = "group", .int = -1 }} }, &.{ zeros(&.{ 1, 1, 3, 3 }), zeros(&.{ 1, 1, 1, 1 }) });
+    try expectNodeError(mismatch, .{ .op = "Conv", .inputs = names_2[0..2], .attributes = &.{.{ .name = "strides", .ints = &.{ 0, 0 } }} }, &.{ zeros(&.{ 1, 1, 3, 3 }), zeros(&.{ 1, 1, 1, 1 }) });
+    try expectNodeError(mismatch, .{ .op = "Conv", .inputs = names_2[0..2], .attributes = &.{.{ .name = "dilations", .ints = &.{ -1, -1 } }} }, &.{ zeros(&.{ 1, 1, 3, 3 }), zeros(&.{ 1, 1, 1, 1 }) });
+    try expectNodeError(mismatch, .{ .op = "MaxPool", .inputs = names_2[0..1], .attributes = &.{.{ .name = "strides", .ints = &.{ 0, 0 } }} }, &.{zeros(&.{ 1, 1, 3, 3 })});
+    try expectNodeError(mismatch, .{ .op = "Add", .inputs = names_2[0..2] }, &.{ zeros(&one_nine), zeros(&one_nine) });
+}
+
+test "Gather rejects an index that is not a usable integer" {
+    var table = [_]f32{ 1, 2, 3, 4 };
+    var nan = [_]f32{std.math.nan(f32)};
+    var huge = [_]f32{1e30};
+    const data: Array = .{ .dims = &.{ 2, 2 }, .data = &table };
+    const node: lib.onnx_runtime.Node = .{ .op = "Gather", .inputs = names_2[0..2] };
+    try expectNodeError(error.ShapeMismatch, node, &.{ data, .{ .dims = &.{1}, .data = &nan } });
+    try expectNodeError(error.ShapeMismatch, node, &.{ data, .{ .dims = &.{1}, .data = &huge } });
+}
+
+test "Slice reads only integer bounds of matching lengths, and a huge step does not overflow" {
+    const x = zeros(&.{5});
+    const node: lib.onnx_runtime.Node = .{ .op = "Slice", .inputs = names_5[0..4] };
+    // Bounds that are floats (no integer view) would cut nothing and pass silently.
+    try expectNodeError(error.UnsupportedOp, .{ .op = "Slice", .inputs = names_5[0..3] }, &.{ x, zeros(&.{1}), shapeOf(&.{3}) });
+    // Two starts but one axis would read the axes list out of bounds.
+    try expectNodeError(error.ShapeMismatch, node, &.{ zeros(&.{ 5, 5 }), shapeOf(&.{ 0, 0 }), shapeOf(&.{ 1, 1 }), shapeOf(&.{0}) });
+    try expectNodeError(error.ShapeMismatch, node, &.{ zeros(&.{ 5, 5 }), shapeOf(&.{0}), shapeOf(&.{ 1, 1 }), shapeOf(&.{0}) });
+    try expectNodeError(error.ShapeMismatch, node, &.{ x, shapeOf(&.{0}), shapeOf(&.{3}), shapeOf(&.{7}) });
+
+    const cut = try lib.onnx_runtime.cutOf(&.{5}, shapeOf(&.{0}), shapeOf(&.{5}), null, shapeOf(&.{std.math.maxInt(i64)}));
+    try testing.expectEqual(@as(usize, 1), cut.dims[0]);
+}
+
+test "run rejects a feed whose data does not match its dims" {
+    const gpa = testing.allocator;
+    const nodes = [_]lib.onnx_runtime.Node{.{ .op = "Relu", .inputs = &.{"x"}, .outputs = &.{"y"} }};
+    var model: Model = .{ .arena = .init(gpa), .nodes = &nodes, .initializers = .init(gpa), .inputs = &.{"x"}, .outputs = &.{"y"} };
+    defer model.deinit();
+    const data = [_]f32{ 1, 2, 3 };
+    try testing.expectError(error.ShapeMismatch, model.run(gpa, .{}, &.{.{ .name = "x", .dims = &.{ 2, 2 }, .data = &data }}));
+    try testing.expectError(error.ShapeMismatch, model.run(gpa, .{}, &.{.{ .name = "x", .dims = &.{ 1, 1, 1, 1, 1, 1, 1, 1, 3 }, .data = &data }}));
+    var result = try model.run(gpa, .{}, &.{.{ .name = "x", .dims = &.{3}, .data = &data }});
+    defer result.deinit();
+    try testing.expectEqualSlices(f32, &data, result.outputs[0].data);
+}
+
+test "Model.load reads a model file into the model arena" {
+    const gpa = testing.allocator;
+    const path = ".zig-cache/runtime-load-test.onnx";
+    defer std.Io.Dir.cwd().deleteFile(testing.io, path) catch {};
+    const bytes = try modelWithInitializer(gpa, &.{2}, 8);
+    defer gpa.free(bytes);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = bytes });
+    var model = try Model.load(gpa, testing.io, path);
+    defer model.deinit();
+    try testing.expectEqualStrings("Relu", model.nodes[0].op);
+    try testing.expectEqualSlices(usize, &.{2}, model.initializers.get("w").?.dims);
+
+    const broken = try modelWithInitializer(gpa, &.{std.math.maxInt(u64)}, 8);
+    defer gpa.free(broken);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = broken });
+    try testing.expectError(error.BadModel, Model.load(gpa, testing.io, path));
+}

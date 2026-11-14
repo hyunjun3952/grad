@@ -27,6 +27,8 @@ pub const Library = struct {
 
     pub fn open(names: Names, dir: ?[:0]const u8) error{LibraryNotFound}!Library {
         if (windows) {
+            // NOTE: the directory stays in the process search path on purpose; cuDNN loads its engine DLLs from it on the first
+            // convolution, long after this call, so resetting it here would break that load.
             if (dir) |d| _ = win.SetDllDirectoryA(d.ptr);
             return .{ .handle = win.LoadLibraryA(names.windows.ptr) orelse return error.LibraryNotFound };
         }

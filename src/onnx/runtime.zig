@@ -18,10 +18,29 @@ pub const Array = struct {
     }
 };
 
-fn product(dims: []const usize) usize {
+/// Number of elements of a tensor with these dims. Dims that come from a file or a caller go through checkedProduct first.
+pub fn product(dims: []const usize) usize {
     var n: usize = 1;
     for (dims) |d| n *= d;
     return n;
+}
+
+/// Same as product, but null when the count does not fit in usize.
+pub fn checkedProduct(dims: []const usize) ?usize {
+    var n: usize = 1;
+    for (dims) |d| n = std.math.mul(usize, n, d) catch return null;
+    return n;
+}
+
+/// Most axes a tensor may have in the runtime; the stride and index tables of the elementwise ops are this long.
+pub const max_rank = 8;
+
+/// Checks that every feed has at most max_rank axes and as many values as its dims say.
+pub fn checkFeeds(feeds: []const Model.Feed) Error!void {
+    for (feeds) |feed| {
+        if (feed.dims.len > max_rank) return error.ShapeMismatch;
+        if ((checkedProduct(feed.dims) orelse return error.ShapeMismatch) != feed.data.len) return error.ShapeMismatch;
+    }
 }
 
 const Field = struct { number: u32, wire: u3, varint: u64 = 0, bytes: []const u8 = &.{} };
@@ -47,7 +66,7 @@ const Reader = struct {
     fn next(self: *Reader) Error!?Field {
         if (self.at >= self.bytes.len) return null;
         const key = try self.varint();
-        var field: Field = .{ .number = @intCast(key >> 3), .wire = @intCast(key & 7) };
+        var field: Field = .{ .number = std.math.cast(u32, key >> 3) orelse return error.BadModel, .wire = @intCast(key & 7) };
         switch (field.wire) {
             0 => field.varint = try self.varint(),
             1 => {
@@ -128,17 +147,31 @@ pub const Model = struct {
         self.arena.deinit();
     }
 
+    /// Reads and parses a model file. The bytes are read straight into the model arena, because the names in the graph point into them.
     pub fn load(gpa: Allocator, io: Io, path: []const u8) !Model {
-        const bytes = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 31));
-        defer gpa.free(bytes);
-        return parse(gpa, bytes);
+        var model = empty(gpa);
+        errdefer model.deinit();
+        const bytes = try Io.Dir.cwd().readFileAlloc(io, path, model.arena.allocator(), .limited(1 << 31));
+        try model.fill(bytes);
+        return model;
     }
 
+    /// Parses a model from bytes the caller keeps; they are copied into the model arena.
     pub fn parse(gpa: Allocator, bytes: []const u8) Error!Model {
-        var model: Model = .{ .arena = .init(gpa), .nodes = &.{}, .initializers = .init(gpa), .inputs = &.{}, .outputs = &.{} };
+        var model = empty(gpa);
         errdefer model.deinit();
+        try model.fill(try model.arena.allocator().dupe(u8, bytes));
+        return model;
+    }
+
+    fn empty(gpa: Allocator) Model {
+        return .{ .arena = .init(gpa), .nodes = &.{}, .initializers = .init(gpa), .inputs = &.{}, .outputs = &.{} };
+    }
+
+    // The bytes must live in the arena of the model, since nodes and names keep slices of them.
+    fn fill(model: *Model, bytes: []const u8) Error!void {
         const a = model.arena.allocator();
-        var top: Reader = .{ .bytes = try a.dupe(u8, bytes) };
+        var top: Reader = .{ .bytes = bytes };
         while (try top.next()) |field| {
             if (field.number != 7) continue;
             var nodes: std.ArrayList(Node) = .empty;
@@ -164,7 +197,6 @@ pub const Model = struct {
             model.outputs = try outputs.toOwnedSlice(a);
         }
         if (model.nodes.len == 0) return error.BadModel;
-        return model;
     }
 
     pub const Feed = struct { name: []const u8, dims: []const usize, data: []const f32 };
@@ -185,6 +217,7 @@ pub const Model = struct {
         var values = std.StringHashMap(Array).init(a);
         var it = self.initializers.iterator();
         while (it.next()) |entry| try values.put(entry.key_ptr.*, entry.value_ptr.*);
+        try checkFeeds(feeds);
         for (feeds) |feed| try values.put(feed.name, .{ .dims = feed.dims, .data = @constCast(feed.data) });
         for (self.inputs) |name| {
             if (!values.contains(name)) return error.MissingInput;
@@ -326,9 +359,15 @@ fn parseTensor(a: Allocator, bytes: []const u8) Error!struct { name: []const u8,
         9 => raw = f.bytes,
         else => {},
     };
+    if (dims.items.len > max_rank) return error.BadModel;
     const shape = try a.alloc(usize, dims.items.len);
-    for (dims.items, shape) |d, *s| s.* = @intCast(d);
-    const count = product(shape);
+    var count: usize = 1;
+    for (dims.items, shape) |d, *s| {
+        s.* = std.math.cast(usize, d) orelse return error.BadModel;
+        count = std.math.mul(usize, count, s.*) catch return error.BadModel;
+    }
+    // NOTE: every value takes at least one byte of the tensor message, so a larger count cannot be backed by data and must not be allocated.
+    if (count > bytes.len) return error.BadModel;
     var array: Array = .{ .dims = shape, .data = try a.alloc(f32, count) };
     switch (data_type) {
         1 => if (raw.len == 4 * count) {
@@ -353,8 +392,10 @@ fn parseTensor(a: Allocator, bytes: []const u8) Error!struct { name: []const u8,
 }
 
 fn make(a: Allocator, dims: []const usize) Error!Array {
+    if (dims.len > max_rank) return error.ShapeMismatch;
+    const count = checkedProduct(dims) orelse return error.ShapeMismatch;
     const owned = try a.dupe(usize, dims);
-    return .{ .dims = owned, .data = try a.alloc(f32, product(dims)) };
+    return .{ .dims = owned, .data = try a.alloc(f32, count) };
 }
 
 pub fn input(values: *std.StringHashMap(Array), node: Node, index: usize) Error!Array {
@@ -366,8 +407,6 @@ fn maybeInput(values: *std.StringHashMap(Array), node: Node, index: usize) ?Arra
     if (index >= node.inputs.len or node.inputs[index].len == 0) return null;
     return values.get(node.inputs[index]);
 }
-
-const max_rank = 8;
 
 fn stridesFor(dims: []const usize, rank: usize, out: *[max_rank]usize) void {
     @memset(out, 0);
@@ -489,8 +528,31 @@ fn sqrtf(x: f32) f32 {
     return @sqrt(x);
 }
 
-fn normalizeAxis(axis: i64, rank: usize) usize {
-    return @intCast(if (axis < 0) axis + @as(i64, @intCast(rank)) else axis);
+/// Turns an ONNX axis (negative counts from the end) into an index below rank; ShapeMismatch when it is out of range.
+pub fn normalizeAxis(axis: i64, rank: usize) Error!usize {
+    const signed_rank: i64 = @intCast(rank);
+    if (axis < -signed_rank or axis >= signed_rank) return error.ShapeMismatch;
+    return @intCast(if (axis < 0) axis + signed_rank else axis);
+}
+
+/// The two dims a Flatten node makes of x_dims; an axis equal to the rank is allowed and gives a trailing one.
+pub fn flattenDims(x_dims: []const usize, axis: i64) Error![2]usize {
+    const at = if (axis == x_dims.len) x_dims.len else try normalizeAxis(axis, x_dims.len);
+    return .{ product(x_dims[0..at]), product(x_dims[at..]) };
+}
+
+/// Fills perm (one entry per axis) from the perm attribute of a Transpose node, reversing the axes when it is absent.
+/// ShapeMismatch unless the result is a permutation of 0 to perm.len - 1.
+pub fn permutationOf(node: Node, perm: []usize) Error!void {
+    const given = node.ints("perm");
+    if (given.len != 0 and given.len != perm.len) return error.ShapeMismatch;
+    if (perm.len > 64) return error.ShapeMismatch;
+    var seen: u64 = 0;
+    for (perm, 0..) |*p, i| {
+        p.* = if (given.len == 0) perm.len - 1 - i else std.math.cast(usize, given[i]) orelse return error.ShapeMismatch;
+        if (p.* >= perm.len or seen >> @intCast(p.*) & 1 != 0) return error.ShapeMismatch;
+        seen |= @as(u64, 1) << @intCast(p.*);
+    }
 }
 
 pub fn execute(a: Allocator, par: kernels.Parallel, node: Node, values: *std.StringHashMap(Array)) Error![]const Array {
@@ -543,8 +605,7 @@ pub fn execute(a: Allocator, par: kernels.Parallel, node: Node, values: *std.Str
         .BatchNormalization => try batchNorm(a, node, try input(values, node, 0), try input(values, node, 1), try input(values, node, 2), try input(values, node, 3), try input(values, node, 4)),
         .Flatten => blk: {
             const x = try input(values, node, 0);
-            const axis = normalizeAxis(node.int("axis", 1), x.dims.len);
-            break :blk .{ .dims = try a.dupe(usize, &.{ product(x.dims[0..axis]), product(x.dims[axis..]) }), .data = x.data };
+            break :blk .{ .dims = try a.dupe(usize, &(try flattenDims(x.dims, node.int("axis", 1)))), .data = x.data };
         },
         .Reshape => try reshape(a, try input(values, node, 0), try input(values, node, 1)),
         .Transpose => try transpose(a, par, node, try input(values, node, 0)),
@@ -580,6 +641,7 @@ fn matmul(a: Allocator, x: Array, y: Array) Error!Array {
 fn gemm(a: Allocator, par: kernels.Parallel, node: Node, x: Array, y: Array, c: ?Array) Error!Array {
     const trans_a = node.int("transA", 0) != 0;
     const trans_b = node.int("transB", 0) != 0;
+    if (x.dims.len != 2 or y.dims.len != 2) return error.ShapeMismatch;
     const alpha = node.float("alpha", 1);
     const beta = node.float("beta", 1);
     const m = if (trans_a) x.dims[1] else x.dims[0];
@@ -605,8 +667,12 @@ fn transposed2d(a: Allocator, x: Array) Error!Array {
     return out;
 }
 
+/// Reads entry index of an integer attribute as a size, or default when the list is shorter.
+/// NOTE: a negative entry reads as zero and anything above 2^30 is clamped, so sums of pads and sizes cannot overflow;
+/// callers that divide by a stride or dilation reject zero.
 pub fn pair(list: []const i64, index: usize, default: usize) usize {
-    return if (index < list.len) @intCast(list[index]) else default;
+    if (index >= list.len) return default;
+    return @intCast(std.math.clamp(list[index], 0, 1 << 30));
 }
 
 const Window = struct { c: usize, h: usize, w: usize, kh: usize, kw: usize, sy: usize, sx: usize, py: usize, px: usize, dy: usize, dx: usize, oh: usize, ow: usize };
@@ -691,7 +757,11 @@ pub fn convolve(a: Allocator, par: kernels.Parallel, node: Node, x: Array, w: Ar
     const m = w.dims[0];
     const kh = w.dims[2];
     const kw = w.dims[3];
-    const groups: usize = @intCast(node.int("group", 1));
+    const groups = std.math.cast(usize, node.int("group", 1)) orelse return error.ShapeMismatch;
+    if (groups == 0 or c % groups != 0 or m % groups != 0 or kh == 0 or kw == 0) return error.ShapeMismatch;
+    if (bias) |extra| {
+        if (extra.data.len < m) return error.ShapeMismatch;
+    }
     const per_group = c / groups;
     const strides = node.ints("strides");
     const pads = node.ints("pads");
@@ -703,6 +773,7 @@ pub fn convolve(a: Allocator, par: kernels.Parallel, node: Node, x: Array, w: Ar
     const dy = pair(dilations, 0, 1);
     const dx = pair(dilations, 1, 1);
     if (!autoPadIsNone(node)) return error.UnsupportedOp;
+    if (sy == 0 or sx == 0 or dy == 0 or dx == 0) return error.ShapeMismatch;
     const ends = padEnds(pads);
     if (dy * (kh - 1) + 1 > h + py + ends.y or dx * (kw - 1) + 1 > width + px + ends.x) return error.ShapeMismatch;
     const oh = (h + py + ends.y - dy * (kh - 1) - 1) / sy + 1;
@@ -712,7 +783,7 @@ pub fn convolve(a: Allocator, par: kernels.Parallel, node: Node, x: Array, w: Ar
     if (groups == 1) {
         const taps = c * kh * kw;
         const positions = oh * ow;
-        const col = try a.alloc(f32, taps * positions);
+        const col = try a.alloc(f32, std.math.mul(usize, taps, positions) catch return error.ShapeMismatch);
         const work = try a.alloc(f32, kernels.matmulTiledWorkLen(f32, .{}, par, m, taps, positions));
         const view: Window = .{ .c = c, .h = h, .w = width, .kh = kh, .kw = kw, .sy = sy, .sx = sx, .py = py, .px = px, .dy = dy, .dx = dx, .oh = oh, .ow = ow };
         for (0..n) |b| {
@@ -799,7 +870,10 @@ pub fn convolveNhwc(a: Allocator, par: kernels.Parallel, node: Node, x: Array, w
     const c = x.dims[3];
     const m = w.dims[0];
     const k = w.dims[2];
-    if (w.dims[3] != k or w.dims[1] != c) return error.ShapeMismatch;
+    if (w.dims[3] != k or w.dims[1] != c or k == 0) return error.ShapeMismatch;
+    if (bias) |extra| {
+        if (extra.data.len < m) return error.ShapeMismatch;
+    }
     const sy = pair(node.ints("strides"), 0, 1);
     const sx = pair(node.ints("strides"), 1, 1);
     const py = pair(node.ints("pads"), 0, 0);
@@ -807,6 +881,7 @@ pub fn convolveNhwc(a: Allocator, par: kernels.Parallel, node: Node, x: Array, w
     const dy = pair(node.ints("dilations"), 0, 1);
     const dx = pair(node.ints("dilations"), 1, 1);
     if (sx != sy or px != py or dx != dy) return error.UnsupportedOp;
+    if (sy == 0 or dy == 0) return error.ShapeMismatch;
     // The dilated window must fit the padded input, otherwise the unsigned output size below would underflow.
     if (dy * (k - 1) + 1 > h + 2 * py or dx * (k - 1) + 1 > width + 2 * px) return error.ShapeMismatch;
     const oh = (h + 2 * py - dy * (k - 1) - 1) / sy + 1;
@@ -879,6 +954,7 @@ pub fn pool(a: Allocator, par: kernels.Parallel, node: Node, x: Array, is_max: b
     if (!autoPadIsNone(node) or pair(node.ints("dilations"), 0, 1) != 1 or pair(node.ints("dilations"), 1, 1) != 1) return error.UnsupportedOp;
     const ends = padEnds(pads);
     const ceil_mode = node.int("ceil_mode", 0) != 0;
+    if (ky == 0 or kx == 0 or sy == 0 or sx == 0) return error.ShapeMismatch;
     if (h + py + ends.y < ky or w + px + ends.x < kx) return error.ShapeMismatch;
     const oh = pooledSize(h + py + ends.y, h + py, ky, sy, ceil_mode);
     const ow = pooledSize(w + px + ends.x, w + px, kx, sx, ceil_mode);
@@ -889,6 +965,7 @@ pub fn pool(a: Allocator, par: kernels.Parallel, node: Node, x: Array, is_max: b
 }
 
 fn globalAverage(a: Allocator, x: Array) Error!Array {
+    if (x.dims.len < 2) return error.ShapeMismatch;
     const planes = x.dims[0] * x.dims[1];
     const size = product(x.dims[2..]);
     const out = try make(a, &.{ x.dims[0], x.dims[1], 1, 1 });
@@ -902,7 +979,11 @@ fn globalAverage(a: Allocator, x: Array) Error!Array {
 
 fn batchNorm(a: Allocator, node: Node, x: Array, scale: Array, shift: Array, mean: Array, variance: Array) Error!Array {
     const eps = node.float("epsilon", 1e-5);
+    if (x.dims.len < 2) return error.ShapeMismatch;
     const c = x.dims[1];
+    for ([_]Array{ scale, shift, mean, variance }) |per_channel| {
+        if (per_channel.data.len < c) return error.ShapeMismatch;
+    }
     const inner = product(x.dims[2..]);
     const out = try make(a, x.dims);
     for (0..x.dims[0]) |b| {
@@ -918,19 +999,25 @@ fn batchNorm(a: Allocator, node: Node, x: Array, scale: Array, shift: Array, mea
 
 pub fn reshape(a: Allocator, x: Array, shape: Array) Error!Array {
     if (shape.ints.len == 0) return error.UnsupportedOp;
+    if (shape.ints.len > max_rank) return error.ShapeMismatch;
     const dims = try a.alloc(usize, shape.ints.len);
     var known: usize = 1;
     var unknown: ?usize = null;
     for (shape.ints, dims, 0..) |s, *d, i| {
         if (s == -1) {
+            if (unknown != null) return error.ShapeMismatch;
             unknown = i;
             d.* = 1;
-        } else {
-            d.* = if (s == 0) x.dims[i] else @intCast(s);
-            known *= d.*;
+            continue;
         }
+        if (s == 0 and i >= x.dims.len) return error.ShapeMismatch;
+        d.* = if (s == 0) x.dims[i] else std.math.cast(usize, s) orelse return error.ShapeMismatch;
+        known = std.math.mul(usize, known, d.*) catch return error.ShapeMismatch;
     }
-    if (unknown) |i| dims[i] = x.len() / known;
+    if (unknown) |i| {
+        if (known == 0) return error.ShapeMismatch;
+        dims[i] = x.len() / known;
+    }
     if (product(dims) != x.len()) return error.ShapeMismatch;
     return .{ .dims = dims, .data = x.data };
 }
@@ -975,9 +1062,9 @@ fn transposeBlocks(job: TransposeJob, lo: usize, hi: usize) void {
 /// Permutes the axes of x by the perm attribute (reversed when absent); two swapped groups of axes take a blocked matrix transpose.
 pub fn transpose(a: Allocator, par: kernels.Parallel, node: Node, x: Array) Error!Array {
     const rank = x.dims.len;
+    if (rank > max_rank) return error.ShapeMismatch;
     var perm: [max_rank]usize = undefined;
-    const given = node.ints("perm");
-    for (0..rank) |i| perm[i] = if (given.len == rank) @intCast(given[i]) else rank - 1 - i;
+    try permutationOf(node, perm[0..rank]);
     var dims: [max_rank]usize = undefined;
     var source_strides: [max_rank]usize = undefined;
     var stride: usize = 1;
@@ -1014,14 +1101,23 @@ pub fn transpose(a: Allocator, par: kernels.Parallel, node: Node, x: Array) Erro
 
 fn concat(a: Allocator, node: Node, values: *std.StringHashMap(Array)) Error!Array {
     const first = try input(values, node, 0);
-    const axis = normalizeAxis(node.int("axis", 0), first.dims.len);
+    if (first.dims.len > max_rank) return error.ShapeMismatch;
+    const axis = try normalizeAxis(node.int("axis", 0), first.dims.len);
     var total: usize = 0;
-    for (0..node.inputs.len) |i| total += (try input(values, node, i)).dims[axis];
-    const dims = try a.dupe(usize, first.dims);
-    dims[axis] = total;
+    for (0..node.inputs.len) |i| {
+        const part = try input(values, node, i);
+        if (part.dims.len != first.dims.len) return error.ShapeMismatch;
+        for (part.dims, first.dims, 0..) |have, want, d| {
+            if (d != axis and have != want) return error.ShapeMismatch;
+        }
+        total = std.math.add(usize, total, part.dims[axis]) catch return error.ShapeMismatch;
+    }
+    var shape: [max_rank]usize = undefined;
+    @memcpy(shape[0..first.dims.len], first.dims);
+    shape[axis] = total;
     const outer = product(first.dims[0..axis]);
     const inner = product(first.dims[axis + 1 ..]);
-    const out: Array = .{ .dims = dims, .data = try a.alloc(f32, product(dims)) };
+    const out = try make(a, shape[0..first.dims.len]);
     var offset: usize = 0;
     for (0..node.inputs.len) |i| {
         const part = try input(values, node, i);
@@ -1033,7 +1129,7 @@ fn concat(a: Allocator, node: Node, values: *std.StringHashMap(Array)) Error!Arr
 }
 
 pub fn softmax(a: Allocator, node: Node, x: Array) Error!Array {
-    const axis = normalizeAxis(node.int("axis", -1), x.dims.len);
+    const axis = try normalizeAxis(node.int("axis", -1), x.dims.len);
     const outer = product(x.dims[0..axis]);
     const size = x.dims[axis];
     const inner = product(x.dims[axis + 1 ..]);
@@ -1058,11 +1154,15 @@ pub fn softmax(a: Allocator, node: Node, x: Array) Error!Array {
 fn gather(a: Allocator, node: Node, data: Array, indices: Array) Error!Array {
     if (node.int("axis", 0) != 0 or data.dims.len < 1) return error.UnsupportedOp;
     const inner = product(data.dims[1..]);
-    const dims = try a.alloc(usize, indices.dims.len + data.dims.len - 1);
+    const rank = indices.dims.len + data.dims.len - 1;
+    if (rank > max_rank) return error.ShapeMismatch;
+    var dims: [max_rank]usize = undefined;
     @memcpy(dims[0..indices.dims.len], indices.dims);
-    @memcpy(dims[indices.dims.len..], data.dims[1..]);
-    const out: Array = .{ .dims = dims, .data = try a.alloc(f32, product(dims)) };
+    @memcpy(dims[indices.dims.len..rank], data.dims[1..]);
+    const out = try make(a, dims[0..rank]);
     for (indices.data, 0..) |raw, i| {
+        // NOTE: NaN, infinities and values beyond 32 bits fail this test and must not reach the float to integer conversion.
+        if (!(raw > -2147483648.0 and raw < 2147483648.0)) return error.ShapeMismatch;
         // ONNX counts a negative index from the end.
         const signed: i64 = @intFromFloat(raw);
         const wrapped = if (signed < 0) signed + @as(i64, @intCast(data.dims[0])) else signed;
@@ -1075,10 +1175,13 @@ fn gather(a: Allocator, node: Node, data: Array, indices: Array) Error!Array {
 
 // Normalizes over the last axis with the population variance, as the engine does.
 fn layerNorm(a: Allocator, node: Node, x: Array, scale: Array, bias: ?Array) Error!Array {
-    if (normalizeAxis(node.int("axis", -1), x.dims.len) != x.dims.len - 1) return error.UnsupportedOp;
+    if (try normalizeAxis(node.int("axis", -1), x.dims.len) != x.dims.len - 1) return error.UnsupportedOp;
     const eps = node.float("epsilon", 1e-5);
     const cols = x.dims[x.dims.len - 1];
-    if (scale.len() != cols) return error.ShapeMismatch;
+    if (cols == 0 or scale.len() != cols) return error.ShapeMismatch;
+    if (bias) |b| {
+        if (b.data.len != cols) return error.ShapeMismatch;
+    }
     const out = try make(a, x.dims);
     for (0..x.len() / cols) |r| {
         const row = x.data[r * cols ..][0..cols];
@@ -1100,24 +1203,40 @@ pub const Cut = struct { first: [max_rank]usize, step: [max_rank]usize, dims: [m
 /// given steps; negative and oversized bounds are clamped as in ONNX, and steps below one are unsupported.
 pub fn cutOf(x_dims: []const usize, starts: Array, ends: Array, axes: ?Array, steps: ?Array) Error!Cut {
     const rank = x_dims.len;
+    if (rank > max_rank) return error.ShapeMismatch;
+    const count = starts.ints.len;
+    if (ends.ints.len != count) return error.ShapeMismatch;
+    if (axes) |given| {
+        if (given.ints.len != count) return error.ShapeMismatch;
+    }
+    if (steps) |given| {
+        if (given.ints.len != count) return error.ShapeMismatch;
+    }
     var cut: Cut = .{ .first = @splat(0), .step = @splat(1), .dims = undefined };
     @memcpy(cut.dims[0..rank], x_dims);
-    for (0..starts.ints.len) |k| {
-        const axis = if (axes) |given| normalizeAxis(given.ints[k], rank) else k;
+    for (0..count) |k| {
+        const axis = if (axes) |given| try normalizeAxis(given.ints[k], rank) else if (k < rank) k else return error.ShapeMismatch;
         const stride: i64 = if (steps) |given| given.ints[k] else 1;
         if (stride < 1) return error.UnsupportedOp;
         const size: i64 = @intCast(x_dims[axis]);
-        const lo = std.math.clamp(if (starts.ints[k] < 0) starts.ints[k] + size else starts.ints[k], 0, size);
-        const hi = std.math.clamp(if (ends.ints[k] < 0) ends.ints[k] + size else ends.ints[k], 0, size);
+        const lo = std.math.clamp(if (starts.ints[k] < 0) starts.ints[k] +| size else starts.ints[k], 0, size);
+        const hi = std.math.clamp(if (ends.ints[k] < 0) ends.ints[k] +| size else ends.ints[k], 0, size);
         cut.first[axis] = @intCast(lo);
         cut.step[axis] = @intCast(stride);
-        cut.dims[axis] = if (hi > lo) @intCast(@divTrunc(hi - lo + stride - 1, stride)) else 0;
+        // NOTE: written as (span - 1) / stride + 1 because span + stride - 1 overflows for a huge stride.
+        cut.dims[axis] = if (hi > lo) @intCast(@divTrunc(hi - lo - 1, stride) + 1) else 0;
     }
     return cut;
 }
 
 fn slice(a: Allocator, x: Array, starts: Array, ends: Array, axes: ?Array, steps: ?Array) Error!Array {
     const rank = x.dims.len;
+    // NOTE: bounds that are not integer tensors (computed floats) have no ints, and cutOf would silently cut nothing.
+    for ([_]?Array{ starts, ends, axes, steps }) |operand| {
+        if (operand) |bounds| {
+            if (bounds.ints.len != bounds.data.len) return error.UnsupportedOp;
+        }
+    }
     const cut = try cutOf(x.dims, starts, ends, axes, steps);
     const first = cut.first;
     const step = cut.step;
