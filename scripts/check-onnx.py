@@ -1,7 +1,7 @@
 """Check an exported model against the engine: python scripts/check-onnx.py MODEL.onnx mnist|cifar|text LOGITS...
 
-LOGITS are the numbers printed by `--predict=1` (logits of image 0, ten of them), or for the Transformer example
-(`zig build transformer -- 20 --gpu --onnx=model.onnx`) the 128 scores of the last position that it prints.
+LOGITS are the numbers printed by --predict=1 (logits of image 0, ten of them), or for the Transformer example
+(zig build transformer -- 20 --gpu --onnx=model.onnx) the 128 scores of the last position that it prints.
 Needs: pip install numpy onnx (the onnx package ships a slow but exact reference evaluator).
 """
 import sys
