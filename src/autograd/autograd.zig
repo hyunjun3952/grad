@@ -797,6 +797,8 @@ pub const Tape = struct {
             try dev.batchNormStats(x.value.data, st, c, self.training);
             try dev.batchNormApply(x.value.data, added, value.data, affine, layout);
         } else if (In.Elem == f32) {
+            // NOTE: the CPU kernels keep per-channel sums in fixed stack buffers, and asserts vanish in release builds.
+            if (c > norm.max_channels) return error.TooManyChannels;
             cpu.normStats(self.par, x.value.data, st, c, self.training);
             cpu.normApply(self.par, x.value.data, added, value.data, affine, layout);
         } else return error.NoDevice;

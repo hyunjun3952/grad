@@ -233,6 +233,8 @@ pub const Model = struct {
         if (!std.mem.eql(u8, conv.op, "Conv") or conv.int("group", 1) != 1) return null;
         if (lead.outputs.len != 1 or conv.outputs.len != 1 or trail.inputs.len != 1) return null;
         if (!std.mem.eql(u8, trail.inputs[0], conv.outputs[0])) return null;
+        // The convolution must read the transposed tensor, otherwise its real input would be ignored.
+        if (conv.inputs.len == 0 or lead.inputs.len != 1 or !std.mem.eql(u8, conv.inputs[0], lead.outputs[0])) return null;
         // Fusing skips the wrapped tensors entirely, so a second user would silently read a missing value.
         if (self.uses(lead.outputs[0]) != 1 or self.uses(conv.outputs[0]) != 1) return null;
         const weights = try input(values, conv, 1);

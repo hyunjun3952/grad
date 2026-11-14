@@ -463,9 +463,10 @@ pub fn normStats(par: kernels.Parallel, x: []const f32, st: norm.Stats, c: usize
         return;
     }
     var partial: [parts][2 * norm.max_channels]f64 = undefined;
-    var job: Pass = .{ .x = x.ptr, .other = x.ptr, .mask = x.ptr, .centre = undefined, .inv_std = st.inv_std, .rows = x.len / c, .channels = c, .partial = &partial, .kind = .sum };
     var mean: [norm.max_channels]f64 = undefined;
     var square: [norm.max_channels]f64 = undefined;
+    // NOTE: the sum pass never uses the centre, but the vector loop loads it anyway, so it must point at readable memory.
+    var job: Pass = .{ .x = x.ptr, .other = x.ptr, .mask = x.ptr, .centre = &square, .inv_std = st.inv_std, .rows = x.len / c, .channels = c, .partial = &partial, .kind = .sum };
     reduceParts(par, job, &mean, 0);
     const count: f64 = @floatFromInt(job.rows);
     for (mean[0..c]) |*m| m.* /= count;

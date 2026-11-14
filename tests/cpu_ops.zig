@@ -193,3 +193,32 @@ test "row-wise batch-norm apply and input gradient equal the per-element referen
         try testing.expectEqualSlices(f32, want_dr, got_dr);
     }
 }
+
+test "batch norm statistics on the CPU cover 384 channels, the widest layer of the wide CIFAR network" {
+    const gpa = testing.allocator;
+    const c = 384;
+    const rows = 10;
+    var prng = std.Random.DefaultPrng.init(8);
+    const rng = prng.random();
+    const x = try gpa.alloc(f32, rows * c);
+    defer gpa.free(x);
+    for (x) |*v| v.* = rng.floatNorm(f32) * 2 + 1;
+    var mean: [c]f32 = undefined;
+    var inv_std: [c]f32 = undefined;
+    var running_mean: [c]f32 = @splat(0);
+    var running_var: [c]f32 = @splat(1);
+    const st: norm.Stats = .{ .mean = &mean, .inv_std = &inv_std, .running_mean = &running_mean, .running_var = &running_var };
+    for ([_]kernels.Parallel{ .{}, .{ .io = testing.io, .threads = 3 } }) |par| {
+        lib.cpu_ops.normStats(par, x, st, c, true);
+        for (0..c) |ch| {
+            var sum: f64 = 0;
+            for (0..rows) |r| sum += x[r * c + ch];
+            const mu = sum / rows;
+            var square: f64 = 0;
+            for (0..rows) |r| square += (x[r * c + ch] - mu) * (x[r * c + ch] - mu);
+            const want_inv: f64 = 1 / @sqrt(square / rows + norm.eps);
+            try testing.expectApproxEqAbs(@as(f32, @floatCast(mu)), mean[ch], 1e-5);
+            try testing.expectApproxEqRel(@as(f32, @floatCast(want_inv)), inv_std[ch], 1e-4);
+        }
+    }
+}

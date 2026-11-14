@@ -429,3 +429,26 @@ test "the nhwc fusion only accepts uniform pads without an auto_pad rule" {
     try testing.expect(!lib.onnx_runtime.padsAreUniform(asymmetric));
     try testing.expect(!lib.onnx_runtime.padsAreUniform(same));
 }
+
+test "a graph whose Conv reads another tensor than the transposed one is not fused" {
+    const gpa = testing.allocator;
+    const par: lib.kernels.Parallel = .{};
+    const nodes = [_]lib.onnx_runtime.Node{
+        .{ .op = "Transpose", .inputs = &.{"x"}, .outputs = &.{"t"}, .attributes = &.{.{ .name = "perm", .ints = &.{ @as(i64, 0), 3, 1, 2 } }} },
+        .{ .op = "Conv", .inputs = &.{ "y", "w" }, .outputs = &.{"c"} },
+        .{ .op = "Transpose", .inputs = &.{"c"}, .outputs = &.{"out"}, .attributes = &.{.{ .name = "perm", .ints = &.{ @as(i64, 0), 2, 3, 1 } }} },
+        .{ .op = "Relu", .inputs = &.{"t"}, .outputs = &.{"r"} },
+    };
+    var model: Model = .{ .arena = .init(gpa), .nodes = &nodes, .initializers = .init(gpa), .inputs = &.{}, .outputs = &.{ "out", "r" } };
+    defer model.deinit();
+    var weight = [_]f32{2};
+    try model.initializers.put("w", .{ .dims = &.{ 1, 1, 1, 1 }, .data = &weight });
+
+    const x = [_]f32{ -1, 2, -3, 4 };
+    const y = [_]f32{ 1, 2, 3, 4 };
+    const dims = [_]usize{ 1, 2, 2, 1 };
+    var result = try model.run(gpa, par, &.{ .{ .name = "x", .dims = &dims, .data = &x }, .{ .name = "y", .dims = &.{ 1, 1, 2, 2 }, .data = &y } });
+    defer result.deinit();
+    try testing.expectEqualSlices(f32, &.{ 2, 4, 6, 8 }, result.outputs[0].data);
+    try testing.expectEqualSlices(f32, &.{ 0, 2, 0, 4 }, result.outputs[1].data);
+}

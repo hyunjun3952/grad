@@ -3,7 +3,8 @@ const bf16 = @import("bf16.zig");
 
 pub const eps: f32 = 1e-5;
 pub const momentum: f32 = 0.1;
-pub const max_channels = 256;
+/// Most channels the CPU batch-norm kernels hold in stack buffers; the wide CIFAR network needs 384.
+pub const max_channels = 512;
 
 pub const Affine = extern struct { mean: [*]const f32, inv_std: [*]const f32, gamma: [*]const f32, beta: [*]const f32 };
 pub const Stats = extern struct { mean: [*]f32, inv_std: [*]f32, running_mean: [*]f32, running_var: [*]f32 };
