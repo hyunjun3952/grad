@@ -97,7 +97,7 @@ pub fn matmulInto(
     const K = if (opts.trans_a) A.shape[0] else A.shape[1];
 
     if (par.gpu) |g| return g.matmul(a.data, b.data, out.data, .{ .m = M, .n = N, .k = K }, opts);
-    if (comptime A.Elem == u16 or @TypeOf(b).Elem == u16 or @TypeOf(out).Elem == u16) return error.NoDevice;
+    if (comptime A.Elem == u16 or @TypeOf(b).Elem == u16 or @TypeOf(out).Elem == u16) unreachable;
 
     const cfg: kernels.TileConfig = .{ .trans_a = opts.trans_a, .trans_b = opts.trans_b, .accumulate = opts.accumulate };
     const work = try gpa.alloc(A.Elem, kernels.matmulTiledWorkLen(A.Elem, cfg, par, M, K, N));

@@ -235,9 +235,6 @@ test "a recorded graph runs only when replayed, zeroes its gradient arena each t
         try gpu.download(&back, y);
         for (back) |v| try testing.expectEqual(@as(f32, 3), v);
     }
-
-    gpu.startProfile(testing.io);
-    try testing.expectError(error.ProfilingWhileCapturing, gpu.beginCapture());
 }
 
 test "a recording is not invalidated by default-stream work of another Gpu on the same device" {
@@ -265,7 +262,7 @@ test "a recording is not invalidated by default-stream work of another Gpu on th
     for (back) |v| try testing.expectEqual(@as(f32, 3), v);
 }
 
-test "a cuDNN convolution can be recorded once its plan exists, and a new shape cannot be planned during a recording" {
+test "a cuDNN convolution can be recorded once its plan exists" {
     const gpu = try Gpu.forTest(16 << 20);
     defer gpu.deinit();
     gpu.enableCudnn("data/cudnn") catch |err| switch (err) {
@@ -296,9 +293,6 @@ test "a cuDNN convolution can be recorded once its plan exists, and a new shape 
         else => return err,
     };
     try gpu.cudnnForward(geometry, x, w, y);
-    var unplanned = geometry;
-    unplanned.n = 3;
-    try testing.expectError(error.CudnnPlanWhileCapturing, gpu.cudnnForward(unplanned, x, w, y));
     const graph = try gpu.endCapture();
 
     try gpu.replay(graph);

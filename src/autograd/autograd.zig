@@ -281,7 +281,7 @@ pub const Tape = struct {
             try dev.elementwise(op, a.data, b.data, out.data, .{ .dims = padToRank(&bc.dims, 1), .a_strides = padToRank(&bc.a, 0), .b_strides = padToRank(&bc.b, 0) });
             return out;
         }
-        if (comptime @TypeOf(a).Elem != f32) return error.NoDevice;
+        if (comptime @TypeOf(a).Elem != f32) unreachable;
         const A = @TypeOf(a);
         const B = @TypeOf(b);
         const R = ops.BroadcastResult(A, B);
@@ -344,7 +344,7 @@ pub const Tape = struct {
             }
             return;
         }
-        if (comptime D.Elem != f32) return error.NoDevice;
+        if (comptime D.Elem != f32) unreachable;
         if (comptime std.mem.eql(usize, D.shape, G.shape)) {
             kernels.parallelFor(self.par, D.len, 1 << 15, PairJob{ .dst = v.grad.data, .src = g.data }, addRange);
         } else {
@@ -376,14 +376,14 @@ pub const Tape = struct {
             try dev.addRelu(a.value.data, b.value.data, value.data);
         } else if (T.Elem == f32) {
             for (value.data, a.value.data, b.value.data) |*o, x, y| o.* = @max(x + y, 0);
-        } else return error.NoDevice;
+        } else unreachable;
         const out = try self.makeVar(value, a.needs_grad or b.needs_grad);
         try self.note(.add_relu, .{ a, b }, out, .{});
         const Ctx = struct { a: @TypeOf(a), b: @TypeOf(b), out: @TypeOf(out) };
         if (out.needs_grad) try self.recordBackward(Ctx{ .a = a, .b = b, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
                 if (t.par.gpu) |dev| return dev.addReluBackward(c.out.value.data, c.out.grad.data, c.a.grad.data, c.b.grad.data, c.a.needs_grad, c.b.needs_grad);
-                if (comptime T.Elem != f32) return error.NoDevice;
+                if (comptime T.Elem != f32) unreachable;
                 for (c.out.value.data, c.out.grad.data, 0..) |o, g, i| {
                     const v = if (o > 0) g else 0;
                     if (c.a.needs_grad) c.a.grad.data[i] += v;
@@ -461,7 +461,7 @@ pub const Tape = struct {
         if (self.par.gpu) |dev| {
             try dev.relu(x.value.data, value.data);
         } else {
-            if (comptime @TypeOf(x.value).Elem != f32) return error.NoDevice;
+            if (comptime @TypeOf(x.value).Elem != f32) unreachable;
             kernels.parallelFor(self.par, value.data.len, 1 << 15, PairJob{ .dst = value.data, .src = x.value.data }, reluRange);
         }
         const out = try self.makeVar(value, x.needs_grad);
@@ -470,7 +470,7 @@ pub const Tape = struct {
         if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
                 if (t.par.gpu) |dev| return dev.reluBackward(c.x.value.data, c.out.grad.data, c.x.grad.data);
-                if (comptime @TypeOf(c.x.value).Elem != f32) return error.NoDevice;
+                if (comptime @TypeOf(c.x.value).Elem != f32) unreachable;
                 kernels.parallelFor(t.par, c.x.grad.data.len, 1 << 15, ReluGradJob{ .dst = c.x.grad.data, .x = c.x.value.data, .g = c.out.grad.data }, reluGradRange);
             }
         }.run);
@@ -527,7 +527,7 @@ pub const Tape = struct {
         if (self.par.gpu) |dev| {
             try dev.embeddingGather(table.value.data, ids, value.data);
         } else {
-            if (comptime Out != f32) return error.NoDevice;
+            if (comptime Out != f32) unreachable;
             // NOTE: ids are host data here, so a bad one is caught before it reads another row of memory.
             for (ids) |id| {
                 if (id >= @TypeOf(table.value).shape[0]) return error.InvalidIndex;
@@ -561,7 +561,7 @@ pub const Tape = struct {
         if (self.par.gpu) |dev| {
             try dev.layerNorm(.{ .x = x.value.data, .gamma = gamma.value.data, .mean = mean.data, .inv_std = inv_std.data }, beta.value.data, value.data);
         } else {
-            if (comptime X.Elem != f32) return error.NoDevice;
+            if (comptime X.Elem != f32) unreachable;
             for (0..rows) |r| {
                 const row = layernorm_math.forwardRow(f32, x.value.data.ptr + r * cols, value.data.ptr + r * cols, gamma.value.data.ptr, beta.value.data.ptr, cols);
                 mean.data[r] = row.mean;
@@ -577,7 +577,7 @@ pub const Tape = struct {
                     const p: gpu_mod.Gpu.LayerNorm(X.Elem) = .{ .x = c.x.value.data, .gamma = c.gamma.value.data, .mean = c.mean.data, .inv_std = c.inv_std.data };
                     return dev.layerNormBackward(p, c.out.grad.data, if (c.x.needs_grad) c.x.grad.data else null, if (c.gamma.needs_grad) c.gamma.grad.data else null, if (c.beta.needs_grad) c.beta.grad.data else null);
                 }
-                if (comptime X.Elem != f32) return error.NoDevice;
+                if (comptime X.Elem != f32) unreachable;
                 for (0..rows) |r| {
                     if (c.x.needs_grad) layernorm_math.backwardRow(
                         f32,
@@ -618,7 +618,7 @@ pub const Tape = struct {
         if (self.par.gpu) |dev| {
             try dev.softmax(x.value.data, value.data, cols, period, opts.scale);
         } else {
-            if (comptime X.Elem != f32) return error.NoDevice;
+            if (comptime X.Elem != f32) unreachable;
             const Job = struct { x: [*]const f32, y: [*]f32 };
             kernels.parallelFor(self.par, X.shape[0], 16, Job{ .x = x.value.data.ptr, .y = value.data.ptr }, struct {
                 fn run(job: Job, lo: usize, hi: usize) void {
@@ -632,7 +632,7 @@ pub const Tape = struct {
         if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
                 if (t.par.gpu) |dev| return dev.softmaxBackward(c.out.value.data, c.out.grad.data, c.x.grad.data, cols, opts.scale);
-                if (comptime X.Elem != f32) return error.NoDevice;
+                if (comptime X.Elem != f32) unreachable;
                 for (0..X.shape[0]) |r| softmax_math.backwardRow(f32, c.out.value.data.ptr + r * cols, c.out.grad.data.ptr + r * cols, c.x.grad.data.ptr + r * cols, cols, opts.scale);
             }
         }.run);
@@ -713,7 +713,7 @@ pub const Tape = struct {
         const X = @TypeOf(x.value);
         if (X.Elem == To) return x;
         comptime if (!((X.Elem == f32 and To == u16) or (X.Elem == u16 and To == f32))) @compileError("cast converts between f32 and bf16 (stored as u16)");
-        const dev = self.par.gpu orelse return error.NoDevice;
+        const dev = self.par.gpu orelse unreachable;
         const value = try self.newTensor(Tensor(To, X.shape));
         if (To == u16) try dev.toHalf(x.value.data, value.data) else try dev.fromHalf(x.value.data, value.data);
         const out = try self.makeVar(value, x.needs_grad);
@@ -735,7 +735,7 @@ pub const Tape = struct {
         if (self.par.gpu) |dev| {
             try dev.activation(x.value.data, value.data, kind);
         } else {
-            if (comptime @TypeOf(x.value).Elem != f32) return error.NoDevice;
+            if (comptime @TypeOf(x.value).Elem != f32) unreachable;
             kernels.parallelFor(self.par, value.data.len, 1 << 14, Job{ .x = x.value.data, .y = value.data }, struct {
                 fn run(job: Job, lo: usize, hi: usize) void {
                     activation_math.apply(job.x, job.y, kind, lo, hi);
@@ -748,7 +748,7 @@ pub const Tape = struct {
         if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .out = out }, struct {
             fn run(t: *Tape, c: *const Ctx) Error!void {
                 if (t.par.gpu) |dev| return dev.activationBackward(c.x.value.data, c.out.value.data, c.out.grad.data, c.x.grad.data, kind);
-                if (comptime @TypeOf(c.x.value).Elem != f32) return error.NoDevice;
+                if (comptime @TypeOf(c.x.value).Elem != f32) unreachable;
                 activation_math.applyBackward(c.x.value.data, c.out.value.data, c.out.grad.data, c.x.grad.data, kind, 0, c.x.grad.data.len);
             }
         }.run);
@@ -757,7 +757,7 @@ pub const Tape = struct {
 
     fn dropKernel(self: *Tape, src: anytype, dst: anytype, seed: u64, keep: f32, accumulate: bool) Error!void {
         if (self.par.gpu) |dev| return dev.dropout(src, dst, seed, keep, accumulate);
-        if (comptime @typeInfo(@TypeOf(dst)).pointer.child != f32) return error.NoDevice;
+        if (comptime @typeInfo(@TypeOf(dst)).pointer.child != f32) unreachable;
         kernels.parallelEach(self.par, src.len, drop.apply, .{ src, dst, seed, keep, accumulate });
     }
     /// Zeroes each element with probability 1 - keep and scales the rest by 1 / keep; does nothing unless training is set.
@@ -818,7 +818,7 @@ pub const Tape = struct {
             if (c > norm.max_channels) return error.TooManyChannels;
             cpu.normStats(self.par, x.value.data, st, c, self.training);
             cpu.normApply(self.par, x.value.data, added, value.data, affine, layout);
-        } else return error.NoDevice;
+        } else unreachable;
         const residual_grad = fuse == .add_relu and residual.needs_grad;
         const out = try self.makeVar(value, x.needs_grad or gamma.needs_grad or beta.needs_grad or residual_grad);
         const norm_inputs = .{ x, gamma, beta, running.mean, running.variance };
@@ -845,7 +845,7 @@ pub const Tape = struct {
                     if (to_residual) try dev.addReluBackward(k.out.value.data, k.out.grad.data, k.residual.grad.data, k.residual.grad.data, true, false);
                     return;
                 }
-                if (comptime In.Elem != f32) return error.NoDevice;
+                if (comptime In.Elem != f32) unreachable;
                 cpu.normGradSums(t.par, k.x.value.data, k.out.grad.data, k.affine, mask, grads);
                 if (k.x.needs_grad) return cpu.normGradInput(t.par, io, k.affine, grad_layout);
                 if (!to_residual) return;
@@ -891,7 +891,7 @@ pub const Tape = struct {
         comptime if (opts.stride != 1 or opts.groups != 1 or opts.dilation != 1 or
             c_in % 64 != 0 or c_out % 32 != 0)
             @compileError("bf16 activations need stride-1 convolutions with a multiple of 64 input and of 32 output channels; cast to f32 around other layers");
-        const dev = self.par.gpu orelse return error.NoDevice;
+        const dev = self.par.gpu orelse unreachable;
         const d: conv.Dims = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = c_in, .k = k, .pad = opts.pad, .c_out = c_out };
         const kc = k * k * c_in;
         const geometry: ga.ConvGeometry = comptime convGeometry(d, .{});

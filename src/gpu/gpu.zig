@@ -11,7 +11,7 @@ const ptx = @embedFile("kernels_ptx");
 
 /// Everything that can fail on the device path. The CUDA driver and cuDNN are loaded at run time,
 /// so a missing library is an error value rather than a link failure.
-pub const Error = Allocator.Error || error{ NoDevice, TooManyChannels, InvalidIndex, NoGraphSupport, ProfilingWhileCapturing, CudnnPlanWhileCapturing, NoSuchDevice, DriverNotFound, MissingSymbol, CudaFailed, CudnnNotFound, CudnnFailed, NoAlgorithm };
+pub const Error = Allocator.Error || error{ TooManyChannels, InvalidIndex, NoGraphSupport, NoSuchDevice, DriverNotFound, MissingSymbol, CudaFailed, CudnnNotFound, CudnnFailed, NoAlgorithm };
 
 pub const BinaryOp = enum { add, mul };
 
@@ -447,7 +447,7 @@ pub const Gpu = struct {
     /// kernel argument, so anything that changes between steps (a dropout seed, a step offset) has to stay outside the graph.
     /// Scratch addresses are the same in each step only if resetStep is called first and the same allocations follow.
     pub fn beginCapture(self: *Gpu) Error!void {
-        if (self.profile != null) return error.ProfilingWhileCapturing;
+        std.debug.assert(self.profile == null);
         try self.cu.beginCapture();
         self.capturing = true;
         // NOTE: a capture that stays open would make every later launch on the stream fail, so a failed setStream ends it.
@@ -488,7 +488,7 @@ pub const Gpu = struct {
         }
         // NOTE: choosing a plan times real convolutions and may allocate, neither of which a recording allows, so every geometry
         // a recorded step uses must have been planned by a step that ran normally before.
-        if (self.capturing) return error.CudnnPlanWhileCapturing;
+        std.debug.assert(!self.capturing);
         const plan = try self.cudnn_lib.?.plan(geometry, .float, 512 << 20, self.deterministic);
         try self.cudnn_plans.append(self.gpa, .{ .geometry = geometry, .plan = plan });
         if (plan.workspaceBytes() > self.cudnn_workspace_bytes) {
