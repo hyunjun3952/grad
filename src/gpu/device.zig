@@ -1143,6 +1143,13 @@ inline fn fillSlot(dst: u32, src: anytype, valid: bool, comptime magic: bool) vo
     copyAsyncZfill(dst, src, valid);
 }
 
+// Maps a tap coordinate on a virtually upsampled operand back to the stored one: off-grid taps read a zero, and the
+// survivors shrink by the factor. Identity for the ordinary kernels, so only the subsampled variants pay the division.
+inline fn subsampled(y: i32, comptime enabled: bool, sub: i32) struct { v: i32, on: bool } {
+    if (!enabled) return .{ .v = y, .on = true };
+    return .{ .v = @divTrunc(y, sub), .on = @rem(y, sub) == 0 };
+}
+
 const Acc = [4][4][4]f32;
 const Warp = struct { lane: usize, row: usize, col: usize };
 const Block = struct { tid: usize, row0: usize, col0: usize, k_begin: usize };
@@ -1163,6 +1170,9 @@ const GemmKind = struct {
     affine_a: bool = false,
     // gather_b only: the same transform applied to the gathered right operand of a weight gradient.
     affine_b: bool = false,
+    // gather_a only: the left operand is read as if upsampled by geo.subsample (the input gradient of a strided
+    // convolution), so a tap that lands between two elements contributes zero.
+    subsampled: bool = false,
     // Adds the masked per-channel sums a batch-norm backward needs to the epilogue (see dxStatsTile).
     dx_stats: bool = false,
 
@@ -1298,10 +1308,15 @@ fn GemmLoader(comptime kind: GemmKind) type {
             const dil: i32 = @intCast(geometry.dilation);
             const channel_step = if (geometry.c_step != 0) geometry.c_step else geometry.c;
             if (mode == .gather_a) {
+                const sub: i32 = @intCast(geometry.subsample);
                 inline for (0..a_per) |i| {
-                    const y = self.origin_y[i] + self.cursor_ky * dil;
-                    const x = self.origin_x[i] + self.cursor_kx * dil;
-                    const valid = self.origin_valid[i] and y >= 0 and y < @as(i32, @intCast(geometry.h)) and x >= 0 and x < @as(i32, @intCast(geometry.w));
+                    // NOTE: the input gradient of a strided convolution gathers the output gradient as if it had
+                    // subsample - 1 rows and columns of zeros between its elements.
+                    const sy = subsampled(self.origin_y[i] + self.cursor_ky * dil, kind.subsampled, sub);
+                    const sx = subsampled(self.origin_x[i] + self.cursor_kx * dil, kind.subsampled, sub);
+                    const y = sy.v;
+                    const x = sx.v;
+                    const valid = self.origin_valid[i] and sy.on and sx.on and y >= 0 and y < @as(i32, @intCast(geometry.h)) and x >= 0 and x < @as(i32, @intCast(geometry.w));
                     const at = if (valid)
                         ((@as(usize, self.origin_n[i]) * geometry.h + @as(usize, @intCast(y))) * geometry.w +
                             @as(usize, @intCast(x))) * channel_step + self.cursor_channel + self.chunk_a * lane_elems
@@ -1883,6 +1898,10 @@ export fn convTf32Forward(x: [*]const f32, w: [*]const f32, c: [*]f32, shape: ga
     tileGemm(.{ .tf32 = true, .mode = .gather_a }, x, w, c, .{}, shape, geo);
 }
 
+export fn convTf32ForwardSubsampled(x: [*]const f32, w: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
+    tileGemm(.{ .tf32 = true, .mode = .gather_a, .subsampled = true }, x, w, c, .{}, shape, geo);
+}
+
 export fn convTf32WeightGrad(dy_t: [*]const f32, x: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
     tileGemm(.{ .tf32 = true, .mode = .gather_b }, dy_t, x, c, .{}, shape, geo);
 }
@@ -1893,6 +1912,10 @@ export fn convTf32WeightGradShort(dy_t: [*]const f32, x: [*]const f32, c: [*]f32
 
 export fn convExactForward(x: [*]const f32, w: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
     tileGemm(.{ .tf32 = true, .exact = true, .mode = .gather_a }, x, w, c, .{}, shape, geo);
+}
+
+export fn convExactForwardSubsampled(x: [*]const f32, w: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
+    tileGemm(.{ .tf32 = true, .exact = true, .mode = .gather_a, .subsampled = true }, x, w, c, .{}, shape, geo);
 }
 
 export fn convExactForwardWide(x: [*]const f32, w: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {

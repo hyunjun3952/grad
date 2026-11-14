@@ -118,6 +118,9 @@ fn convGeometry(d: conv.Dims, opts: ConvGeometryOpts) ga.ConvGeometry {
             .c_out = if (opts.per_group) d.c / d.groups else d.c,
             .dilation = d.dilation,
             .c_step = if (opts.per_group) d.c_out else 0,
+            // NOTE: the input gradient of a strided convolution reads the output gradient off a grid that has
+            // stride - 1 zeros between its elements; the subsampled gather applies the mask and the division.
+            .subsample = d.stride,
         };
     }
     return .{
@@ -144,9 +147,10 @@ fn chooseConvPath(d: conv.Dims, dev: ?*gpu_mod.Gpu) ConvPath {
     const general = d.dilation * (d.k - 1) < d.pad;
     const per_in = d.c / d.groups;
     const per_out = d.c_out / d.groups;
-    // NOTE: a grouped stride-1 convolution is one implicit-GEMM launch per group when the per-group channels are
-    // multiples of 16 and the products are large enough; everything else about it keeps the simple kernel.
-    if (d.groups > 1 and d.stride == 1 and !general and per_in % 16 == 0 and per_out % 16 == 0 and
+    // NOTE: a grouped convolution is one implicit-GEMM launch per group when the per-group channels are multiples of 16
+    // and the products are large enough; the input gradient of a strided one takes the subsampled gather. Everything
+    // else (odd per-group channels, small groups, a negative reverse pad) keeps the simple kernel.
+    if (d.groups > 1 and !general and per_in % 16 == 0 and per_out % 16 == 0 and
         dev != null and dev.?.f32ImplicitWorthwhile(rows, per_out, d.k * d.k * per_in)) return .grouped_implicit;
     if (d.groups > 1 or general) return .grouped;
     const g = dev orelse return .cpu;

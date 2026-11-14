@@ -60,9 +60,11 @@ const Kernel = enum {
     sgemmTensor,
     weightsToKrsc,
     convTf32Forward,
+    convTf32ForwardSubsampled,
     convTf32WeightGrad,
     convTf32WeightGradShort,
     convExactForward,
+    convExactForwardSubsampled,
     convExactForwardWide,
     convExactWeightGrad,
     convExactWeightGradShort,
@@ -782,7 +784,8 @@ pub const Gpu = struct {
 
     /// Forward (or, with reversed geometry and rotated weights, input-gradient) implicit GEMM over f32 activations: rounded to
     /// TF32 on tensor cores when tf32 is set, strict f32 on the CUDA cores otherwise. With a non-null c_layout the result is
-    /// one group's slice of a grouped convolution's output, written with c_layout.pitch as the row stride.
+    /// one group's slice of a grouped convolution's output, written with c_layout.pitch as the row stride. A geometry with
+    /// subsample above one (the input gradient of a strided convolution) takes the subsampled kernel variants.
     pub fn convF32Forward(self: *Gpu, x: []const f32, w: []const f32, out: []f32, geo: ga.ConvGeometry, opts: ConvF32ForwardOpts) Error!void {
         const c_layout = opts.c_layout orelse dense_group;
         const c_out: usize = geo.c_out;
@@ -801,9 +804,17 @@ pub const Gpu = struct {
             .c_pitch = c_layout.pitch,
             .c_offset = c_layout.offset,
         });
-        const wide = !self.tf32 and c_out >= wide_conv_min_c_out and
+        const wide = !self.tf32 and geo.subsample == 1 and c_out >= wide_conv_min_c_out and
             m >= wide_conv_forward_min_positions and opts.c_layout == null;
-        try self.launch(if (self.tf32) .convTf32Forward else if (wide) .convExactForwardWide else .convExactForward, .{ ceilDiv(c_out, if (wide) 128 else 64), ceilDiv(m, 128), 1 }, .{ x, w, out, kernel_shape, geo });
+        const kernel: Kernel = if (geo.subsample > 1)
+            if (self.tf32) .convTf32ForwardSubsampled else .convExactForwardSubsampled
+        else if (self.tf32)
+            .convTf32Forward
+        else if (wide)
+            .convExactForwardWide
+        else
+            .convExactForward;
+        try self.launch(kernel, .{ ceilDiv(c_out, if (wide) 128 else 64), ceilDiv(m, 128), 1 }, .{ x, w, out, kernel_shape, geo });
     }
 
     /// Weight gradient of the implicit GEMM over f32 activations; dy_t is the transposed output gradient (see transposeF32).

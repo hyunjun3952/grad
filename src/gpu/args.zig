@@ -73,7 +73,9 @@ pub const TensorShape = extern struct { m: u32, n: u32, k_padded: u32, n_padded:
 
 /// Geometry of one implicit-GEMM convolution. The field c_step is the channel stride in memory and c the logical channel
 /// count of the operand: per-group launches of a grouped convolution offset the base pointer by a whole number of groups and pass c_step as the full channel count.
-pub const ConvGeometry = extern struct { n: u32, h: u32, w: u32, c: u32, k: u32, stride: u32, pad: u32, out_h: u32, out_w: u32, positions: u32, c_out: u32, dilation: u32 = 1, c_step: u32 = 0 };
+/// The field subsample is above one only for the input gradient of a strided convolution, where the gathered operand is the
+/// output gradient read as if it had subsample - 1 rows and columns of zeros between its elements.
+pub const ConvGeometry = extern struct { n: u32, h: u32, w: u32, c: u32, k: u32, stride: u32, pad: u32, out_h: u32, out_w: u32, positions: u32, c_out: u32, dilation: u32 = 1, c_step: u32 = 0, subsample: u32 = 1 };
 
 /// Arguments of the weight-rotation kernel. The fields src_pitch and src_offset read one group's columns out of the full weight matrix, whose rows are the full c_out long.
 pub const RotateArgs = extern struct { k: u32, c_in: u32, c_out: u32, rows_padded: u32, cols_padded: u32, src_pitch: u32 = 0, src_offset: u32 = 0 };

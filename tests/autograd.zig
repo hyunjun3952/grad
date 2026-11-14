@@ -380,6 +380,28 @@ const GroupedConvNet = struct {
     }
 };
 
+const StridedGroupedConvNet = struct {
+    const X = Tensor(f32, &.{ 8, 17, 17, 32 });
+    const W = Tensor(f32, &.{ 144, 32 });
+    const Y = Tensor(f32, &.{ 8, 9 * 9 * 32 });
+
+    pub const Inputs = struct { x: X, w: W, y: Y };
+    pub const names = .{ "x", "w", "y" };
+    pub const labels: [8]u8 = @splat(0);
+    const Result = struct { loss: Var(Tensor(f32, &.{})), x: Var(X), w: Var(W), y: Var(Y) };
+
+    pub fn build(t: *Tape, p: Inputs, _: []const u8) !Result {
+        const x = try t.leaf(p.x);
+        const w = try t.leaf(p.w);
+        const y = try t.leaf(p.y);
+        return .{ .loss = try t.mse(reshape(try t.conv2d(x, w, .{ .stride = 2, .pad = 1, .groups = 2 }), &.{ 8, 9 * 9 * 32 }), y), .x = x, .w = w, .y = y };
+    }
+
+    pub fn acceptable(_: Allocator, _: Inputs) !bool {
+        return true;
+    }
+};
+
 fn LayerNormNet(comptime rows: usize, comptime cols: usize) type {
     return struct {
         const X = Tensor(f32, &.{ rows, cols });
@@ -1952,6 +1974,23 @@ test "dilated convolutions on the implicit GEMM match the cpu" {
 test "grouped convolutions on the implicit GEMM match the cpu" {
     try gradcheck.expectGpuMatchesCpu(GroupedConvNet, 43, 1e-4);
     try gradcheck.expectTensorCoresClose(GroupedConvNet, 44, 3e-2);
+}
+
+test "strided grouped convolutions match a direct convolution and the cpu on the implicit GEMM" {
+    inline for (.{
+        .{ ConvOpts{ .stride = 2, .pad = 1, .groups = 2 }, 3, 32, 32 },
+        // pad 0 leaves input rows past the dilated output grid, which the subsampled gather must reject.
+        .{ ConvOpts{ .stride = 2, .pad = 0, .groups = 2 }, 3, 32, 32 },
+        .{ ConvOpts{ .stride = 3, .pad = 1, .groups = 2 }, 3, 32, 32 },
+        .{ ConvOpts{ .stride = 2, .pad = 2, .dilation = 2, .groups = 4 }, 3, 64, 64 },
+    }) |config| {
+        const Case = ConvCase(config[0], config[1], config[2], config[3]);
+        try Case.expectDirectConvolution();
+        try gradcheck.expectGpuMatchesCpu(Case, 36, 1e-4);
+        try gradcheck.expectTf32Close(Case, 37, 0.1);
+    }
+    try gradcheck.expectGpuMatchesCpu(StridedGroupedConvNet, 45, 1e-4);
+    try gradcheck.expectTf32Close(StridedGroupedConvNet, 46, 0.1);
 }
 
 test "implicit-GEMM convolutions on tensor cores match a direct convolution and the cpu" {
