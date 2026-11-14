@@ -2,6 +2,7 @@ const std = @import("std");
 const lib = @import("grad");
 const Gpu = lib.gpu.Gpu;
 const norm = lib.math.norm;
+const bf16 = lib.math.bf16;
 
 const testing = std.testing;
 
@@ -108,6 +109,79 @@ test "deterministic mode gives bit-identical results on every run, for split-K p
         try testing.expectApproxEqAbs(@as(f32, @floatCast(mu)), first_stats[ch], 1e-4);
         try testing.expectApproxEqAbs(@as(f32, @floatCast(1 / @sqrt(square / rows + norm.eps))), first_stats[channels + ch], 1e-4);
     }
+}
+
+// Runs convImplicitForward and convImplicitForwardStats on the same input and checks that the stored outputs are
+// bit-identical and that the epilogue sums of value - shift and its square match a host reduction of the output.
+fn runEpilogueStats(gpu: *Gpu, comptime n: usize, comptime side: usize, comptime c_in: usize, comptime c_out: usize, seed: u64) !void {
+    const gpa = testing.allocator;
+    const m = n * side * side;
+    const geo: lib.gpu.ConvGeometry = .{ .n = n, .h = side, .w = side, .c = c_in, .k = 3, .stride = 1, .pad = 1, .out_h = side, .out_w = side, .positions = m, .c_out = c_out };
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rng = prng.random();
+    const x = try gpa.alloc(f32, m * c_in);
+    defer gpa.free(x);
+    const w = try gpa.alloc(f32, 9 * c_in * c_out);
+    defer gpa.free(w);
+    for (x) |*v| v.* = rng.floatNorm(f32) * 2 + 0.5;
+    for (w) |*v| v.* = rng.floatNorm(f32) * 0.05;
+    var shift_host: [c_out]f32 = undefined;
+    for (&shift_host) |*v| v.* = rng.floatNorm(f32) * 0.4;
+    const dx = try gpu.alloc(f32, x.len);
+    const dw = try gpu.alloc(f32, w.len);
+    const dshift = try gpu.alloc(f32, c_out);
+    try gpu.upload(dx, x);
+    try gpu.upload(dw, w);
+    try gpu.upload(dshift, &shift_host);
+    const x_half = (try gpu.packMatrix(dx, m, c_in, .{})).data;
+    const w_half = try gpu.packMatrix(dw, 9 * c_in, c_out, .{ .cols_padded = lib.gpu.padTo(c_out, .columns) });
+    const out_plain = try gpu.scratch(u16, m * c_out);
+    try gpu.convImplicitForward(x_half, w_half, out_plain, geo, false);
+    const out_stats = try gpu.scratch(u16, m * c_out);
+    const sums = try gpu.scratchZeroed(f32, 2 * c_out);
+    try gpu.convImplicitForwardStats(x_half, w_half, out_stats, geo, dshift, sums);
+    const host_plain = try gpa.alloc(u16, m * c_out);
+    defer gpa.free(host_plain);
+    const host_stats = try gpa.alloc(u16, m * c_out);
+    defer gpa.free(host_stats);
+    try gpu.download(host_plain, out_plain);
+    try gpu.download(host_stats, out_stats);
+    try testing.expectEqualSlices(u16, host_plain, host_stats);
+    var host_sums: [2 * c_out]f32 = undefined;
+    try gpu.download(&host_sums, sums);
+    for (0..c_out) |ch| {
+        var s: f64 = 0;
+        var q: f64 = 0;
+        for (0..m) |r| {
+            const v = @as(f64, bf16.decode(host_stats[r * c_out + ch])) - shift_host[ch];
+            s += v;
+            q += v * v;
+        }
+        try testing.expectApproxEqAbs(@as(f32, @floatCast(s)), host_sums[ch], 0.05 + 1e-5 * @abs(@as(f32, @floatCast(s))));
+        try testing.expectApproxEqAbs(@as(f32, @floatCast(q)), host_sums[c_out + ch], 0.05 + 1e-4 * @as(f32, @floatCast(q)));
+    }
+    // The deterministic mode combines per-block partial sums in order: bit-identical across runs, close to the atomic sums.
+    gpu.deterministic = true;
+    defer gpu.deterministic = false;
+    const sums_det = try gpu.scratchZeroed(f32, 2 * c_out);
+    try gpu.convImplicitForwardStats(x_half, w_half, out_stats, geo, dshift, sums_det);
+    var det1: [2 * c_out]f32 = undefined;
+    try gpu.download(&det1, sums_det);
+    const sums_det2 = try gpu.scratchZeroed(f32, 2 * c_out);
+    try gpu.convImplicitForwardStats(x_half, w_half, out_stats, geo, dshift, sums_det2);
+    var det2: [2 * c_out]f32 = undefined;
+    try gpu.download(&det2, sums_det2);
+    try testing.expectEqualSlices(f32, &det1, &det2);
+    for (host_sums, det1) |want, got| try testing.expectApproxEqAbs(want, got, 0.05 + 1e-4 * @abs(want));
+}
+
+test "conv forward epilogue accumulates batch-norm sums that match a host reduction of the output" {
+    const gpu = try Gpu.forTest(128 << 20);
+    defer gpu.deinit();
+    // 96 output channels give the 64-wide tile a partial second tile; 128 channels with enough rows take the wide tile.
+    try runEpilogueStats(gpu, 5, 16, 64, 96, 51);
+    try gpu.resetStep();
+    try runEpilogueStats(gpu, 12, 32, 64, 128, 52);
 }
 
 test "a recorded graph runs only when replayed, zeroes its gradient arena each time, and repeats fills and launches" {

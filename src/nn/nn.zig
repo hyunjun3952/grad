@@ -262,16 +262,23 @@ pub fn ConvBn(comptime c_in: usize, comptime c_out: usize, comptime k: usize, co
         }
 
         pub fn forward(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(autograd.ConvOut(@TypeOf(x.value), Conv.Weights, opts)) {
-            return self.norm.forward(tape, try tape.conv2d(x, self.conv.inner.w, opts));
+            return tape.convBatchNorm(x, self.conv.inner.w, self.norm.gamma, self.norm.beta, self.norm.stats(), opts);
         }
 
         pub fn forwardRelu(self: Self, tape: *Tape, x: anytype) autograd.Error!Var(autograd.ConvOut(@TypeOf(x.value), Conv.Weights, opts)) {
-            return self.norm.forwardRelu(tape, try tape.conv2d(x, self.conv.inner.w, opts));
+            return tape.convBatchNormRelu(x, self.conv.inner.w, self.norm.gamma, self.norm.beta, self.norm.stats(), opts);
         }
 
-        /// Convolution, batch norm, addition of residual and ReLU; the last three run as one kernel.
+        /// Convolution, batch norm, addition of residual and ReLU; the last three run as one kernel, and on the
+        /// bf16 GPU path the batch statistics come from the convolution's epilogue.
         pub fn forwardAddRelu(self: Self, tape: *Tape, x: anytype, residual: anytype) autograd.Error!Var(autograd.ConvOut(@TypeOf(x.value), Conv.Weights, opts)) {
-            return self.norm.forwardAddRelu(tape, try tape.conv2d(x, self.conv.inner.w, opts), residual);
+            return tape.convBatchNormAddRelu(x, self.conv.inner.w, residual, self.norm.gamma, self.norm.beta, self.norm.stats(), opts);
+        }
+
+        /// A residual block of this convolution fused with a preceding one around a virtual middle map: the
+        /// first convolution's batch norm and ReLU are never written to memory. first must use the same opts.
+        pub fn forwardChain(self: Self, tape: *Tape, first: anytype, x: anytype, residual: anytype) autograd.Error!Var(autograd.ConvOut(autograd.ConvOut(@TypeOf(x.value), @TypeOf(first.conv.inner.w.value), opts), Conv.Weights, opts)) {
+            return tape.convBnChain(x, first.conv.inner.w, first.norm.gamma, first.norm.beta, first.norm.stats(), self.conv.inner.w, residual, self.norm.gamma, self.norm.beta, self.norm.stats(), opts);
         }
 
         pub fn params(self: Self) @TypeOf(.{self.conv.inner.w} ++ self.norm.params()) {

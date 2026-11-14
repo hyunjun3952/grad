@@ -1268,6 +1268,394 @@ test "a convolution on bf16 activations agrees with the f32 convolution within b
     for (wide_dw, half_dw) |want, got| try testing.expectApproxEqAbs(want, got, 0.6 + 0.03 * @abs(want));
 }
 
+// Runs convBatchNormRelu (batch statistics from the conv epilogue) or conv2d followed by batchNormRelu (a separate
+// reduction) on bf16 activations and downloads the output, the input, weight, gamma, beta and residual gradients
+// and the running statistics. r_values empty selects the plain ReLU variant.
+fn runConvBn(comptime fused: bool, comptime n: usize, comptime side: usize, comptime c_in: usize, comptime c_out: usize, gpu: *gpu_mod.Gpu, x_values: []const f32, w_values: []const f32, r_values: []const f32, dy_values: []const f32, out: []f32, dx: []f32, dw: []f32, dgamma: []f32, dbeta: []f32, dr: []f32, running: []f32) !void {
+    const X = Tensor(f32, &.{ n, side, side, c_in });
+    const W = Tensor(f32, &.{ 9 * c_in, c_out });
+    const Y = Tensor(f32, &.{ n, side, side, c_out });
+    const Channels = Tensor(f32, &.{c_out});
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try gpu.resetStep();
+    var t: Tape = .{ .gpa = arena.allocator(), .par = .{ .gpu = gpu }, .training = true };
+    const x = try t.leaf(X{ .data = try gpu.alloc(f32, X.len) });
+    const w = try t.leaf(W{ .data = try gpu.alloc(f32, W.len) });
+    try gpu.upload(x.value.data, x_values);
+    try gpu.upload(w.value.data, w_values);
+    try gpu.fill(x.grad.data, 0);
+    try gpu.fill(w.grad.data, 0);
+    const r = try t.leaf(Y{ .data = try gpu.alloc(f32, Y.len) });
+    try gpu.fill(r.value.data, 0);
+    if (r_values.len != 0) try gpu.upload(r.value.data, r_values);
+    try gpu.fill(r.grad.data, 0);
+    const gamma = try t.leaf(Channels{ .data = try gpu.alloc(f32, c_out) });
+    const beta = try t.leaf(Channels{ .data = try gpu.alloc(f32, c_out) });
+    try gpu.fill(gamma.value.data, 1.5);
+    try gpu.fill(beta.value.data, 0.25);
+    try gpu.fill(gamma.grad.data, 0);
+    try gpu.fill(beta.grad.data, 0);
+    const mean = Channels{ .data = try gpu.alloc(f32, c_out) };
+    const variance = Channels{ .data = try gpu.alloc(f32, c_out) };
+    try gpu.fill(mean.data, 0);
+    try gpu.fill(variance.data, 1);
+
+    const input = try t.cast(x, u16);
+    const stats = .{ .mean = mean, .variance = variance };
+    const y = if (r_values.len == 0)
+        (if (fused)
+            try t.convBatchNormRelu(input, w, gamma, beta, stats, .{ .pad = 1 })
+        else
+            try t.batchNormRelu(try t.conv2d(input, w, .{ .pad = 1 }), gamma, beta, stats))
+    else blk: {
+        const residual = try t.cast(r, u16);
+        break :blk if (fused)
+            try t.convBatchNormAddRelu(input, w, residual, gamma, beta, stats, .{ .pad = 1 })
+        else
+            try t.batchNormAddRelu(try t.conv2d(input, w, .{ .pad = 1 }), residual, gamma, beta, stats);
+    };
+    const back = try t.cast(y, f32);
+    try gpu.download(out, back.value.data);
+    try gpu.upload(back.grad.data, dy_values);
+    var at = t.nodes.items.len;
+    while (at > 0) {
+        at -= 1;
+        try t.nodes.items[at].run(&t, t.nodes.items[at].ctx);
+    }
+    if (dx.len != 0) try gpu.download(dx, x.grad.data);
+    if (dw.len != 0) try gpu.download(dw, w.grad.data);
+    if (dgamma.len != 0) try gpu.download(dgamma, gamma.grad.data);
+    if (dbeta.len != 0) try gpu.download(dbeta, beta.grad.data);
+    if (r_values.len != 0) try gpu.download(dr, r.grad.data);
+    try gpu.download(running[0..c_out], mean.data);
+    try gpu.download(running[c_out..], variance.data);
+}
+
+fn expectConvBnClose(fused: []const f32, unfused: []const f32, abs: f32, rel: f32, max_flipped: usize) !void {
+    var flipped: usize = 0;
+    for (fused, unfused) |got, want| {
+        if (!std.math.isFinite(got) or @abs(want - got) > abs + rel * @abs(want)) flipped += 1;
+    }
+    try testing.expect(flipped <= max_flipped);
+}
+
+// Compares buffers whose differences are dominated by ReLU mask flips: about 0.1% of the positions of a chain's
+// output sit close enough to the boundary that the one-ulp difference of the virtual map (rebuilt with
+// bf16-rounded scale and shift) flips the mask, and each flip redirects a whole gradient value. Per-element
+// tolerances cannot hold there; the root-mean-square distance and the largest error relative to the largest
+// wanted value are what separate that rounding cascade from a broken kernel.
+fn expectConvBnNoise(fused: []const f32, unfused: []const f32, max_rms: f64, max_worst: f32) !void {
+    var sq_diff: f64 = 0;
+    var sq_want: f64 = 0;
+    var worst: f32 = 0;
+    var max_want: f32 = 0;
+    for (fused, unfused) |got, want| {
+        try testing.expect(std.math.isFinite(got));
+        const err = @abs(want - got);
+        if (err > worst) worst = err;
+        sq_diff += @as(f64, err) * err;
+        sq_want += @as(f64, want) * want;
+        if (@abs(want) > max_want) max_want = @abs(want);
+    }
+    try testing.expect(@sqrt(sq_diff / sq_want) <= max_rms);
+    try testing.expect(worst <= max_worst * max_want);
+}
+
+const ChainBufs = struct { out: []f32, dx: []f32, dw1: []f32, dw2: []f32, dg1: []f32, db1: []f32, dg2: []f32, db2: []f32, dr: []f32, run1: []f32, run2: []f32 };
+
+fn runConvBnChain(comptime fused: bool, comptime n: usize, comptime side: usize, comptime c_in: usize, comptime c1: usize, comptime c2: usize, gpu: *gpu_mod.Gpu, x_values: []const f32, w1_values: []const f32, w2_values: []const f32, r_values: []const f32, dy_values: []const f32, bufs: ChainBufs) !void {
+    const X = Tensor(f32, &.{ n, side, side, c_in });
+    const W1 = Tensor(f32, &.{ 9 * c_in, c1 });
+    const W2 = Tensor(f32, &.{ 9 * c1, c2 });
+    const Y = Tensor(f32, &.{ n, side, side, c2 });
+    const Ch1 = Tensor(f32, &.{c1});
+    const Ch2 = Tensor(f32, &.{c2});
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try gpu.resetStep();
+    var t: Tape = .{ .gpa = arena.allocator(), .par = .{ .gpu = gpu }, .training = true };
+    const x = try t.leaf(X{ .data = try gpu.alloc(f32, X.len) });
+    const w1 = try t.leaf(W1{ .data = try gpu.alloc(f32, W1.len) });
+    const w2 = try t.leaf(W2{ .data = try gpu.alloc(f32, W2.len) });
+    const r = try t.leaf(Y{ .data = try gpu.alloc(f32, Y.len) });
+    try gpu.upload(x.value.data, x_values);
+    try gpu.upload(w1.value.data, w1_values);
+    try gpu.upload(w2.value.data, w2_values);
+    try gpu.upload(r.value.data, r_values);
+    try gpu.fill(x.grad.data, 0);
+    try gpu.fill(w1.grad.data, 0);
+    try gpu.fill(w2.grad.data, 0);
+    try gpu.fill(r.grad.data, 0);
+    const gamma1 = try t.leaf(Ch1{ .data = try gpu.alloc(f32, c1) });
+    const beta1 = try t.leaf(Ch1{ .data = try gpu.alloc(f32, c1) });
+    const gamma2 = try t.leaf(Ch2{ .data = try gpu.alloc(f32, c2) });
+    const beta2 = try t.leaf(Ch2{ .data = try gpu.alloc(f32, c2) });
+    try gpu.fill(gamma1.value.data, 1.5);
+    try gpu.fill(beta1.value.data, 0.25);
+    try gpu.fill(gamma2.value.data, 1.5);
+    try gpu.fill(beta2.value.data, 0.25);
+    try gpu.fill(gamma1.grad.data, 0);
+    try gpu.fill(beta1.grad.data, 0);
+    try gpu.fill(gamma2.grad.data, 0);
+    try gpu.fill(beta2.grad.data, 0);
+    const mean1 = Ch1{ .data = try gpu.alloc(f32, c1) };
+    const variance1 = Ch1{ .data = try gpu.alloc(f32, c1) };
+    const mean2 = Ch2{ .data = try gpu.alloc(f32, c2) };
+    const variance2 = Ch2{ .data = try gpu.alloc(f32, c2) };
+    try gpu.fill(mean1.data, 0);
+    try gpu.fill(variance1.data, 1);
+    try gpu.fill(mean2.data, 0);
+    try gpu.fill(variance2.data, 1);
+
+    const input = try t.cast(x, u16);
+    const residual = try t.cast(r, u16);
+    const stats1 = .{ .mean = mean1, .variance = variance1 };
+    const stats2 = .{ .mean = mean2, .variance = variance2 };
+    const y = if (fused)
+        try t.convBnChain(input, w1, gamma1, beta1, stats1, w2, residual, gamma2, beta2, stats2, .{ .pad = 1 })
+    else
+        try t.convBatchNormAddRelu(try t.convBatchNormRelu(input, w1, gamma1, beta1, stats1, .{ .pad = 1 }), w2, residual, gamma2, beta2, stats2, .{ .pad = 1 });
+    const back = try t.cast(y, f32);
+    try gpu.download(bufs.out, back.value.data);
+    try gpu.upload(back.grad.data, dy_values);
+    var at = t.nodes.items.len;
+    while (at > 0) {
+        at -= 1;
+        try t.nodes.items[at].run(&t, t.nodes.items[at].ctx);
+    }
+    try gpu.download(bufs.dx, x.grad.data);
+    try gpu.download(bufs.dw1, w1.grad.data);
+    try gpu.download(bufs.dw2, w2.grad.data);
+    try gpu.download(bufs.dg1, gamma1.grad.data);
+    try gpu.download(bufs.db1, beta1.grad.data);
+    try gpu.download(bufs.dg2, gamma2.grad.data);
+    try gpu.download(bufs.db2, beta2.grad.data);
+    try gpu.download(bufs.dr, r.grad.data);
+    try gpu.download(bufs.run1[0..c1], mean1.data);
+    try gpu.download(bufs.run1[c1..], variance1.data);
+    try gpu.download(bufs.run2[0..c2], mean2.data);
+    try gpu.download(bufs.run2[c2..], variance2.data);
+}
+
+fn expectChainMatch(comptime n: usize, comptime side: usize, comptime c_in: usize, comptime c1: usize, comptime c2: usize, seed: u64, gpu_bytes: usize) !void {
+    const gpu = try gpu_mod.Gpu.forTest(gpu_bytes);
+    defer gpu.deinit();
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rng = prng.random();
+    const xl = n * side * side * c_in;
+    const yl = n * side * side * c2;
+    const w1l = 9 * c_in * c1;
+    const w2l = 9 * c1 * c2;
+    const x = try testing.allocator.alloc(f32, xl);
+    defer testing.allocator.free(x);
+    const w1 = try testing.allocator.alloc(f32, w1l);
+    defer testing.allocator.free(w1);
+    const w2 = try testing.allocator.alloc(f32, w2l);
+    defer testing.allocator.free(w2);
+    const r = try testing.allocator.alloc(f32, yl);
+    defer testing.allocator.free(r);
+    const dy = try testing.allocator.alloc(f32, yl);
+    defer testing.allocator.free(dy);
+    for (x) |*v| v.* = rng.floatNorm(f32) * 2 + 0.5;
+    for (w1) |*v| v.* = rng.floatNorm(f32) * 0.05;
+    for (w2) |*v| v.* = rng.floatNorm(f32) * 0.05;
+    for (r) |*v| v.* = rng.floatNorm(f32);
+    for (dy) |*v| v.* = rng.floatNorm(f32);
+    const run_len = yl + xl + w1l + w2l + 4 * c1 + 4 * c2 + yl;
+    const fused = try testing.allocator.alloc(f32, run_len);
+    defer testing.allocator.free(fused);
+    const plain = try testing.allocator.alloc(f32, run_len);
+    defer testing.allocator.free(plain);
+    const carve = struct {
+        fn of(buf: []f32) ChainBufs {
+            var at: usize = 0;
+            var out: ChainBufs = undefined;
+            inline for (.{ "out", "dx", "dw1", "dw2", "dg1", "db1", "dg2", "db2", "dr", "run1", "run2" }) |name| {
+                const len = comptime blk: {
+                    if (std.mem.eql(u8, name, "out") or std.mem.eql(u8, name, "dr")) break :blk yl;
+                    if (std.mem.eql(u8, name, "dx")) break :blk xl;
+                    if (std.mem.eql(u8, name, "dw1")) break :blk w1l;
+                    if (std.mem.eql(u8, name, "dw2")) break :blk w2l;
+                    if (std.mem.eql(u8, name, "run1")) break :blk 2 * c1;
+                    if (std.mem.eql(u8, name, "run2")) break :blk 2 * c2;
+                    if (name[name.len - 1] == '1') break :blk c1;
+                    break :blk c2;
+                };
+                @field(out, name) = buf[at..][0..len];
+                at += len;
+            }
+            return out;
+        }
+    }.of;
+    const fused_bufs = carve(fused);
+    const plain_bufs = carve(plain);
+    try runConvBnChain(true, n, side, c_in, c1, c2, gpu, x, w1, w2, r, dy, fused_bufs);
+    try runConvBnChain(false, n, side, c_in, c1, c2, gpu, x, w1, w2, r, dy, plain_bufs);
+    // NOTE: the virtual map is rebuilt on load with bf16-rounded scale and shift (one extra bf16 step next to
+    // the map's own bf16 storage), so the forward output lands within a rounding of the materialized path, and
+    // the gradients pick up the mask-flip cascade described at expectConvBnNoise.
+    try expectConvBnClose(fused_bufs.out, plain_bufs.out, 0.06, 0.01, yl / 1000);
+    try expectConvBnNoise(fused_bufs.dx, plain_bufs.dx, 0.06, 0.3);
+    try expectConvBnNoise(fused_bufs.dw1, plain_bufs.dw1, 0.06, 0.3);
+    try expectConvBnNoise(fused_bufs.dw2, plain_bufs.dw2, 0.06, 0.3);
+    try expectConvBnNoise(fused_bufs.dg1, plain_bufs.dg1, 0.06, 0.3);
+    try expectConvBnNoise(fused_bufs.db1, plain_bufs.db1, 0.06, 0.3);
+    try expectConvBnNoise(fused_bufs.dg2, plain_bufs.dg2, 0.06, 0.3);
+    try expectConvBnNoise(fused_bufs.db2, plain_bufs.db2, 0.06, 0.3);
+    try expectConvBnClose(fused_bufs.dr, plain_bufs.dr, 0.01, 0.01, yl / 500);
+    try expectConvBnClose(fused_bufs.run1, plain_bufs.run1, 0.02, 0.02, 0);
+    try expectConvBnClose(fused_bufs.run2, plain_bufs.run2, 0.02, 0.02, 0);
+
+    // A deterministic device combines the per-block sums in order; both orders are valid roundings of the same sums.
+    gpu.deterministic = true;
+    defer gpu.deterministic = false;
+    try runConvBnChain(true, n, side, c_in, c1, c2, gpu, x, w1, w2, r, dy, plain_bufs);
+    try expectConvBnClose(fused_bufs.out, plain_bufs.out, 0.06, 0.01, yl / 1000);
+    try expectConvBnClose(fused_bufs.dx, plain_bufs.dx, 0.05, 0.03, xl / 1000);
+    try expectConvBnClose(fused_bufs.dw1, plain_bufs.dw1, 0.05, 0.03, w1l / 1000);
+    try expectConvBnClose(fused_bufs.dw2, plain_bufs.dw2, 0.05, 0.03, w2l / 1000);
+    try expectConvBnClose(fused_bufs.dg1, plain_bufs.dg1, 0.02, 0.02, 0);
+    try expectConvBnClose(fused_bufs.db1, plain_bufs.db1, 0.02, 0.02, 0);
+}
+
+test "conv batch-norm chain around a virtual map matches the unfused pair, forward and backward" {
+    try expectChainMatch(2, 16, 64, 64, 64, 51, 64 << 20);
+}
+
+test "conv batch-norm chain with a non-tile-multiple output width matches the unfused pair" {
+    try expectChainMatch(2, 16, 64, 64, 96, 52, 64 << 20);
+}
+
+test "conv batch-norm chain on the wide tiles matches the unfused pair" {
+    try expectChainMatch(12, 32, 64, 128, 128, 53, 256 << 20);
+}
+
+test "conv + batch norm with statistics from the conv epilogue matches the unfused path, forward and backward" {
+    const gpu = try gpu_mod.Gpu.forTest(64 << 20);
+    defer gpu.deinit();
+    const n = 2;
+    const side = 16;
+    const c_in = 64;
+    // NOTE: 96 output channels give the 64-wide tile a partial second tile, exercising the edge guards of the epilogue.
+    const c_out = 96;
+    var prng = std.Random.DefaultPrng.init(41);
+    const rng = prng.random();
+    const xl = n * side * side * c_in;
+    const wl = 9 * c_in * c_out;
+    const yl = n * side * side * c_out;
+    const x = try testing.allocator.alloc(f32, xl);
+    defer testing.allocator.free(x);
+    const w = try testing.allocator.alloc(f32, wl);
+    defer testing.allocator.free(w);
+    const dy = try testing.allocator.alloc(f32, yl);
+    defer testing.allocator.free(dy);
+    for (x) |*v| v.* = rng.floatNorm(f32) * 2 + 0.5;
+    for (w) |*v| v.* = rng.floatNorm(f32) * 0.05;
+    for (dy) |*v| v.* = rng.floatNorm(f32);
+    const bufs = try testing.allocator.alloc(f32, 2 * (yl + xl + wl + 4 * c_out));
+    defer testing.allocator.free(bufs);
+    const fused_out = bufs[0..yl];
+    const fused_dx = bufs[yl..][0..xl];
+    const fused_dw = bufs[yl + xl ..][0..wl];
+    const fused_dg = bufs[yl + xl + wl ..][0..c_out];
+    const fused_db = bufs[yl + xl + wl + c_out ..][0..c_out];
+    const fused_running = bufs[yl + xl + wl + 2 * c_out ..][0 .. 2 * c_out];
+    const plain_out = bufs[yl + xl + wl + 4 * c_out ..][0..yl];
+    const plain_dx = bufs[2 * yl + xl + wl + 4 * c_out ..][0..xl];
+    const plain_dw = bufs[2 * yl + 2 * xl + wl + 4 * c_out ..][0..wl];
+    const plain_dg = bufs[2 * yl + 2 * xl + 2 * wl + 4 * c_out ..][0..c_out];
+    const plain_db = bufs[2 * yl + 2 * xl + 2 * wl + 5 * c_out ..][0..c_out];
+    const plain_running = bufs[2 * yl + 2 * xl + 2 * wl + 6 * c_out ..][0 .. 2 * c_out];
+    try runConvBn(true, n, side, c_in, c_out, gpu, x, w, &.{}, dy, fused_out, fused_dx, fused_dw, fused_dg, fused_db, &.{}, fused_running);
+    try runConvBn(false, n, side, c_in, c_out, gpu, x, w, &.{}, dy, plain_out, plain_dx, plain_dw, plain_dg, plain_db, &.{}, plain_running);
+    // NOTE: the two reductions sum in a different order, so an occasional output lands one bf16 ulp apart.
+    try expectConvBnClose(fused_out, plain_out, 0.06, 0.01, yl / 1000);
+    try expectConvBnClose(fused_dx, plain_dx, 0.05, 0.03, xl / 1000);
+    try expectConvBnClose(fused_dw, plain_dw, 0.05, 0.03, wl / 1000);
+    try expectConvBnClose(fused_dg, plain_dg, 0.02, 0.02, 0);
+    try expectConvBnClose(fused_db, plain_db, 0.02, 0.02, 0);
+    try expectConvBnClose(fused_running, plain_running, 0.02, 0.02, 0);
+
+    // A deterministic device combines the per-block sums in order; both orders are valid roundings of the same sums.
+    gpu.deterministic = true;
+    defer gpu.deterministic = false;
+    try runConvBn(true, n, side, c_in, c_out, gpu, x, w, &.{}, dy, plain_out, plain_dx, plain_dw, plain_dg, plain_db, &.{}, plain_running);
+    try expectConvBnClose(fused_out, plain_out, 0.06, 0.01, yl / 1000);
+    try expectConvBnClose(fused_dx, plain_dx, 0.05, 0.03, xl / 1000);
+    try expectConvBnClose(fused_dw, plain_dw, 0.05, 0.03, wl / 1000);
+}
+
+test "conv + batch norm + residual with statistics from the conv epilogue matches the unfused path" {
+    const gpu = try gpu_mod.Gpu.forTest(64 << 20);
+    defer gpu.deinit();
+    const n = 2;
+    const side = 16;
+    const c = 64;
+    var prng = std.Random.DefaultPrng.init(42);
+    const rng = prng.random();
+    const xl = n * side * side * c;
+    const wl = 9 * c * c;
+    const x = try testing.allocator.alloc(f32, xl);
+    defer testing.allocator.free(x);
+    const w = try testing.allocator.alloc(f32, wl);
+    defer testing.allocator.free(w);
+    const r = try testing.allocator.alloc(f32, xl);
+    defer testing.allocator.free(r);
+    const dy = try testing.allocator.alloc(f32, xl);
+    defer testing.allocator.free(dy);
+    for (x) |*v| v.* = rng.floatNorm(f32) * 2 + 0.5;
+    for (w) |*v| v.* = rng.floatNorm(f32) * 0.05;
+    for (r) |*v| v.* = rng.floatNorm(f32);
+    for (dy) |*v| v.* = rng.floatNorm(f32);
+    const fused = try testing.allocator.alloc(f32, 3 * xl + wl + 4 * c);
+    defer testing.allocator.free(fused);
+    const plain = try testing.allocator.alloc(f32, fused.len);
+    defer testing.allocator.free(plain);
+    const fused_out, const fused_dx, const fused_dw, const fused_dr, const fused_g, const fused_b, const fused_run = .{ fused[0..xl], fused[xl..][0..xl], fused[2 * xl ..][0..wl], fused[2 * xl + wl ..][0..xl], fused[2 * xl + wl + xl ..][0..c], fused[2 * xl + wl + xl + c ..][0..c], fused[2 * xl + wl + xl + 2 * c ..][0 .. 2 * c] };
+    const plain_out, const plain_dx, const plain_dw, const plain_dr, const plain_g, const plain_b, const plain_run = .{ plain[0..xl], plain[xl..][0..xl], plain[2 * xl ..][0..wl], plain[2 * xl + wl ..][0..xl], plain[2 * xl + wl + xl ..][0..c], plain[2 * xl + wl + xl + c ..][0..c], plain[2 * xl + wl + xl + 2 * c ..][0 .. 2 * c] };
+    try runConvBn(true, n, side, c, c, gpu, x, w, r, dy, fused_out, fused_dx, fused_dw, fused_g, fused_b, fused_dr, fused_run);
+    try runConvBn(false, n, side, c, c, gpu, x, w, r, dy, plain_out, plain_dx, plain_dw, plain_g, plain_b, plain_dr, plain_run);
+    try expectConvBnClose(fused_out, plain_out, 0.06, 0.01, xl / 1000);
+    try expectConvBnClose(fused_dx, plain_dx, 0.05, 0.03, xl / 1000);
+    try expectConvBnClose(fused_dw, plain_dw, 0.05, 0.03, wl / 1000);
+    try expectConvBnClose(fused_dr, plain_dr, 0.01, 0.01, 0);
+    try expectConvBnClose(fused_g, plain_g, 0.02, 0.02, 0);
+    try expectConvBnClose(fused_b, plain_b, 0.02, 0.02, 0);
+    try expectConvBnClose(fused_run, plain_run, 0.02, 0.02, 0);
+}
+
+test "conv + batch norm epilogue statistics on the wide tile match the unfused path" {
+    const gpu = try gpu_mod.Gpu.forTest(256 << 20);
+    defer gpu.deinit();
+    const n = 12;
+    const side = 32;
+    const c_in = 64;
+    const c_out = 128;
+    var prng = std.Random.DefaultPrng.init(43);
+    const rng = prng.random();
+    const xl = n * side * side * c_in;
+    const wl = 9 * c_in * c_out;
+    const yl = n * side * side * c_out;
+    const x = try testing.allocator.alloc(f32, xl);
+    defer testing.allocator.free(x);
+    const w = try testing.allocator.alloc(f32, wl);
+    defer testing.allocator.free(w);
+    const dy = try testing.allocator.alloc(f32, yl);
+    defer testing.allocator.free(dy);
+    for (x) |*v| v.* = rng.floatNorm(f32);
+    for (w) |*v| v.* = rng.floatNorm(f32) * 0.05;
+    for (dy) |*v| v.* = rng.floatNorm(f32);
+    const fused = try testing.allocator.alloc(f32, yl + 2 * c_out);
+    defer testing.allocator.free(fused);
+    const plain = try testing.allocator.alloc(f32, fused.len);
+    defer testing.allocator.free(plain);
+    try runConvBn(true, n, side, c_in, c_out, gpu, x, w, &.{}, dy, fused[0..yl], &.{}, &.{}, &.{}, &.{}, &.{}, fused[yl..]);
+    try runConvBn(false, n, side, c_in, c_out, gpu, x, w, &.{}, dy, plain[0..yl], &.{}, &.{}, &.{}, &.{}, &.{}, plain[yl..]);
+    try expectConvBnClose(fused[0..yl], plain[0..yl], 0.06, 0.01, yl / 1000);
+    try expectConvBnClose(fused[yl..], plain[yl..], 0.02, 0.02, 0);
+}
+
 test "softmax rows, with and without a causal mask, have correct values and gradients on the cpu and the gpu" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

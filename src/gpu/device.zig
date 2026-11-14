@@ -50,6 +50,16 @@ inline fn warpSum(value: f32) f32 {
     return total;
 }
 
+// Adds value across the lanes that are offset apart; every lane gets the same total. All lanes of the warp must call it together.
+inline fn shflXor(value: f32, comptime offset: u32) f32 {
+    const other = asm volatile ("shfl.sync.bfly.b32 %[out], %[in], %[offset], 0x1f, 0xffffffff;"
+        : [out] "=r" (-> u32),
+        : [in] "r" (@as(u32, @bitCast(value))),
+          [offset] "r" (@as(u32, offset)),
+    );
+    return value + @as(f32, @bitCast(other));
+}
+
 // The largest value across the 32 lanes of a warp; every lane gets it. All lanes of the warp must call it together.
 inline fn warpMax(value: f32) f32 {
     var best = value;
@@ -62,6 +72,17 @@ inline fn warpMax(value: f32) f32 {
         best = @max(best, @as(f32, @bitCast(other)));
     }
     return best;
+}
+
+// Writes 16 bytes of bf16 quiet NaNs to shared memory. A gathered copy that falls outside the input taps uses this
+// instead of a zero-fill when the operand is transformed on load: the transform maps NaN to exactly 0, while a
+// zero-filled value would wrongly come out of relu(scale * 0 + shift) as max(shift, 0).
+inline fn storeMagicShared(dst: u32) void {
+    asm volatile ("st.shared.v4.b32 [%[dst]], {%[m], %[m], %[m], %[m]};"
+        :
+        : [dst] "r" (dst),
+          [m] "r" (@as(u32, 0x7fc07fc0)),
+        : .{ .memory = true });
 }
 
 // The row a warp works on when a kernel runs one warp per row (eight rows per block of 256 threads), and the lane within it.
@@ -1106,6 +1127,13 @@ inline fn waitCopies(comptime pending: usize) void {
     asm volatile (std.fmt.comptimePrint("cp.async.wait_group {d};", .{pending}) ::: .{ .memory = true });
 }
 
+// One gathered operand copy: an asynchronous 16-byte copy with zero-fill, or, when the operand is transformed on
+// load (magic), a NaN marker for out-of-bounds taps that the transform turns back into an exact zero.
+inline fn fillSlot(dst: u32, src: anytype, valid: bool, comptime magic: bool) void {
+    if (magic and !valid) return storeMagicShared(dst);
+    copyAsyncZfill(dst, src, valid);
+}
+
 const Acc = [4][4][4]f32;
 const Warp = struct { lane: usize, row: usize, col: usize };
 const Block = struct { tid: usize, row0: usize, col0: usize, k_begin: usize };
@@ -1119,6 +1147,15 @@ const GemmKind = struct {
     rows: usize = 128,
     cols: usize = 64,
     mode: GemmMode,
+    // Adds per-channel batch-norm sums of the output to the epilogue (see statsTile).
+    bn_stats: bool = false,
+    // gather_a only: the left operand is a virtual batch-norm-plus-ReLU output, recomputed on load from the raw
+    // values (see affinePair). Out-of-bounds taps carry NaN markers so the transform yields exact zeros.
+    affine_a: bool = false,
+    // gather_b only: the same transform applied to the gathered right operand of a weight gradient.
+    affine_b: bool = false,
+    // Adds the masked per-channel sums a batch-norm backward needs to the epilogue (see dxStatsTile).
+    dx_stats: bool = false,
 
     fn Elem(comptime self: GemmKind) type {
         return if (self.tf32) f32 else u16;
@@ -1261,7 +1298,7 @@ fn GemmLoader(comptime kind: GemmKind) type {
                             @as(usize, @intCast(x))) * channel_step + self.cursor_channel + self.chunk_a * lane_elems
                     else
                         0;
-                    copyAsyncZfill(tc.sharedAddress(base + self.dst_a[i]), self.a + at, valid);
+                    fillSlot(tc.sharedAddress(base + self.dst_a[i]), self.a + at, valid, kind.affine_a);
                 }
                 self.cursor_channel += tc.depth;
                 if (self.cursor_channel >= geometry.c) {
@@ -1293,7 +1330,7 @@ fn GemmLoader(comptime kind: GemmKind) type {
                     const x = @as(i32, @intCast(self.p_x[j] * geometry.stride)) + self.tap_kx[j] * dil - @as(i32, @intCast(geometry.pad));
                     const valid = self.p[j] < geometry.positions and y >= 0 and y < @as(i32, @intCast(geometry.h)) and x >= 0 and x < @as(i32, @intCast(geometry.w));
                     const at = if (valid) ((@as(usize, self.p_n[j]) * geometry.h + @as(usize, @intCast(y))) * geometry.w + @as(usize, @intCast(x))) * channel_step + self.tap_channel[j] else 0;
-                    copyAsyncZfill(tc.sharedAddress(base + self.dst_b[j]), self.b + at, valid);
+                    fillSlot(tc.sharedAddress(base + self.dst_b[j]), self.b + at, valid, kind.affine_b);
                     // NOTE: issue is called for consecutive tiles of K, so the position moves by exactly depth each time.
                     self.p[j] += tc.depth;
                     self.p_x[j] += self.step_x;
@@ -1316,8 +1353,13 @@ fn GemmLoader(comptime kind: GemmKind) type {
     };
 }
 
+// Per-position scale and shift of a virtual batch-norm-plus-ReLU operand, expanded over the (tap, channel) index
+// and packed as bf16 pairs: scale2 and shift2 hold the pairs (2j, 2j+1) for the A fragments, scalec and shiftc
+// hold one duplicated value per column for the B fragments.
+const AffineLoad = struct { scale2: [*]const u32, shift2: [*]const u32, scalec: [*]const u32, shiftc: [*]const u32 };
+
 // Overlaps loading and computing: the copies for the next stages are in flight while the current tile is multiplied.
-inline fn pipeline(comptime kind: GemmKind, loader: anytype, block: Block, tiles: usize, warp: Warp, acc: *Acc) void {
+inline fn pipeline(comptime kind: GemmKind, loader: anytype, block: Block, tiles: usize, warp: Warp, aff: AffineLoad, acc: *Acc) void {
     const tc = kind.Tile();
     inline for (0..tc.stages - 1) |stage| {
         if (stage < tiles) loader.issue(stage, block.k_begin + stage * tc.depth);
@@ -1331,7 +1373,7 @@ inline fn pipeline(comptime kind: GemmKind, loader: anytype, block: Block, tiles
         if (ahead < tiles) loader.issue(ahead % tc.stages, block.k_begin + ahead * tc.depth);
         commitCopies();
         const base = (tile % tc.stages) * tc.stage_elems;
-        if (kind.exact) f32Compute(tc, warp, base, acc) else if (kind.tf32) tf32Compute(tc, warp, base, acc) else bf16Compute(tc, kind.transposedA(), warp, base, acc);
+        if (kind.exact) f32Compute(tc, warp, base, acc) else if (kind.tf32) tf32Compute(tc, warp, base, acc) else bf16Compute(tc, kind, warp, base, block.k_begin + tile * tc.depth, block.col0, aff, acc);
     }
 }
 
@@ -1366,8 +1408,149 @@ inline fn storeTile(comptime kind: GemmKind, c: [*]f32, acc: *const Acc, shape: 
     }
 }
 
+// The per-channel sums a batch norm needs, accumulated in the GEMM epilogue: shift centers the values (the host
+// passes the running mean, a close estimate, so the squared sums keep their precision), sums takes the results
+// atomically, and in an ordered (deterministic) run partial takes one entry per block row for an ordered combine.
+const BnStats = struct { shift: [*]const f32, sums: [*]f32, partial: [*]f32, ordered: u32 };
+
+// The per-channel sums a batch-norm backward needs, accumulated in the epilogue of the GEMM that produces the
+// output gradient of a virtual normalized map: x is the raw map the norm ran on, the affine parameters rebuild
+// the ReLU mask and the normalized values, and sums takes the masked sums of dy and of dy * x_hat.
+const DxStats = struct { x: [*]const u16, mean: [*]const f32, inv_std: [*]const f32, gamma: [*]const f32, beta: [*]const f32, sums: [*]f32, partial: [*]f32, ordered: u32 };
+
+// Folds the per-lane column sums across the warp and the warp rows of the tile, then flushes them to the global
+// sums (atomically, or to the per-block-row partial buffer of an ordered run).
+inline fn flushStats(comptime kind: GemmKind, sums: *const [4][2]f32, squares: *const [4][2]f32, shape: ga.TensorShape, block: Block, warp: Warp, out_sums: [*]f32, out_partial: [*]f32, ordered: u32) void {
+    const tc = kind.Tile();
+    var total_sums = sums.*;
+    var total_squares = squares.*;
+    // NOTE: the lanes that share a column are four apart (the column comes from lane % 4, the row from lane / 4),
+    // so folding those three lane bits leaves the warp's column sums in every lane.
+    inline for (.{ 4, 8, 16 }) |offset| {
+        inline for (0..4) |ni| {
+            inline for (0..2) |qp| {
+                total_sums[ni][qp] = shflXor(total_sums[ni][qp], offset);
+                total_squares[ni][qp] = shflXor(total_squares[ni][qp], offset);
+            }
+        }
+    }
+    // The pipeline is done, so its shared memory hosts the reduction across the warp rows of the tile.
+    barrier();
+    const red: [*]addrspace(.shared) f32 = @ptrCast(&tc.smem[0]);
+    if (warp.lane < 4) {
+        inline for (0..4) |ni| {
+            inline for (0..2) |qp| {
+                const at = (warp.row * tc.cols + warp.col * 32 + ni * 8 + warp.lane * 2 + qp) * 2;
+                red[at] = total_sums[ni][qp];
+                red[at + 1] = total_squares[ni][qp];
+            }
+        }
+    }
+    barrier();
+    const warp_rows = 8 / (tc.cols / 32);
+    if (block.tid < tc.cols) {
+        const ch = block.col0 + block.tid;
+        if (ch < shape.n) {
+            var total: f32 = 0;
+            var total_sq: f32 = 0;
+            inline for (0..warp_rows) |wr| {
+                total += red[(wr * tc.cols + block.tid) * 2];
+                total_sq += red[(wr * tc.cols + block.tid) * 2 + 1];
+            }
+            if (ordered != 0) {
+                const at = @as(usize, @workGroupId(1)) * 2 * shape.n + ch;
+                out_partial[at] = total;
+                out_partial[at + shape.n] = total_sq;
+            } else {
+                _ = @atomicRmw(f32, &out_sums[ch], .Add, total, .monotonic);
+                _ = @atomicRmw(f32, &out_sums[shape.n + ch], .Add, total_sq, .monotonic);
+            }
+        }
+    }
+}
+
+// Accumulates the sums of v - shift and (v - shift)^2 per output channel of the tile, over the same values the
+// tile stores (bf16-rounded when the output is bf16, so the sums match the stored feature map).
+inline fn statsTile(comptime kind: GemmKind, st: BnStats, acc: *const Acc, shape: ga.TensorShape, block: Block, warp: Warp) void {
+    const tc = kind.Tile();
+    const half_output = !kind.tf32;
+    var sums: [4][2]f32 = @splat(@splat(0));
+    var squares: [4][2]f32 = @splat(@splat(0));
+    var shift: [4][2]f32 = undefined;
+    inline for (0..4) |ni| {
+        inline for (0..2) |qp| {
+            const col = block.col0 + warp.col * 32 + ni * 8 + (warp.lane % 4) * 2 + qp;
+            shift[ni][qp] = if (col < shape.n) st.shift[col] else 0;
+        }
+    }
+    inline for (0..tc.warp_m / 16) |mi| {
+        inline for (0..4) |ni| {
+            inline for (0..4) |q| {
+                const r = block.row0 + warp.row * tc.warp_m + mi * 16 + warp.lane / 4 + (q / 2) * 8;
+                const col = block.col0 + warp.col * 32 + ni * 8 + (warp.lane % 4) * 2 + q % 2;
+                if (r < shape.m and col < shape.n) {
+                    const stored = if (half_output) bf16.decode(bf16.encode(acc[mi][ni][q])) else acc[mi][ni][q];
+                    const v = stored - shift[ni][q % 2];
+                    sums[ni][q % 2] += v;
+                    squares[ni][q % 2] += v * v;
+                }
+            }
+        }
+    }
+    flushStats(kind, &sums, &squares, shape, block, warp, st.sums, st.partial, st.ordered);
+}
+
+// Accumulates the sums of g and g * x_hat per output channel of the tile, where g is the stored output gradient
+// masked by the ReLU of the virtual normalized map: the map itself is never written, so the mask and x_hat are
+// rebuilt from the raw map x and the affine parameters (mask is gamma * x_hat + beta > 0).
+inline fn dxStatsTile(comptime kind: GemmKind, st: DxStats, acc: *const Acc, shape: ga.TensorShape, block: Block, warp: Warp) void {
+    const tc = kind.Tile();
+    var sums: [4][2]f32 = @splat(@splat(0));
+    var squares: [4][2]f32 = @splat(@splat(0));
+    var mean: [4][2]f32 = undefined;
+    var inv_std: [4][2]f32 = undefined;
+    var gamma: [4][2]f32 = undefined;
+    var beta: [4][2]f32 = undefined;
+    inline for (0..4) |ni| {
+        inline for (0..2) |qp| {
+            const col = block.col0 + warp.col * 32 + ni * 8 + (warp.lane % 4) * 2 + qp;
+            const valid = col < shape.n;
+            mean[ni][qp] = if (valid) st.mean[col] else 0;
+            inv_std[ni][qp] = if (valid) st.inv_std[col] else 0;
+            gamma[ni][qp] = if (valid) st.gamma[col] else 0;
+            beta[ni][qp] = if (valid) st.beta[col] else 0;
+        }
+    }
+    inline for (0..tc.warp_m / 16) |mi| {
+        inline for (0..4) |ni| {
+            inline for (0..2) |qh| {
+                const r = block.row0 + warp.row * tc.warp_m + mi * 16 + warp.lane / 4 + qh * 8;
+                const col = block.col0 + warp.col * 32 + ni * 8 + (warp.lane % 4) * 2;
+                // NOTE: col and shape.n are even (whole 8-channel groups), so the pair load is aligned and in bounds.
+                if (r < shape.m and col < shape.n) {
+                    const pair: u32 = @as(*align(4) const u32, @ptrCast(@alignCast(st.x + r * shape.n + col))).*;
+                    const x0: f32 = @bitCast(pair << 16);
+                    const x1: f32 = @bitCast(pair & 0xffff0000);
+                    const xh0 = (x0 - mean[ni][0]) * inv_std[ni][0];
+                    const xh1 = (x1 - mean[ni][1]) * inv_std[ni][1];
+                    const g0 = if (gamma[ni][0] * xh0 + beta[ni][0] > 0) bf16.decode(bf16.encode(acc[mi][ni][2 * qh])) else 0;
+                    const g1 = if (gamma[ni][1] * xh1 + beta[ni][1] > 0) bf16.decode(bf16.encode(acc[mi][ni][2 * qh + 1])) else 0;
+                    sums[ni][0] += g0;
+                    sums[ni][1] += g1;
+                    squares[ni][0] += g0 * xh0;
+                    squares[ni][1] += g1 * xh1;
+                }
+            }
+        }
+    }
+    flushStats(kind, &sums, &squares, shape, block, warp, st.sums, st.partial, st.ordered);
+}
+
+// Optional operands of a tensor core GEMM beyond the three matrices: epilogue statistics and the on-load affine transform.
+const GemmExtras = struct { stats: ?BnStats = null, dx: ?DxStats = null, affine: ?AffineLoad = null };
+
 // One thread block computes one tile of C. Work group x and y pick the tile and work group z picks the range of K for split-K.
-inline fn tileGemm(comptime kind: GemmKind, a: [*]const kind.Elem(), b: [*]const kind.Elem(), c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) void {
+inline fn tileGemm(comptime kind: GemmKind, a: [*]const kind.Elem(), b: [*]const kind.Elem(), c: [*]f32, extras: GemmExtras, shape: ga.TensorShape, geo: ga.ConvGeometry) void {
     const tc = kind.Tile();
     const tid: usize = @workItemId(0);
     const warp: Warp = .{ .lane = tid % 32, .row = tid / 32 / (tc.cols / 32), .col = tid / 32 % (tc.cols / 32) };
@@ -1376,17 +1559,33 @@ inline fn tileGemm(comptime kind: GemmKind, a: [*]const kind.Elem(), b: [*]const
 
     var loader = GemmLoader(kind).init(a, b, geo, shape, block);
     var acc: Acc = @splat(@splat(@splat(0)));
-    pipeline(kind, &loader, block, tiles, warp, &acc);
+    pipeline(kind, &loader, block, tiles, warp, (extras.affine orelse undefined), &acc);
     storeTile(kind, c, &acc, shape, block, warp);
+    if (comptime kind.bn_stats) statsTile(kind, extras.stats.?, &acc, shape, block, warp);
+    if (comptime kind.dx_stats) dxStatsTile(kind, extras.dx.?, &acc, shape, block, warp);
 }
-inline fn bf16Compute(comptime tc: type, comptime a_transposed: bool, warp: Warp, base: usize, acc: *Acc) void {
+
+// Applies the affine map and ReLU of a virtual normalized map to a pair of bf16 values held in one register,
+// with the scale and shift packed the same way. A NaN marker (an out-of-bounds tap) comes out as exactly zero
+// because max treats a NaN operand as missing and keeps the other.
+inline fn affinePair(word: u32, scale2: u32, shift2: u32) u32 {
+    return asm ("fma.rn.bf16x2 %[out], %[w], %[s], %[h];\n\tmax.bf16x2 %[out], %[out], %[z];"
+        : [out] "=r" (-> u32),
+        : [w] "r" (word),
+          [s] "r" (scale2),
+          [h] "r" (shift2),
+          [z] "r" (@as(u32, 0)),
+    );
+}
+
+inline fn bf16Compute(comptime tc: type, comptime kind: GemmKind, warp: Warp, base: usize, kk: usize, col0: usize, aff: AffineLoad, acc: *Acc) void {
     inline for (0..tc.depth / 16) |step| {
         var a_frag: [4][4]u32 = undefined;
         inline for (0..tc.warp_m / 16) |mi| {
             // NOTE: lanes 8j to 8j + 7 address the rows of 8 x 8 block j: block j covers rows + 8 (j % 2) and k + 8 (j / 2),
             // which is the register order of the A fragment. A transposed tile is stored by k, so .trans turns it back.
             const row = warp.row * tc.warp_m + mi * 16 + warp.lane % 8 + 8 * ((warp.lane / 8) % 2);
-            if (a_transposed) {
+            if (kind.transposedA()) {
                 const k = step * 16 + warp.lane % 8 + 8 * (warp.lane / 16);
                 const first_row = warp.row * tc.warp_m + mi * 16 + 8 * ((warp.lane / 8) % 2);
                 a_frag[mi] = tc.ldmatrixTransposed(tc.sharedAddress(base + tc.aTransposedSlot(k, first_row / 8)));
@@ -1394,9 +1593,32 @@ inline fn bf16Compute(comptime tc: type, comptime a_transposed: bool, warp: Warp
                 a_frag[mi] = tc.ldmatrix(tc.sharedAddress(base + tc.aSlot(row, step * 2 + warp.lane / 16)));
             }
         }
+        // NOTE: register j of the fragment holds the elements of k + 8 * (j / 2) + (lane % 4) * 2 and the next one.
+        if (comptime kind.affine_a) {
+            inline for (0..2) |kh| {
+                const k0 = kk + step * 16 + 8 * kh + (warp.lane % 4) * 2;
+                const s = aff.scale2[k0 / 2];
+                const h = aff.shift2[k0 / 2];
+                inline for (0..tc.warp_m / 16) |mi| {
+                    a_frag[mi][2 * kh] = affinePair(a_frag[mi][2 * kh], s, h);
+                    a_frag[mi][2 * kh + 1] = affinePair(a_frag[mi][2 * kh + 1], s, h);
+                }
+            }
+        }
         inline for (0..2) |pair| {
             const k = step * 16 + warp.lane % 8 + 8 * ((warp.lane / 8) % 2);
-            const frag = tc.ldmatrixTransposed(tc.sharedAddress(base + tc.a_elems + tc.bSlot(k, warp.col * 4 + pair * 2 + warp.lane / 16)));
+            var frag = tc.ldmatrixTransposed(tc.sharedAddress(base + tc.a_elems + tc.bSlot(k, warp.col * 4 + pair * 2 + warp.lane / 16)));
+            // NOTE: registers 0 and 1 cover one column of the tile, registers 2 and 3 the next; both elements of a
+            // register are the same column (two consecutive positions), so one duplicated scale and shift serve it.
+            if (comptime kind.affine_b) {
+                inline for (0..2) |half| {
+                    const col = col0 + (warp.col * 4 + pair * 2 + half) * 8 + warp.lane / 4;
+                    const s = aff.scalec[col];
+                    const h = aff.shiftc[col];
+                    frag[2 * half] = affinePair(frag[2 * half], s, h);
+                    frag[2 * half + 1] = affinePair(frag[2 * half + 1], s, h);
+                }
+            }
             inline for (0..tc.warp_m / 16) |mi| {
                 tc.mma(&acc[mi][pair * 2], a_frag[mi], .{ frag[0], frag[1] });
                 tc.mma(&acc[mi][pair * 2 + 1], a_frag[mi], .{ frag[2], frag[3] });
@@ -1453,27 +1675,108 @@ inline fn tf32Compute(comptime tc: type, warp: Warp, base: usize, acc: *Acc) voi
 }
 
 export fn sgemmTensor(a: [*]const u16, b: [*]const u16, c: [*]f32, shape: ga.TensorShape) callconv(.nvptx_kernel) void {
-    tileGemm(.{ .mode = .dense }, a, b, c, shape, zero_geometry);
+    tileGemm(.{ .mode = .dense }, a, b, c, .{}, shape, zero_geometry);
 }
 
 export fn convGemmForward(x: [*]const u16, w: [*]const u16, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
-    tileGemm(.{ .mode = .gather_a }, x, w, c, shape, geo);
+    tileGemm(.{ .mode = .gather_a }, x, w, c, .{}, shape, geo);
 }
 
 export fn convGemmWeightGrad(dy_t: [*]const u16, x: [*]const u16, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
-    tileGemm(.{ .mode = .gather_b }, dy_t, x, c, shape, geo);
+    tileGemm(.{ .mode = .gather_b }, dy_t, x, c, .{}, shape, geo);
 }
 
 export fn convGemmForwardWide(x: [*]const u16, w: [*]const u16, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
-    tileGemm(.{ .rows = 128, .cols = 128, .mode = .gather_a }, x, w, c, shape, geo);
+    tileGemm(.{ .rows = 128, .cols = 128, .mode = .gather_a }, x, w, c, .{}, shape, geo);
+}
+
+export fn convGemmForwardStats(x: [*]const u16, w: [*]const u16, c: [*]f32, shift: [*]const f32, sums: [*]f32, partial: [*]f32, ordered: u32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
+    tileGemm(.{ .mode = .gather_a, .bn_stats = true }, x, w, c, .{ .stats = .{ .shift = shift, .sums = sums, .partial = partial, .ordered = ordered } }, shape, geo);
+}
+
+export fn convGemmForwardStatsWide(x: [*]const u16, w: [*]const u16, c: [*]f32, shift: [*]const f32, sums: [*]f32, partial: [*]f32, ordered: u32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
+    tileGemm(.{ .rows = 128, .cols = 128, .mode = .gather_a, .bn_stats = true }, x, w, c, .{ .stats = .{ .shift = shift, .sums = sums, .partial = partial, .ordered = ordered } }, shape, geo);
+}
+
+// Forward over a virtual batch-norm-plus-ReLU input: the gathered left operand is transformed on load from the raw
+// map x with the per-position scale and shift, and the epilogue accumulates the next norm's batch statistics.
+export fn convGemmForwardAffineStats(x: [*]const u16, w: [*]const u16, c: [*]f32, scale2: [*]const u32, shift2: [*]const u32, stats_shift: [*]const f32, sums: [*]f32, partial: [*]f32, ordered: u32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
+    tileGemm(.{ .mode = .gather_a, .bn_stats = true, .affine_a = true }, x, w, c, .{ .stats = .{ .shift = stats_shift, .sums = sums, .partial = partial, .ordered = ordered }, .affine = .{ .scale2 = scale2, .shift2 = shift2, .scalec = undefined, .shiftc = undefined } }, shape, geo);
+}
+
+export fn convGemmForwardAffineStatsWide(x: [*]const u16, w: [*]const u16, c: [*]f32, scale2: [*]const u32, shift2: [*]const u32, stats_shift: [*]const f32, sums: [*]f32, partial: [*]f32, ordered: u32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
+    tileGemm(.{ .rows = 128, .cols = 128, .mode = .gather_a, .bn_stats = true, .affine_a = true }, x, w, c, .{ .stats = .{ .shift = stats_shift, .sums = sums, .partial = partial, .ordered = ordered }, .affine = .{ .scale2 = scale2, .shift2 = shift2, .scalec = undefined, .shiftc = undefined } }, shape, geo);
+}
+
+// Input-gradient GEMM (reversed geometry) whose epilogue accumulates the masked batch-norm gradient sums of the
+// virtual normalized map the gradient belongs to, rebuilding the mask and x_hat from the raw map x_bn.
+export fn convGemmForwardDxStats(x: [*]const u16, w: [*]const u16, c: [*]f32, x_bn: [*]const u16, mean: [*]const f32, inv_std: [*]const f32, gamma: [*]const f32, beta: [*]const f32, sums: [*]f32, partial: [*]f32, ordered: u32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
+    tileGemm(.{ .mode = .gather_a, .dx_stats = true }, x, w, c, .{ .dx = .{ .x = x_bn, .mean = mean, .inv_std = inv_std, .gamma = gamma, .beta = beta, .sums = sums, .partial = partial, .ordered = ordered } }, shape, geo);
+}
+
+export fn convGemmForwardDxStatsWide(x: [*]const u16, w: [*]const u16, c: [*]f32, x_bn: [*]const u16, mean: [*]const f32, inv_std: [*]const f32, gamma: [*]const f32, beta: [*]const f32, sums: [*]f32, partial: [*]f32, ordered: u32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
+    tileGemm(.{ .rows = 128, .cols = 128, .mode = .gather_a, .dx_stats = true }, x, w, c, .{ .dx = .{ .x = x_bn, .mean = mean, .inv_std = inv_std, .gamma = gamma, .beta = beta, .sums = sums, .partial = partial, .ordered = ordered } }, shape, geo);
+}
+
+// Weight gradient over a virtual batch-norm-plus-ReLU input: the gathered right operand is transformed on load
+// with the per-column scale and shift, each a duplicated bf16 pair.
+export fn convGemmWeightGradAffine(dy_t: [*]const u16, x: [*]const u16, c: [*]f32, scalec: [*]const u32, shiftc: [*]const u32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
+    tileGemm(.{ .mode = .gather_b, .affine_b = true }, dy_t, x, c, .{ .affine = .{ .scale2 = undefined, .shift2 = undefined, .scalec = scalec, .shiftc = shiftc } }, shape, geo);
+}
+
+export fn convGemmWeightGradAffineShort(dy_t: [*]const u16, x: [*]const u16, c: [*]f32, scalec: [*]const u32, shiftc: [*]const u32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
+    tileGemm(.{ .rows = 64, .cols = 128, .mode = .gather_b, .affine_b = true }, dy_t, x, c, .{ .affine = .{ .scale2 = undefined, .shift2 = undefined, .scalec = scalec, .shiftc = shiftc } }, shape, geo);
+}
+
+export fn convGemmWeightGradAffineWide(dy_t: [*]const u16, x: [*]const u16, c: [*]f32, scalec: [*]const u32, shiftc: [*]const u32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
+    tileGemm(.{ .rows = 128, .cols = 128, .mode = .gather_b, .affine_b = true }, dy_t, x, c, .{ .affine = .{ .scale2 = undefined, .shift2 = undefined, .scalec = scalec, .shiftc = shiftc } }, shape, geo);
+}
+
+// Expands the per-channel batch-norm affine map to packed per-(tap, channel) scale and shift words for the
+// on-load transform: scale = gamma * inv_std and shift = beta - mean * scale, so relu(scale * x + shift) ==
+// relu(norm(x)) up to the bf16 rounding of scale and shift (one extra bf16 step next to the map's own bf16
+// storage). Entries past k_real pad the GEMM tiles and are zero. len is even. scalec and shiftc hold len words
+// with one value duplicated in both halves; scale2 and shift2 hold len / 2 words of two consecutive positions,
+// matching the fragment layouts of the B and A operands respectively.
+export fn affineExpand(mean: [*]const f32, inv_std: [*]const f32, gamma: [*]const f32, beta: [*]const f32, scale2: [*]u32, shift2: [*]u32, scalec: [*]u32, shiftc: [*]u32, c: u32, k_real: u32, len: u32) callconv(.nvptx_kernel) void {
+    const j = globalIndex();
+    if (j >= len) return;
+    var s: f32 = 0;
+    var h: f32 = 0;
+    if (j < k_real) {
+        const ch = j % c;
+        s = gamma[ch] * inv_std[ch];
+        h = beta[ch] - mean[ch] * s;
+    }
+    scalec[j] = @as(u32, bf16.encode(s)) * 0x10001;
+    shiftc[j] = @as(u32, bf16.encode(h)) * 0x10001;
+    if (j >= len / 2) return;
+    const j0 = 2 * j;
+    const j1 = 2 * j + 1;
+    var s0: f32 = 0;
+    var h0: f32 = 0;
+    var s1: f32 = 0;
+    var h1: f32 = 0;
+    if (j0 < k_real) {
+        const ch = j0 % c;
+        s0 = gamma[ch] * inv_std[ch];
+        h0 = beta[ch] - mean[ch] * s0;
+    }
+    if (j1 < k_real) {
+        const ch = j1 % c;
+        s1 = gamma[ch] * inv_std[ch];
+        h1 = beta[ch] - mean[ch] * s1;
+    }
+    scale2[j] = @as(u32, bf16.encode(s1)) << 16 | bf16.encode(s0);
+    shift2[j] = @as(u32, bf16.encode(h1)) << 16 | bf16.encode(h0);
 }
 
 export fn convGemmWeightGradWide(dy_t: [*]const u16, x: [*]const u16, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
-    tileGemm(.{ .rows = 128, .cols = 128, .mode = .gather_b }, dy_t, x, c, shape, geo);
+    tileGemm(.{ .rows = 128, .cols = 128, .mode = .gather_b }, dy_t, x, c, .{}, shape, geo);
 }
 
 export fn convGemmWeightGradShort(dy_t: [*]const u16, x: [*]const u16, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
-    tileGemm(.{ .rows = 64, .cols = 128, .mode = .gather_b }, dy_t, x, c, shape, geo);
+    tileGemm(.{ .rows = 64, .cols = 128, .mode = .gather_b }, dy_t, x, c, .{}, shape, geo);
 }
 
 export fn packWeightsRotated(src: [*]const f32, dst: [*]u16, args: ga.RotateArgs) callconv(.nvptx_kernel) void {
@@ -1568,35 +1871,35 @@ fn Tf32Tile(comptime tile_rows: usize, comptime tile_cols: usize) type {
 }
 
 export fn convTf32Forward(x: [*]const f32, w: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
-    tileGemm(.{ .tf32 = true, .mode = .gather_a }, x, w, c, shape, geo);
+    tileGemm(.{ .tf32 = true, .mode = .gather_a }, x, w, c, .{}, shape, geo);
 }
 
 export fn convTf32WeightGrad(dy_t: [*]const f32, x: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
-    tileGemm(.{ .tf32 = true, .mode = .gather_b }, dy_t, x, c, shape, geo);
+    tileGemm(.{ .tf32 = true, .mode = .gather_b }, dy_t, x, c, .{}, shape, geo);
 }
 
 export fn convTf32WeightGradShort(dy_t: [*]const f32, x: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
-    tileGemm(.{ .tf32 = true, .rows = 64, .cols = 128, .mode = .gather_b }, dy_t, x, c, shape, geo);
+    tileGemm(.{ .tf32 = true, .rows = 64, .cols = 128, .mode = .gather_b }, dy_t, x, c, .{}, shape, geo);
 }
 
 export fn convExactForward(x: [*]const f32, w: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
-    tileGemm(.{ .tf32 = true, .exact = true, .mode = .gather_a }, x, w, c, shape, geo);
+    tileGemm(.{ .tf32 = true, .exact = true, .mode = .gather_a }, x, w, c, .{}, shape, geo);
 }
 
 export fn convExactForwardWide(x: [*]const f32, w: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
-    tileGemm(.{ .tf32 = true, .exact = true, .rows = 128, .cols = 128, .mode = .gather_a }, x, w, c, shape, geo);
+    tileGemm(.{ .tf32 = true, .exact = true, .rows = 128, .cols = 128, .mode = .gather_a }, x, w, c, .{}, shape, geo);
 }
 
 export fn convExactWeightGradWide(dy_t: [*]const f32, x: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
-    tileGemm(.{ .tf32 = true, .exact = true, .rows = 128, .cols = 128, .mode = .gather_b }, dy_t, x, c, shape, geo);
+    tileGemm(.{ .tf32 = true, .exact = true, .rows = 128, .cols = 128, .mode = .gather_b }, dy_t, x, c, .{}, shape, geo);
 }
 
 export fn convExactWeightGrad(dy_t: [*]const f32, x: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
-    tileGemm(.{ .tf32 = true, .exact = true, .mode = .gather_b }, dy_t, x, c, shape, geo);
+    tileGemm(.{ .tf32 = true, .exact = true, .mode = .gather_b }, dy_t, x, c, .{}, shape, geo);
 }
 
 export fn convExactWeightGradShort(dy_t: [*]const f32, x: [*]const f32, c: [*]f32, shape: ga.TensorShape, geo: ga.ConvGeometry) callconv(.nvptx_kernel) void {
-    tileGemm(.{ .tf32 = true, .exact = true, .rows = 64, .cols = 128, .mode = .gather_b }, dy_t, x, c, shape, geo);
+    tileGemm(.{ .tf32 = true, .exact = true, .rows = 64, .cols = 128, .mode = .gather_b }, dy_t, x, c, .{}, shape, geo);
 }
 
 export fn rotateWeightsF32(src: [*]const f32, dst: [*]f32, args: ga.RotateArgs) callconv(.nvptx_kernel) void {

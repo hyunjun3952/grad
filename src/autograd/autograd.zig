@@ -139,7 +139,7 @@ fn convGeometry(d: conv.Dims, opts: ConvGeometryOpts) ga.ConvGeometry {
 
 fn chooseConvPath(d: conv.Dims, dev: ?*gpu_mod.Gpu) ConvPath {
     const rows = @as(usize, d.n) * conv.outHeight(d) * conv.outWidth(d);
-    const taps = @as(usize, d.k) * d.k * d.c;
+    const taps: usize = conv.patchLen(d);
     const unit_stride_blocks = d.stride == 1 and d.c % 64 == 0;
     const general = d.dilation * (d.k - 1) < d.pad;
     const per_in = d.c / d.groups;
@@ -1093,6 +1093,271 @@ pub const Tape = struct {
         if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .w = w, .path = path, .cache = cache, .out = out }, Ops.backward);
         return out;
     }
+    /// Convolution followed by batch normalization; on the bf16 GPU training path the conv GEMM's epilogue
+    /// accumulates the batch statistics, saving a pass over the feature maps.
+    pub fn convBatchNorm(self: *Tape, x: anytype, w: anytype, gamma: anytype, beta: anytype, running: anytype, comptime opts: ConvOpts) Error!Var(ConvOut(@TypeOf(x.value), @TypeOf(w.value), opts)) {
+        return self.convBn(.none, x, w, {}, gamma, beta, running, opts);
+    }
+
+    /// Convolution followed by batch normalization and ReLU; see convBatchNorm.
+    pub fn convBatchNormRelu(self: *Tape, x: anytype, w: anytype, gamma: anytype, beta: anytype, running: anytype, comptime opts: ConvOpts) Error!Var(ConvOut(@TypeOf(x.value), @TypeOf(w.value), opts)) {
+        return self.convBn(.relu, x, w, {}, gamma, beta, running, opts);
+    }
+
+    /// Convolution, batch norm, addition of residual and ReLU; see convBatchNorm. residual must have the
+    /// shape and element type of the convolution's output.
+    pub fn convBatchNormAddRelu(self: *Tape, x: anytype, w: anytype, residual: anytype, gamma: anytype, beta: anytype, running: anytype, comptime opts: ConvOpts) Error!Var(ConvOut(@TypeOf(x.value), @TypeOf(w.value), opts)) {
+        const Out = ConvOut(@TypeOf(x.value), @TypeOf(w.value), opts);
+        comptime if (@TypeOf(residual.value) != Out) @compileError("convBatchNormAddRelu expects a residual of the convolution's output shape");
+        return self.convBn(.add_relu, x, w, residual, gamma, beta, running, opts);
+    }
+
+    fn convBn(self: *Tape, comptime fuse: NormFuse, x: anytype, w: anytype, residual: anytype, gamma: anytype, beta: anytype, running: anytype, comptime opts: ConvOpts) Error!Var(ConvOut(@TypeOf(x.value), @TypeOf(w.value), opts)) {
+        const In = @TypeOf(x.value);
+        const Out = ConvOut(In, @TypeOf(w.value), opts);
+        if (comptime In.Elem != u16) {
+            const y = try self.conv2d(x, w, opts);
+            return switch (fuse) {
+                .none => self.batchNorm(y, gamma, beta, running),
+                .relu => self.batchNormRelu(y, gamma, beta, running),
+                .add_relu => self.batchNormAddRelu(y, residual, gamma, beta, running),
+            };
+        }
+        // NOTE: only the bf16 implicit GEMM accumulates the statistics in its epilogue; evaluation uses the
+        // running statistics and needs no sums, so both take the unfused ops.
+        if (self.par.gpu == null or !self.training) {
+            const y = try self.conv2d(x, w, opts);
+            return switch (fuse) {
+                .none => self.batchNorm(y, gamma, beta, running),
+                .relu => self.batchNormRelu(y, gamma, beta, running),
+                .add_relu => self.batchNormAddRelu(y, residual, gamma, beta, running),
+            };
+        }
+        const dev = self.par.gpu.?;
+        const ks = comptime kernelSize(In, @TypeOf(w.value), 1);
+        const c_in = In.shape[3];
+        const c_out = Out.shape[3];
+        comptime if (opts.stride != 1 or opts.groups != 1 or opts.dilation != 1 or
+            c_in % 64 != 0 or c_out % 32 != 0)
+            @compileError("bf16 activations need stride-1 convolutions with a multiple of 64 input and of 32 output channels; cast to f32 around other layers");
+        const d: conv.Dims = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = c_in, .k = ks, .pad = opts.pad, .c_out = c_out };
+        const kc = ks * ks * c_in;
+        const geometry: ga.ConvGeometry = comptime convGeometry(d, .{});
+        const reverse: ga.ConvGeometry = comptime convGeometry(d, .{ .reverse = true });
+        const Channels = Tensor(f32, &.{c_out});
+        const mean = try self.newTensor(Channels);
+        const inv_std = try self.newTensor(Channels);
+        const st: norm.Stats = .{ .mean = mean.data.ptr, .inv_std = inv_std.data.ptr, .running_mean = running.mean.data.ptr, .running_var = running.variance.data.ptr };
+        const affine: norm.Affine = .{ .mean = st.mean, .inv_std = st.inv_std, .gamma = gamma.value.data.ptr, .beta = beta.value.data.ptr };
+        const flag: u32 = switch (fuse) {
+            .none => 0,
+            .relu => norm.relu_flag,
+            .add_relu => norm.relu_flag | norm.residual_flag,
+        };
+        const layout: norm.Layout = .{ .len = Out.len, .channels = c_out, .flag = flag };
+        const conv_value = try self.newTensor(Out);
+        {
+            const scope = dev.scratchScope();
+            defer scope.restore();
+            const w_half = try dev.packMatrix(w.value.data, kc, c_out, .{ .cols_padded = gpu_mod.padTo(c_out, .columns) });
+            const sums = try dev.scratchZeroed(f32, 2 * c_out);
+            // NOTE: the sums are shifted by the running mean, so the finish kernel gets it as the f32 shift.
+            try dev.convImplicitForwardStats(x.value.data, w_half, conv_value.data, geometry, running.mean.data, sums);
+            try dev.batchNormFinishShifted(sums, running.mean.data, st, .{ .len = Out.len, .channels = c_out, .flag = 1 });
+        }
+        const value = try self.newTensor(Out);
+        try dev.batchNormApply(conv_value.data, if (fuse == .add_relu) residual.value.data else conv_value.data, value.data, affine, layout);
+        const residual_grad = fuse == .add_relu and residual.needs_grad;
+        const out = try self.makeVar(value, x.needs_grad or w.needs_grad or gamma.needs_grad or beta.needs_grad or residual_grad);
+        const norm_inputs = .{ gamma, beta, running.mean, running.variance };
+        try self.note(.conv, .{ x, w }, conv_value, .{ .kernel = ks, .pad = opts.pad });
+        switch (fuse) {
+            .none => try self.note(.batch_norm, .{conv_value} ++ norm_inputs, out, .{}),
+            .relu => try self.note(.batch_norm_relu, .{conv_value} ++ norm_inputs, out, .{}),
+            .add_relu => try self.note(.batch_norm_add_relu, .{conv_value} ++ norm_inputs ++ .{residual}, out, .{}),
+        }
+
+        const Ctx = struct { x: @TypeOf(x), w: @TypeOf(w), residual: @TypeOf(residual), gamma: @TypeOf(gamma), beta: @TypeOf(beta), affine: norm.Affine, conv_value: Out, out: @TypeOf(out) };
+        if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .w = w, .residual = residual, .gamma = gamma, .beta = beta, .affine = affine, .conv_value = conv_value, .out = out }, struct {
+            fn run(t: *Tape, k: *const Ctx) Error!void {
+                const g = t.par.gpu.?;
+                const sums = try t.zeroedTensor(Tensor(f32, &.{2 * c_out}));
+                const mask: []const u16 = if (fuse != .none) k.out.value.data else &.{};
+                const grads: norm.GradOut = .{ .sums = sums.data, .gamma = k.gamma.grad.data, .beta = k.beta.grad.data };
+                try g.batchNormGradSums(k.conv_value.data, k.out.grad.data, k.affine, mask, grads);
+                const to_residual = fuse == .add_relu and k.residual.needs_grad;
+                var grad_layout = layout;
+                if (!to_residual) grad_layout.flag &= ~norm.residual_flag;
+                grad_layout.flag |= norm.store_flag;
+                if (k.x.needs_grad or k.w.needs_grad) {
+                    const scope = g.scratchScope();
+                    defer scope.restore();
+                    // NOTE: the batch-norm input gradient is the conv output gradient; it is a fresh scratch
+                    // buffer written once per element, so the kernel stores instead of accumulating.
+                    const dconv: Out = .{ .data = try g.scratch(u16, Out.len) };
+                    const io: norm.GradIo(u16) = .{
+                        .x = k.conv_value.data.ptr,
+                        .dy = k.out.grad.data.ptr,
+                        .dx = dconv.data.ptr,
+                        .sums = sums.data.ptr,
+                        .mask = if (fuse != .none) k.out.value.data.ptr else k.out.grad.data.ptr,
+                        .dr = if (to_residual) k.residual.grad.data.ptr else dconv.data.ptr,
+                    };
+                    try g.batchNormGradInput(io, k.affine, grad_layout);
+                    if (k.x.needs_grad) {
+                        const rotated = try g.packRotatedWeights(k.w.value.data, ks, c_in, c_out);
+                        try g.convImplicitForward(dconv.data, rotated, k.x.grad.data, reverse, true);
+                    }
+                    if (k.w.needs_grad) try g.convImplicitWeightGrad(dconv.data, k.x.value.data, k.w.grad.data, geometry);
+                } else if (to_residual) {
+                    try g.addReluBackward(k.out.value.data, k.out.grad.data, k.residual.grad.data, k.residual.grad.data, true, false);
+                }
+            }
+        }.run);
+        return out;
+    }
+
+    /// Two convolutions of a residual block fused around a virtual middle map: the batch-norm-plus-ReLU output of
+    /// the first convolution is never written to memory. The second convolution's GEMM rebuilds it on load
+    /// (relu(scale * x + shift) per element, with scale and shift rounded to bf16 — one extra bf16 step next to
+    /// the map's own bf16 storage), and in the backward pass the input-gradient GEMM of the second convolution
+    /// accumulates the first norm's masked gradient sums in its epilogue. Both convolutions share
+    /// opts. Off the bf16 GPU training path it falls back to the unfused pair.
+    pub fn convBnChain(self: *Tape, x: anytype, w1: anytype, gamma1: anytype, beta1: anytype, running1: anytype, w2: anytype, residual: anytype, gamma2: anytype, beta2: anytype, running2: anytype, comptime opts: ConvOpts) Error!Var(ConvOut(ConvOut(@TypeOf(x.value), @TypeOf(w1.value), opts), @TypeOf(w2.value), opts)) {
+        const In = @TypeOf(x.value);
+        const Mid = ConvOut(In, @TypeOf(w1.value), opts);
+        const Out = ConvOut(Mid, @TypeOf(w2.value), opts);
+        comptime if (@TypeOf(residual.value) != Out) @compileError("convBnChain expects a residual of the chain's output shape");
+        if (comptime In.Elem != u16) {
+            const y1 = try self.convBatchNormRelu(x, w1, gamma1, beta1, running1, opts);
+            return self.convBatchNormAddRelu(y1, w2, residual, gamma2, beta2, running2, opts);
+        }
+        // NOTE: only the bf16 implicit GEMM rebuilds the virtual map on load; evaluation uses the running
+        // statistics and both convolutions take the unfused ops, like convBn.
+        if (self.par.gpu == null or !self.training) {
+            const y1 = try self.convBatchNormRelu(x, w1, gamma1, beta1, running1, opts);
+            return self.convBatchNormAddRelu(y1, w2, residual, gamma2, beta2, running2, opts);
+        }
+        const dev = self.par.gpu.?;
+        const ks1 = comptime kernelSize(In, @TypeOf(w1.value), 1);
+        const ks2 = comptime kernelSize(Mid, @TypeOf(w2.value), 1);
+        const c_in = In.shape[3];
+        const c1 = Mid.shape[3];
+        const c2 = Out.shape[3];
+        comptime if (opts.stride != 1 or opts.groups != 1 or opts.dilation != 1 or
+            c_in % 64 != 0 or c1 % 64 != 0 or c2 % 32 != 0)
+            @compileError("bf16 activations need stride-1 convolutions with a multiple of 64 input and of 32 output channels; cast to f32 around other layers");
+        const d1: conv.Dims = .{ .n = In.shape[0], .h = In.shape[1], .w = In.shape[2], .c = c_in, .k = ks1, .pad = opts.pad, .c_out = c1 };
+        const d2: conv.Dims = .{ .n = In.shape[0], .h = Mid.shape[1], .w = Mid.shape[2], .c = c1, .k = ks2, .pad = opts.pad, .c_out = c2 };
+        const kc1 = ks1 * ks1 * c_in;
+        const kc2 = ks2 * ks2 * c1;
+        const geometry1: ga.ConvGeometry = comptime convGeometry(d1, .{});
+        const reverse1: ga.ConvGeometry = comptime convGeometry(d1, .{ .reverse = true });
+        const geometry2: ga.ConvGeometry = comptime convGeometry(d2, .{});
+        const reverse2: ga.ConvGeometry = comptime convGeometry(d2, .{ .reverse = true });
+        const Channels1 = Tensor(f32, &.{c1});
+        const Channels2 = Tensor(f32, &.{c2});
+        const mean1 = try self.newTensor(Channels1);
+        const inv_std1 = try self.newTensor(Channels1);
+        const mean2 = try self.newTensor(Channels2);
+        const inv_std2 = try self.newTensor(Channels2);
+        const st1: norm.Stats = .{ .mean = mean1.data.ptr, .inv_std = inv_std1.data.ptr, .running_mean = running1.mean.data.ptr, .running_var = running1.variance.data.ptr };
+        const st2: norm.Stats = .{ .mean = mean2.data.ptr, .inv_std = inv_std2.data.ptr, .running_mean = running2.mean.data.ptr, .running_var = running2.variance.data.ptr };
+        const affine1: norm.Affine = .{ .mean = st1.mean, .inv_std = st1.inv_std, .gamma = gamma1.value.data.ptr, .beta = beta1.value.data.ptr };
+        const affine2: norm.Affine = .{ .mean = st2.mean, .inv_std = st2.inv_std, .gamma = gamma2.value.data.ptr, .beta = beta2.value.data.ptr };
+        const layout2: norm.Layout = .{ .len = Out.len, .channels = c2, .flag = norm.relu_flag | norm.residual_flag };
+        const conv1_out = try self.newTensor(Mid);
+        const conv2_out = try self.newTensor(Out);
+        // NOTE: the virtual map is relu(scale * x + shift) per element with these expanded parameters; the same
+        // expansion serves the second convolution's loads and its weight gradient in the backward pass, so the
+        // buffer is a tape tensor rather than forward scratch.
+        const aff_buf = try self.newTensor(Tensor(u32, &.{3 * gpu_mod.padTo(kc2, .rows)}));
+        var aff: gpu_mod.Gpu.AffineExpanded = undefined;
+        {
+            const scope = dev.scratchScope();
+            defer scope.restore();
+            const w1_half = try dev.packMatrix(w1.value.data, kc1, c1, .{ .cols_padded = gpu_mod.padTo(c1, .columns) });
+            const sums1 = try dev.scratchZeroed(f32, 2 * c1);
+            try dev.convImplicitForwardStats(x.value.data, w1_half, conv1_out.data, geometry1, running1.mean.data, sums1);
+            try dev.batchNormFinishShifted(sums1, running1.mean.data, st1, .{ .len = Mid.len, .channels = c1, .flag = 1 });
+            aff = try dev.affineExpand(mean1.data, inv_std1.data, gamma1.value.data, beta1.value.data, aff_buf.data, c1, kc2);
+            const w2_half = try dev.packMatrix(w2.value.data, kc2, c2, .{ .cols_padded = gpu_mod.padTo(c2, .columns) });
+            const sums2 = try dev.scratchZeroed(f32, 2 * c2);
+            try dev.convImplicitForwardAffineStats(conv1_out.data, w2_half, conv2_out.data, geometry2, aff, running2.mean.data, sums2);
+            try dev.batchNormFinishShifted(sums2, running2.mean.data, st2, .{ .len = Out.len, .channels = c2, .flag = 1 });
+        }
+        const value = try self.newTensor(Out);
+        try dev.batchNormApply(conv2_out.data, residual.value.data, value.data, affine2, layout2);
+        const needs = x.needs_grad or w1.needs_grad or w2.needs_grad or gamma1.needs_grad or beta1.needs_grad or gamma2.needs_grad or beta2.needs_grad or residual.needs_grad;
+        const out = try self.makeVar(value, needs);
+        // NOTE: the first norm's output is virtual (never stored), so the trace records the chain's spine only.
+        try self.note(.conv, .{ x, w1 }, conv1_out, .{ .kernel = ks1, .pad = opts.pad });
+        try self.note(.conv, .{ conv1_out, w2 }, conv2_out, .{ .kernel = ks2, .pad = opts.pad });
+        try self.note(.batch_norm_add_relu, .{ conv2_out, gamma2, beta2, running2.mean, running2.variance, residual }, out, .{});
+
+        const Ctx = struct { x: @TypeOf(x), w1: @TypeOf(w1), gamma1: @TypeOf(gamma1), beta1: @TypeOf(beta1), affine1: norm.Affine, conv1_out: Mid, aff: gpu_mod.Gpu.AffineExpanded, w2: @TypeOf(w2), gamma2: @TypeOf(gamma2), beta2: @TypeOf(beta2), affine2: norm.Affine, conv2_out: Out, residual: @TypeOf(residual), out: @TypeOf(out) };
+        if (out.needs_grad) try self.recordBackward(Ctx{ .x = x, .w1 = w1, .gamma1 = gamma1, .beta1 = beta1, .affine1 = affine1, .conv1_out = conv1_out, .aff = aff, .w2 = w2, .gamma2 = gamma2, .beta2 = beta2, .affine2 = affine2, .conv2_out = conv2_out, .residual = residual, .out = out }, struct {
+            fn run(t: *Tape, k: *const Ctx) Error!void {
+                const g = t.par.gpu.?;
+                const sums2 = try t.zeroedTensor(Tensor(f32, &.{2 * c2}));
+                const grads2: norm.GradOut = .{ .sums = sums2.data, .gamma = k.gamma2.grad.data, .beta = k.beta2.grad.data };
+                try g.batchNormGradSums(k.conv2_out.data, k.out.grad.data, k.affine2, k.out.value.data, grads2);
+                const to_residual = k.residual.needs_grad;
+                const inner = k.x.needs_grad or k.w1.needs_grad or k.w2.needs_grad or k.gamma1.needs_grad or k.beta1.needs_grad;
+                if (!inner) {
+                    // NOTE: without an input gradient the residual still needs the masked output gradient.
+                    if (to_residual) try g.addReluBackward(k.out.value.data, k.out.grad.data, k.residual.grad.data, k.residual.grad.data, true, false);
+                    return;
+                }
+                var grad_layout2 = layout2;
+                if (!to_residual) grad_layout2.flag &= ~norm.residual_flag;
+                grad_layout2.flag |= norm.store_flag;
+                const scope = g.scratchScope();
+                defer scope.restore();
+                // NOTE: the batch-norm input gradients are the conv output gradients; both are fresh scratch
+                // buffers written once per element, so the kernels store instead of accumulating.
+                const dconv2: Out = .{ .data = try g.scratch(u16, Out.len) };
+                const io2: norm.GradIo(u16) = .{
+                    .x = k.conv2_out.data.ptr,
+                    .dy = k.out.grad.data.ptr,
+                    .dx = dconv2.data.ptr,
+                    .sums = sums2.data.ptr,
+                    .mask = k.out.value.data.ptr,
+                    .dr = if (to_residual) k.residual.grad.data.ptr else dconv2.data.ptr,
+                };
+                try g.batchNormGradInput(io2, k.affine2, grad_layout2);
+                // NOTE: the input gradient of the second convolution is the output gradient of the virtual first
+                // norm, so its GEMM's epilogue accumulates that norm's masked gradient sums straight from the
+                // values it stores, saving the column reduction over the map.
+                const dy1: Mid = .{ .data = try g.scratch(u16, Mid.len) };
+                const sums1 = try t.zeroedTensor(Tensor(f32, &.{2 * c1}));
+                {
+                    const rotated2 = try g.packRotatedWeights(k.w2.value.data, ks2, c1, c2);
+                    try g.convImplicitForwardDxStats(dconv2.data, rotated2, dy1.data, reverse2, k.conv1_out.data, k.affine1, sums1.data);
+                }
+                try g.batchNormGradFinish(sums1.data, k.gamma1.grad.data, k.beta1.grad.data);
+                if (k.w2.needs_grad) try g.convImplicitWeightGradAffine(dconv2.data, k.conv1_out.data, k.w2.grad.data, geometry2, k.aff);
+                const dconv1: Mid = .{ .data = try g.scratch(u16, Mid.len) };
+                const io1: norm.GradIo(u16) = .{
+                    .x = k.conv1_out.data.ptr,
+                    .dy = dy1.data.ptr,
+                    .dx = dconv1.data.ptr,
+                    .sums = sums1.data.ptr,
+                    .mask = dy1.data.ptr,
+                    .dr = dconv1.data.ptr,
+                };
+                const layout1: norm.Layout = .{ .len = Mid.len, .channels = c1, .flag = norm.relu_flag | norm.store_flag | norm.mask_x_flag };
+                try g.batchNormGradInput(io1, k.affine1, layout1);
+                if (k.x.needs_grad) {
+                    const rotated1 = try g.packRotatedWeights(k.w1.value.data, ks1, c_in, c1);
+                    try g.convImplicitForward(dconv1.data, rotated1, k.x.grad.data, reverse1, true);
+                }
+                if (k.w1.needs_grad) try g.convImplicitWeightGrad(dconv1.data, k.x.value.data, k.w1.grad.data, geometry1);
+            }
+        }.run);
+        return out;
+    }
+
     /// Takes the maximum over kernel x kernel windows of an NHWC tensor.
     pub fn maxPool(self: *Tape, x: anytype, comptime opts: PoolOpts) Error!Var(PoolOut(@TypeOf(x.value), opts)) {
         const In = @TypeOf(x.value);

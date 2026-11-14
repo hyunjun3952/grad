@@ -13,6 +13,11 @@ pub const Layout = extern struct { len: u32, channels: u32, flag: u32 };
 pub const relu_flag: u32 = 1;
 /// Bit of Layout.flag: a residual tensor is added before the ReLU (backward: its gradient is accumulated into dr).
 pub const residual_flag: u32 = 2;
+/// Bit of Layout.flag: the input gradient is stored, not accumulated (the target is a fresh buffer, not a zeroed one).
+pub const store_flag: u32 = 4;
+/// Bit of Layout.flag: the ReLU mask is recomputed from the input and the affine map instead of read from mask
+/// (for a virtual normalized map that was never written); only meaningful with relu_flag.
+pub const mask_x_flag: u32 = 8;
 pub fn GradIo(comptime E: type) type {
     return extern struct { x: [*]const E, dy: [*]const E, dx: [*]E, sums: [*]const f32, mask: [*]const E, dr: [*]E };
 }
@@ -29,9 +34,11 @@ pub inline fn gradInput(comptime E: type, t: usize, io: GradIo(E), p: Affine, l:
     const ch = t % l.channels;
     const n: f32 = @floatFromInt(l.len / l.channels);
     const x_hat = (bf16.load(E, io.x, t) - p.mean[ch]) * p.inv_std[ch];
-    const g = if (l.flag & relu_flag != 0 and bf16.load(E, io.mask, t) <= 0) 0 else bf16.load(E, io.dy, t);
+    const live = if (l.flag & mask_x_flag != 0) p.gamma[ch] * x_hat + p.beta[ch] > 0 else bf16.load(E, io.mask, t) > 0;
+    const g = if (l.flag & relu_flag != 0 and !live) 0 else bf16.load(E, io.dy, t);
     if (l.flag & residual_flag != 0) bf16.store(E, io.dr, t, bf16.load(E, io.dr, t) + g);
-    bf16.store(E, io.dx, t, bf16.load(E, io.dx, t) + p.gamma[ch] * p.inv_std[ch] / n * (n * g - io.sums[ch] - x_hat * io.sums[l.channels + ch]));
+    const dx = p.gamma[ch] * p.inv_std[ch] / n * (n * g - io.sums[ch] - x_hat * io.sums[l.channels + ch]);
+    bf16.store(E, io.dx, t, if (l.flag & store_flag != 0) dx else bf16.load(E, io.dx, t) + dx);
 }
 
 pub inline fn applyQuad(comptime E: type, t: usize, x: [*]const E, residual: [*]const E, y: [*]E, p: Affine, l: Layout) void {
@@ -55,9 +62,11 @@ pub inline fn gradInputQuad(comptime E: type, t: usize, io: GradIo(E), p: Affine
     const sum_dyx: bf16.Quad = io.sums[l.channels + ch ..][0..4].*;
     const x_hat = (bf16.loadQuad(E, io.x, t) - mean) * inv_std;
     const dy = bf16.loadQuad(E, io.dy, t);
-    const g = if (l.flag & relu_flag != 0) @select(f32, bf16.loadQuad(E, io.mask, t) > @as(bf16.Quad, @splat(0)), dy, @as(bf16.Quad, @splat(0))) else dy;
+    const live = if (l.flag & mask_x_flag != 0) gamma * x_hat + @as(bf16.Quad, p.beta[ch..][0..4].*) > @as(bf16.Quad, @splat(0)) else bf16.loadQuad(E, io.mask, t) > @as(bf16.Quad, @splat(0));
+    const g = if (l.flag & relu_flag != 0) @select(f32, live, dy, @as(bf16.Quad, @splat(0))) else dy;
     if (l.flag & residual_flag != 0) bf16.storeQuad(E, io.dr, t, bf16.loadQuad(E, io.dr, t) + g);
-    bf16.storeQuad(E, io.dx, t, bf16.loadQuad(E, io.dx, t) + gamma * inv_std / n * (n * g - sum_dy - x_hat * sum_dyx));
+    const dx = gamma * inv_std / n * (n * g - sum_dy - x_hat * sum_dyx);
+    bf16.storeQuad(E, io.dx, t, if (l.flag & store_flag != 0) dx else bf16.loadQuad(E, io.dx, t) + dx);
 }
 
 pub fn stats(x: []const f32, st: Stats, c: usize, training: bool) void {

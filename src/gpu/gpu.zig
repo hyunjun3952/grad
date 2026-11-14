@@ -75,6 +75,16 @@ const Kernel = enum {
     convGemmWeightGrad,
     convGemmWeightGradShort,
     convGemmForwardWide,
+    convGemmForwardStats,
+    convGemmForwardStatsWide,
+    convGemmForwardAffineStats,
+    convGemmForwardAffineStatsWide,
+    convGemmForwardDxStats,
+    convGemmForwardDxStatsWide,
+    convGemmWeightGradAffine,
+    convGemmWeightGradAffineShort,
+    convGemmWeightGradAffineWide,
+    affineExpand,
     convGemmWeightGradWide,
     packWeightsRotated,
     elementwise,
@@ -849,6 +859,122 @@ pub const Gpu = struct {
         try self.launch(if (wide) .convGemmForwardWide else .convGemmForward, .{ ceilDiv(c_out, if (wide) 128 else 64), ceilDiv(m, 128), 1 }, .{ x_half, w.data, out, kernel_shape, geo });
     }
 
+    /// Forward implicit GEMM whose epilogue also accumulates the per-channel sums a following batch norm needs:
+    /// sums of value - shift and of (value - shift)^2 over all positions, added into the zeroed sums (2 * c_out).
+    /// shift is the running mean, a close estimate that keeps the squared sums precise. In deterministic mode the
+    /// block totals go through a per-block-row partial buffer combined in order.
+    pub fn convImplicitForwardStats(self: *Gpu, x_half: []const u16, w: Packed, out: []u16, geo: ga.ConvGeometry, shift: []const f32, sums: []f32) Error!void {
+        const c_out: usize = geo.c_out;
+        const m = @as(usize, geo.n) * geo.out_h * geo.out_w;
+        const kernel_shape = pack(ga.TensorShape, .{
+            .m = m,
+            .n = c_out,
+            .k_padded = w.rows_padded,
+            .n_padded = w.cols_padded,
+            .accumulate = false,
+            .chunk = w.rows_padded,
+            .transpose_out = false,
+            .output_half = true,
+            .split_stride = 0,
+            .c_pitch = 0,
+            .c_offset = 0,
+        });
+        const wide = c_out % 128 == 0 and ceilDiv(m, 128) * (c_out / 128) >= 96;
+        const tile_cols: usize = if (wide) 128 else 64;
+        const grid: [3]u32 = .{ ceilDiv(c_out, tile_cols), ceilDiv(m, 128), 1 };
+        const scope = self.scratchScope();
+        defer scope.restore();
+        const partial: []f32 = if (self.deterministic) try self.scratch(f32, @as(usize, grid[1]) * 2 * c_out) else sums;
+        try self.launch(if (wide) .convGemmForwardStatsWide else .convGemmForwardStats, grid, .{ x_half, w.data, out, shift, sums, partial, self.deterministic, kernel_shape, geo });
+        if (self.deterministic) try self.launchFlat(.columnCombine, 2 * c_out, .{ partial, sums, grid[1], toU32(2 * c_out), toU32(2 * c_out) });
+    }
+
+    /// Turns the sums of convImplicitForwardStats into batch statistics; shift is the f32 vector the sums were
+    /// shifted by, so the f32-shift finish kernel applies (the Half twin reads its shift from bf16 data).
+    pub fn batchNormFinishShifted(self: *Gpu, sums: []const f32, shift: []const f32, st: norm.Stats, l: norm.Layout) Error!void {
+        try self.launchFlat(.batchNormFinish, l.channels, .{ sums, shift, st, l });
+    }
+
+    /// The packed per-(tap, channel) affine map of affineExpand: consecutive-position bf16 pairs for the
+    /// gathered A operand of a forward GEMM, duplicated pairs for the gathered B operand of a weight gradient.
+    pub const AffineExpanded = struct { scale2: []u32, shift2: []u32, scalec: []u32, shiftc: []u32 };
+
+    /// Expands a per-channel batch-norm affine map into the packed scale and shift words the on-load transform of
+    /// a virtual normalized map consumes. dst holds 3 * padTo(k_real, .rows) words and is carved into the vectors.
+    pub fn affineExpand(self: *Gpu, mean: []const f32, inv_std: []const f32, gamma: []const f32, beta: []const f32, dst: []u32, c: usize, k_real: usize) Error!AffineExpanded {
+        const len = padTo(k_real, .rows);
+        std.debug.assert(dst.len == 3 * len);
+        const scale2 = dst[0 .. len / 2];
+        const shift2 = dst[len / 2 .. len];
+        const scalec = dst[len .. 2 * len];
+        const shiftc = dst[2 * len .. 3 * len];
+        try self.launchFlat(.affineExpand, len, .{ mean, inv_std, gamma, beta, scale2, shift2, scalec, shiftc, c, k_real, len });
+        return .{ .scale2 = scale2, .shift2 = shift2, .scalec = scalec, .shiftc = shiftc };
+    }
+
+    /// Forward implicit GEMM over a virtual batch-norm-plus-ReLU input: the gathered operand is transformed on
+    /// load with the packed scale and shift of affineExpand, and the epilogue accumulates the batch
+    /// statistics of the following norm exactly as convImplicitForwardStats does.
+    pub fn convImplicitForwardAffineStats(self: *Gpu, x_half: []const u16, w: Packed, out: []u16, geo: ga.ConvGeometry, aff: AffineExpanded, stats_shift: []const f32, sums: []f32) Error!void {
+        const c_out: usize = geo.c_out;
+        const m = @as(usize, geo.n) * geo.out_h * geo.out_w;
+        const kernel_shape = pack(ga.TensorShape, .{
+            .m = m,
+            .n = c_out,
+            .k_padded = w.rows_padded,
+            .n_padded = w.cols_padded,
+            .accumulate = false,
+            .chunk = w.rows_padded,
+            .transpose_out = false,
+            .output_half = true,
+            .split_stride = 0,
+            .c_pitch = 0,
+            .c_offset = 0,
+        });
+        const wide = c_out % 128 == 0 and ceilDiv(m, 128) * (c_out / 128) >= 96;
+        const tile_cols: usize = if (wide) 128 else 64;
+        const grid: [3]u32 = .{ ceilDiv(c_out, tile_cols), ceilDiv(m, 128), 1 };
+        const scope = self.scratchScope();
+        defer scope.restore();
+        const partial: []f32 = if (self.deterministic) try self.scratch(f32, @as(usize, grid[1]) * 2 * c_out) else sums;
+        try self.launch(if (wide) .convGemmForwardAffineStatsWide else .convGemmForwardAffineStats, grid, .{ x_half, w.data, out, aff.scale2, aff.shift2, stats_shift, sums, partial, self.deterministic, kernel_shape, geo });
+        if (self.deterministic) try self.launchFlat(.columnCombine, 2 * c_out, .{ partial, sums, grid[1], toU32(2 * c_out), toU32(2 * c_out) });
+    }
+
+    /// Input-gradient implicit GEMM whose epilogue also accumulates the masked batch-norm gradient sums of a virtual
+    /// normalized map: out is stored (not accumulated), and x_bn with the affine parameters rebuilds the ReLU mask
+    /// and x_hat. The sums behave like those of batchNormGradSums, including the ordered combine when deterministic.
+    pub fn convImplicitForwardDxStats(self: *Gpu, dy: []const u16, w: Packed, out: []u16, geo: ga.ConvGeometry, x_bn: []const u16, p: norm.Affine, sums: []f32) Error!void {
+        const c_out: usize = geo.c_out;
+        const m = @as(usize, geo.n) * geo.out_h * geo.out_w;
+        const kernel_shape = pack(ga.TensorShape, .{
+            .m = m,
+            .n = c_out,
+            .k_padded = w.rows_padded,
+            .n_padded = w.cols_padded,
+            .accumulate = false,
+            .chunk = w.rows_padded,
+            .transpose_out = false,
+            .output_half = true,
+            .split_stride = 0,
+            .c_pitch = 0,
+            .c_offset = 0,
+        });
+        const wide = c_out % 128 == 0 and ceilDiv(m, 128) * (c_out / 128) >= 96;
+        const tile_cols: usize = if (wide) 128 else 64;
+        const grid: [3]u32 = .{ ceilDiv(c_out, tile_cols), ceilDiv(m, 128), 1 };
+        const scope = self.scratchScope();
+        defer scope.restore();
+        const partial: []f32 = if (self.deterministic) try self.scratch(f32, @as(usize, grid[1]) * 2 * c_out) else sums;
+        try self.launch(if (wide) .convGemmForwardDxStatsWide else .convGemmForwardDxStats, grid, .{ dy, w.data, out, x_bn, p.mean[0..c_out], p.inv_std[0..c_out], p.gamma[0..c_out], p.beta[0..c_out], sums, partial, self.deterministic, kernel_shape, geo });
+        if (self.deterministic) try self.launchFlat(.columnCombine, 2 * c_out, .{ partial, sums, grid[1], toU32(2 * c_out), toU32(2 * c_out) });
+    }
+
+    /// Adds the masked batch-norm gradient sums of batchNormGradSums or convImplicitForwardDxStats to the parameter gradients.
+    pub fn batchNormGradFinish(self: *Gpu, sums: []const f32, gamma: []f32, beta: []f32) Error!void {
+        try self.launchFlat(.batchNormGradFinish, beta.len, .{ sums, gamma, beta, beta.len });
+    }
+
     /// Adds the weight gradient of an implicit-GEMM convolution to out (taps x c_out, f32). dy is the bf16 output gradient
     /// as stored, positions x c_out; the kernel reads it transposed itself, so no packed copy is made.
     pub fn convImplicitWeightGrad(self: *Gpu, dy: []const u16, x_half: []const u16, out: []f32, geo: ga.ConvGeometry) Error!void {
@@ -891,6 +1017,44 @@ pub const Gpu = struct {
         var ordered = shape;
         ordered.split_stride = @intCast(out.len);
         return .{ try self.scratch(f32, @as(usize, parts) * out.len), ordered };
+    }
+
+    /// Weight gradient of an implicit-GEMM convolution over a virtual batch-norm-plus-ReLU input: the gathered
+    /// right operand is transformed on load with the packed scale and shift of affineExpand. Everything
+    /// else, including the split-K accumulation, matches convImplicitWeightGrad.
+    pub fn convImplicitWeightGradAffine(self: *Gpu, dy: []const u16, x_half: []const u16, out: []f32, geo: ga.ConvGeometry, aff: AffineExpanded) Error!void {
+        const c_out: usize = geo.c_out;
+        std.debug.assert(c_out % 8 == 0 and dy.len == @as(usize, geo.positions) * c_out);
+        const taps = @as(usize, geo.k) * geo.k * geo.c;
+        const k_padded = padTo(geo.positions, .depth);
+        const short = c_out <= 64;
+        const wide = c_out % 128 == 0;
+        const tile_rows: usize = if (short) 64 else 128;
+        const tile_cols: usize = if (short or wide) 128 else 64;
+        const n_padded = std.mem.alignForward(usize, taps, tile_cols);
+        const blocks = ceilDiv(c_out, tile_rows) * (n_padded / tile_cols);
+        const splits = @max(1, @min(k_padded / 256, (128 + blocks - 1) / blocks));
+        const chunk = padTo((k_padded + splits - 1) / splits, .depth);
+        const kernel_shape = pack(ga.TensorShape, .{
+            .m = c_out,
+            .n = taps,
+            .k_padded = k_padded,
+            .n_padded = n_padded,
+            .accumulate = true,
+            .chunk = chunk,
+            .transpose_out = true,
+            .output_half = false,
+            .split_stride = 0,
+            .c_pitch = 0,
+            .c_offset = 0,
+        });
+        const kernel: Kernel = if (short) .convGemmWeightGradAffineShort else if (wide) .convGemmWeightGradAffineWide else .convGemmWeightGradAffine;
+        const scope = self.scratchScope();
+        defer scope.restore();
+        const parts = ceilDiv(k_padded, chunk);
+        const target, const shape = try self.orderedTarget(out, kernel_shape, parts);
+        try self.launch(kernel, .{ toU32(n_padded / tile_cols), ceilDiv(c_out, tile_rows), parts }, .{ dy, x_half, target, aff.scalec, aff.shiftc, shape, geo });
+        try self.combineSplits(target, out, shape, parts, true);
     }
 
     fn combineSplits(self: *Gpu, workspace: []f32, out: []f32, shape: ga.TensorShape, parts: u32, accumulate: bool) Error!void {
